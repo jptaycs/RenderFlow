@@ -74,6 +74,7 @@ class Motion(BaseModel):
 
 class SceneAssets(BaseModel):
     image: AssetRef = Field(default_factory=AssetRef)
+    avatar_image: AssetRef = Field(default_factory=AssetRef)
     voice: AssetRef = Field(default_factory=AssetRef)
     avatar_clip: AssetRef = Field(default_factory=AssetRef)
     subtitle: SubtitleRef = Field(default_factory=SubtitleRef)
@@ -111,6 +112,7 @@ class ScenePlan(BaseModel):
         for scene in self.scenes:
             for ref in (
                 scene.assets.image,
+                scene.assets.avatar_image,
                 scene.assets.voice,
                 scene.assets.avatar_clip,
             ):

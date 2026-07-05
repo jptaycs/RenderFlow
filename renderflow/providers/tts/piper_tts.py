@@ -42,13 +42,23 @@ class PiperTTS:
     def synthesize(self, text: str, voice: str, **params: Any) -> GeneratedAsset:
         log.info("piper synthesizing %d chars with %s", len(text), voice)
         piper_voice = self._load(voice)
+        length_scale = params.pop("length_scale", None)
+        syn_config = None
+        if length_scale is not None:
+            from piper.config import SynthesisConfig
+
+            syn_config = SynthesisConfig(length_scale=float(length_scale))
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wav:
-            piper_voice.synthesize_wav(text, wav)
+            piper_voice.synthesize_wav(text, wav, syn_config=syn_config)
         return GeneratedAsset(
             data=buf.getvalue(),
             provider=self.name,
-            params={"voice": voice, **params},
+            params={"voice": voice, "length_scale": length_scale, **params},
             cost=0.0,
-            meta={"format": "wav", "characters": len(text)},
+            meta={
+                "format": "wav",
+                "characters": len(text),
+                "length_scale": length_scale,
+            },
         )

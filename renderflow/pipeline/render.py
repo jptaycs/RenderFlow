@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import math
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -19,6 +18,8 @@ log = logging.getLogger("renderflow.pipeline.render")
 
 FPS = 30
 WIDTH, HEIGHT = 1920, 1080
+AVATAR_W = 768
+VISUAL_W = WIDTH - AVATAR_W
 # Upscale before zoompan so sub-pixel motion doesn't jitter.
 PRESCALE_W, PRESCALE_H = 2560, 1440
 
@@ -77,10 +78,12 @@ def _zoompan_expr(scene: Scene, frames: int) -> str:
 
 def render_scene_clip(scene: Scene, out: Path) -> Path:
     if scene.type == "talking_avatar" and scene.assets.avatar_clip.path:
-        avatar_clip = Path(scene.assets.avatar_clip.path)
-        if avatar_clip.resolve() != out.resolve():
-            shutil.copyfile(avatar_clip, out)
-        return out
+        if scene.id == 1:
+            return render_avatar_full_clip(Path(scene.assets.avatar_clip.path), out)
+        assert scene.assets.image.path
+        return render_avatar_split_clip(
+            scene, Path(scene.assets.avatar_clip.path), Path(scene.assets.image.path), out
+        )
 
     assert scene.assets.image.path and scene.assets.voice.path
     image = Path(scene.assets.image.path)
@@ -95,7 +98,63 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
             "-filter_complex", f"[0:v]{_zoompan_expr(scene, frames)}[v]",
             "-map", "[v]", "-map", "1:a",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
+            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-t", f"{duration:.3f}",
+            "-shortest",
+            str(out),
+        ]
+    )
+    return out
+
+
+def render_avatar_full_clip(avatar_clip: Path, out: Path) -> Path:
+    duration = probe_duration(avatar_clip)
+    _run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(avatar_clip),
+            "-vf",
+            (
+                f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
+                f"crop={WIDTH}:{HEIGHT},format=yuv420p"
+            ),
+            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-t", f"{duration:.3f}",
+            "-shortest",
+            str(out),
+        ]
+    )
+    return out
+
+
+def render_avatar_split_clip(
+    scene: Scene, avatar_clip: Path, visual_image: Path, out: Path
+) -> Path:
+    duration = probe_duration(avatar_clip)
+    frames = math.ceil(duration * FPS)
+    right_zoom = _zoompan_expr(scene, frames).replace(
+        f"s={WIDTH}x{HEIGHT}", f"s={VISUAL_W}x{HEIGHT}"
+    )
+    filter_complex = (
+        f"[0:v]scale={AVATAR_W}:{HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={AVATAR_W}:{HEIGHT},format=yuv420p[left];"
+        f"[1:v]{right_zoom},format=yuv420p[right];"
+        "[left][right]hstack=inputs=2[v]"
+    )
+    _run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(avatar_clip),
+            "-loop", "1", "-i", str(visual_image),
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "0:a",
+            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-t", f"{duration:.3f}",
             "-shortest",
             str(out),
         ]
@@ -115,12 +174,16 @@ def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
         "".join(f"file '{clip.resolve()}'\n" for clip in clips)
     )
     final = paths.output / "final.mp4"
+    concat_inputs = [arg for clip in clips for arg in ("-i", str(clip))]
+    concat_streams = "".join(f"[{i}:v][{i}:a]" for i in range(len(clips)))
     _run(
         [
             "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", str(concat_list),
-            "-c", "copy",
+            *concat_inputs,
+            "-filter_complex", f"{concat_streams}concat=n={len(clips)}:v=1:a=1[v][a]",
+            "-map", "[v]", "-map", "[a]",
+            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart",
             str(final),
         ]

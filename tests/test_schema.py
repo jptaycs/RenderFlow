@@ -28,6 +28,7 @@ DOC_EXAMPLE = {
             "motion": {"effect": "zoom_in", "intensity": 0.08},
             "assets": {
                 "image": {"status": "pending", "path": None, "provider": None, "cost": None},
+                "avatar_image": {"status": "pending", "path": None, "provider": None, "cost": None},
                 "voice": {"status": "pending", "path": None, "provider": None, "cost": None},
                 "avatar_clip": {"status": "pending", "path": None, "provider": None, "cost": None},
                 "subtitle": {"status": "pending", "path": None},
@@ -53,6 +54,7 @@ def test_scene_defaults():
     scene = Scene(id=1, duration_estimate_sec=15, narration="x", image_prompt="y")
     assert scene.type == "narration"
     assert scene.assets.image.status is AssetStatus.PENDING
+    assert scene.assets.avatar_image.status is AssetStatus.PENDING
     assert scene.assets.avatar_clip.status is AssetStatus.PENDING
 
 
@@ -133,6 +135,7 @@ def test_generation_schema_forbids_extras():
 def test_total_asset_cost():
     plan = ScenePlan.model_validate(DOC_EXAMPLE)
     plan.scenes[0].assets.image.cost = 0.003
+    plan.scenes[0].assets.avatar_image.cost = 0.003
     plan.scenes[0].assets.voice.cost = 0.02
     plan.scenes[0].assets.avatar_clip.cost = 0.01
-    assert plan.total_asset_cost() == pytest.approx(0.033)
+    assert plan.total_asset_cost() == pytest.approx(0.036)

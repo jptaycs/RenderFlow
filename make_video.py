@@ -22,7 +22,12 @@ from renderflow.pipeline.assets import (
     generate_voice,
 )
 from renderflow.pipeline.render import render_video
-from renderflow.pipeline.script import generate_script, script_markdown, split_script
+from renderflow.pipeline.script import (
+    generate_script,
+    script_markdown,
+    split_script,
+    split_script_local,
+)
 from renderflow.providers import build_avatar, build_image, build_llm, build_tts
 from renderflow.schema import ScenePlan
 from renderflow.storage import ProjectPaths, save_plan, slugify
@@ -41,6 +46,11 @@ def main() -> int:
     parser.add_argument("--length", type=float, default=3.0, help="target minutes")
     parser.add_argument("--style", default="documentary")
     parser.add_argument("--slug", help="project directory name (default: from title)")
+    parser.add_argument(
+        "--llm-split",
+        action="store_true",
+        help="use the configured LLM to split --script-file instead of the free local splitter",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -48,6 +58,9 @@ def main() -> int:
     )
 
     settings = Settings.load()
+    avatar_image = settings.avatar_image
+    if avatar_image is not None and not avatar_image.exists():
+        raise FileNotFoundError(f"avatar image not found: {avatar_image}")
     image = build_image(settings)
     tts = build_tts(settings)
 
@@ -56,11 +69,17 @@ def main() -> int:
         plan = ScenePlan.model_validate_json(args.scenes_file.read_text())
         script_cost = 0.0
     elif args.script_file:
-        llm = build_llm(settings)
-        print(f"[1/4] Splitting client script {args.script_file} into scenes")
-        plan, script_result = split_script(
-            llm, args.script_file.read_text(), args.style
-        )
+        script_text = args.script_file.read_text()
+        if args.llm_split:
+            llm = build_llm(settings)
+            print(f"[1/4] Splitting client script {args.script_file} into scenes")
+            plan, script_result = split_script(llm, script_text, args.style)
+        else:
+            print(
+                f"[1/4] Locally splitting client script "
+                f"{args.script_file} into scenes"
+            )
+            plan, script_result = split_script_local(script_text, args.style)
         script_cost = script_result.cost or 0.0
     else:
         llm = build_llm(settings)
@@ -74,10 +93,13 @@ def main() -> int:
     print(f"      {len(plan.scenes)} scenes → {paths.scenes_json}")
 
     print(f"[2/4] Generating {len(plan.scenes)} images ({image.name})")
-    generate_images(plan, image, paths)
+    generate_images(plan, image, paths, avatar_image=avatar_image)
 
     print(f"[3/4] Generating {len(plan.scenes)} voice clips ({tts.name})")
-    generate_voice(plan, tts, settings.tts_voice, paths)
+    tts_params = {}
+    if settings.tts_provider == "piper":
+        tts_params["length_scale"] = settings.tts_length_scale
+    generate_voice(plan, tts, settings.tts_voice, paths, **tts_params)
 
     avatar_scene_count = sum(scene.type == "talking_avatar" for scene in plan.scenes)
     if avatar_scene_count:

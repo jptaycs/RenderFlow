@@ -1,17 +1,26 @@
-"""Topic → structured scene plan, in one LLM call."""
+"""Topic/script → structured scene plan."""
 
 from __future__ import annotations
 
 import logging
+import re
 
 from pydantic import ValidationError
 
 from renderflow.providers.base import LLMProvider, LLMResult
-from renderflow.schema import GeneratedScript, ScenePlan
+from renderflow.schema import AvatarSpec, GeneratedScript, Motion, Scene, ScenePlan
 
 log = logging.getLogger("renderflow.pipeline.script")
 
 SECONDS_PER_SCENE = 15
+LOCAL_AVATAR = AvatarSpec(
+    name="David Lester",
+    description=(
+        "Middle-aged male documentary host, plain dark shirt, calm serious "
+        "expression, seated in a modest workshop, cinematic portrait lighting"
+    ),
+    background="modest rural workshop",
+)
 
 SYSTEM_PROMPT = """\
 You are the script engine of RenderFlow, an automated YouTube video pipeline.
@@ -105,6 +114,103 @@ def split_script(
     plan.style = style
     log.info("split script into %d scenes: %r", len(plan.scenes), plan.title)
     return plan, result
+
+
+def split_script_local(script_text: str, style: str) -> tuple[ScenePlan, LLMResult]:
+    """Split a client-provided script into scenes without any external LLM call."""
+    cleaned = _strip_script_markup(script_text)
+    chunks = _chunk_sentences(_sentences(cleaned))
+    title = _infer_title(cleaned)
+    motions = ("zoom_in", "pan_right", "zoom_out", "pan_left")
+    scenes = [
+        Scene(
+            id=index,
+            type="talking_avatar" if _uses_local_avatar(index) else "narration",
+            duration_estimate_sec=max(2.0, len(chunk.split()) / 2.5),
+            narration=chunk,
+            image_prompt=_local_image_prompt(chunk, style),
+            negative_prompt="text, watermark, subtitles, captions, low quality, blurry",
+            avatar=LOCAL_AVATAR if _uses_local_avatar(index) else None,
+            motion=Motion(
+                effect=motions[(index - 1) % len(motions)],
+                intensity=0.08 + (0.01 * ((index - 1) % 4)),
+            ),
+        )
+        for index, chunk in enumerate(chunks, start=1)
+    ]
+    plan = ScenePlan(title=title, style=style, scenes=scenes)
+    result = LLMResult(
+        text=plan.model_dump_json(),
+        provider="local-script-splitter",
+        cost=0.0,
+        meta={"scene_count": len(scenes)},
+    )
+    log.info("locally split script into %d scenes: %r", len(plan.scenes), plan.title)
+    return plan, result
+
+
+def _uses_local_avatar(scene_index: int) -> bool:
+    return scene_index == 1 or scene_index % 4 == 0
+
+
+def _strip_script_markup(script_text: str) -> str:
+    text = script_text.replace("\ufeff", "")
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^#{1,6}\s+", "", line)
+        line = re.sub(r"^\*\*(.+)\*\*$", r"\1", line)
+        lines.append(line)
+    return " ".join(lines)
+
+
+def _sentences(text: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        raise ValueError("script file is empty")
+    return re.split(r"(?<=[.!?])\s+", normalized)
+
+
+def _chunk_sentences(
+    sentences: list[str], min_words: int = 25, max_words: int = 55
+) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_words = 0
+
+    for sentence in sentences:
+        words = len(sentence.split())
+        if current and current_words >= min_words and current_words + words > max_words:
+            chunks.append(" ".join(current))
+            current = []
+            current_words = 0
+        current.append(sentence)
+        current_words += words
+
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def _infer_title(script_text: str) -> str:
+    words = re.findall(r"[A-Za-z0-9'$-]+", script_text)
+    if not words:
+        return "Untitled Script"
+    title = " ".join(words[:8]).strip()
+    return title[:80]
+
+
+def _local_image_prompt(narration: str, style: str) -> str:
+    excerpt = narration
+    if len(excerpt) > 180:
+        excerpt = excerpt[:177].rsplit(" ", 1)[0] + "..."
+    return (
+        f"Cinematic photorealistic {style} still illustrating this narration: "
+        f"{excerpt}. Natural lighting, documentary composition, no visible text."
+    )
 
 
 def script_markdown(plan: ScenePlan) -> str:

@@ -1,5 +1,6 @@
 """End-to-end skeleton test with stub providers (no network, no API keys)."""
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -67,13 +68,31 @@ def test_talking_avatar_clip_generation(paths: ProjectPaths):
 
     avatar_scene = load_plan(paths).scenes[0]
     narration_scene = load_plan(paths).scenes[1]
+    assert avatar_scene.assets.avatar_image.status is AssetStatus.COMPLETED
+    assert Path(avatar_scene.assets.avatar_image.path).read_bytes() == b"fake-png"
     assert avatar_scene.assets.avatar_clip.status is AssetStatus.COMPLETED
     assert Path(avatar_scene.assets.avatar_clip.path).read_bytes() == b"fake-mp4"
     assert avatar_scene.assets.avatar_clip.provider == "stub-avatar"
     assert narration_scene.assets.avatar_clip.status is AssetStatus.PENDING
     assert load_plan(paths).total_asset_cost() == pytest.approx(
-        (0.003 + 0.002) * 2 + 0.004
+        (0.003 + 0.002) * 2 + 0.003 + 0.004
     )
+
+
+def test_talking_avatar_uses_local_avatar_image(paths: ProjectPaths):
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    plan.scenes[0].type = "talking_avatar"
+    avatar_image = paths.root / "host.jpg"
+    avatar_image.write_bytes(b"local-host")
+    save_plan(plan, paths)
+
+    generate_images(plan, StubImage(), paths, avatar_image=avatar_image)
+    generate_voice(plan, StubTTS(), "voice-id", paths, length_scale=1.25)
+
+    avatar_scene = load_plan(paths).scenes[0]
+    assert avatar_scene.assets.avatar_image.provider == "local-file"
+    assert Path(avatar_scene.assets.avatar_image.path).read_bytes() == b"local-host"
+    assert Path(avatar_scene.assets.voice.path).read_bytes() == b"fake-mp3"
 
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
@@ -84,6 +103,7 @@ def test_render_integration(paths: ProjectPaths):
     from renderflow.pipeline.render import probe_duration, render_video
 
     plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    plan.scenes[1].type = "talking_avatar"
 
     for scene in plan.scenes:
         img = paths.images / f"scene_{scene.id:03d}.png"
@@ -102,11 +122,38 @@ def test_render_integration(paths: ProjectPaths):
             ref.advance(AssetStatus.RUNNING)
             ref.path = str(path)
             ref.advance(AssetStatus.COMPLETED)
+        if scene.type == "talking_avatar":
+            avatar_clip = paths.avatar / f"scene_{scene.id:03d}.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi", "-i", "color=c=darkred:s=640x360",
+                    "-f", "lavfi", "-i", "sine=frequency=220",
+                    "-t", "1", str(avatar_clip),
+                ],
+                check=True, capture_output=True,
+            )
+            scene.assets.avatar_clip.advance(AssetStatus.RUNNING)
+            scene.assets.avatar_clip.path = str(avatar_clip)
+            scene.assets.avatar_clip.advance(AssetStatus.COMPLETED)
 
     final = render_video(plan, paths)
     assert final.exists()
     # Two 1-second scenes → roughly 2 seconds of video
     assert probe_duration(final) == pytest.approx(2.0, abs=0.5)
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "stream=codec_type",
+            "-of", "json",
+            str(final),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stream_types = {s["codec_type"] for s in json.loads(probe.stdout)["streams"]}
+    assert stream_types == {"audio", "video"}
 
 
 def test_split_script_preserves_flow(paths: ProjectPaths):
@@ -116,3 +163,38 @@ def test_split_script_preserves_flow(paths: ProjectPaths):
     assert len(plan.scenes) == 2
     assert plan.style == "documentary"
     assert result.cost == 0.01
+
+
+def test_local_split_script_preserves_text_without_llm():
+    from renderflow.pipeline.script import split_script_local
+
+    script = (
+        "First, this exact sentence should stay intact. "
+        "Then this second sentence should follow it. "
+        "Finally, this closing sentence should remain unchanged."
+    )
+
+    plan, result = split_script_local(script, "documentary")
+
+    assert result.provider == "local-script-splitter"
+    assert result.cost == 0.0
+    assert plan.style == "documentary"
+    assert " ".join(scene.narration for scene in plan.scenes) == script
+    assert all(scene.image_prompt for scene in plan.scenes)
+    assert plan.scenes[0].type == "talking_avatar"
+    assert plan.scenes[0].avatar is not None
+
+
+def test_local_split_script_ignores_block_comments():
+    from renderflow.pipeline.script import split_script_local
+
+    plan, result = split_script_local(
+        "Keep this narration. /* Do not narrate this section. */ Resume here.",
+        "documentary",
+    )
+
+    narration = " ".join(scene.narration for scene in plan.scenes)
+    assert result.cost == 0.0
+    assert "Keep this narration." in narration
+    assert "Resume here." in narration
+    assert "Do not narrate this section." not in narration
