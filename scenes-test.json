@@ -1,0 +1,24 @@
+{
+  "title": "Free Stack Test",
+  "style": "documentary",
+  "scenes": [
+    {
+      "id": 1,
+      "type": "narration",
+      "duration_estimate_sec": 8,
+      "narration": "Deep in the countryside, morning light spills across a quiet farmstead, where life still moves at the pace of the seasons.",
+      "image_prompt": "Cinematic wide shot of a rustic farmstead at golden hour dawn, mist over fields, warm morning light, photorealistic, film grain",
+      "negative_prompt": "text, watermark, low quality, cartoon",
+      "motion": { "effect": "zoom_in", "intensity": 0.1 }
+    },
+    {
+      "id": 2,
+      "type": "narration",
+      "duration_estimate_sec": 8,
+      "narration": "Every tool here tells a story, passed down through generations of hands that shaped this land.",
+      "image_prompt": "Close-up of weathered antique farming tools hanging in a wooden barn, dramatic side lighting, dust particles in air, photorealistic",
+      "negative_prompt": "text, watermark, low quality, cartoon",
+      "motion": { "effect": "pan_right", "intensity": 0.12 }
+    }
+  ]
+}
