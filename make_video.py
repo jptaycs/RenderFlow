@@ -16,10 +16,14 @@ import sys
 from pathlib import Path
 
 from renderflow.config import Settings
-from renderflow.pipeline.assets import generate_images, generate_voice
+from renderflow.pipeline.assets import (
+    generate_avatar_clips,
+    generate_images,
+    generate_voice,
+)
 from renderflow.pipeline.render import render_video
 from renderflow.pipeline.script import generate_script, script_markdown, split_script
-from renderflow.providers import build_image, build_llm, build_tts
+from renderflow.providers import build_avatar, build_image, build_llm, build_tts
 from renderflow.schema import ScenePlan
 from renderflow.storage import ProjectPaths, save_plan, slugify
 
@@ -75,7 +79,16 @@ def main() -> int:
     print(f"[3/4] Generating {len(plan.scenes)} voice clips ({tts.name})")
     generate_voice(plan, tts, settings.tts_voice, paths)
 
-    print("[4/4] Rendering with FFmpeg")
+    avatar_scene_count = sum(scene.type == "talking_avatar" for scene in plan.scenes)
+    if avatar_scene_count:
+        avatar = build_avatar(settings)
+        print(f"[4/5] Generating {avatar_scene_count} avatar clips ({avatar.name})")
+        generate_avatar_clips(plan, avatar, paths)
+        render_step = "[5/5]"
+    else:
+        render_step = "[4/4]"
+
+    print(f"{render_step} Rendering with FFmpeg")
     final = render_video(plan, paths)
 
     total = script_cost + plan.total_asset_cost()

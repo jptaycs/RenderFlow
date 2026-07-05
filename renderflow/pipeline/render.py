@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -75,6 +76,12 @@ def _zoompan_expr(scene: Scene, frames: int) -> str:
 
 
 def render_scene_clip(scene: Scene, out: Path) -> Path:
+    if scene.type == "talking_avatar" and scene.assets.avatar_clip.path:
+        avatar_clip = Path(scene.assets.avatar_clip.path)
+        if avatar_clip.resolve() != out.resolve():
+            shutil.copyfile(avatar_clip, out)
+        return out
+
     assert scene.assets.image.path and scene.assets.voice.path
     image = Path(scene.assets.image.path)
     audio = Path(scene.assets.voice.path)

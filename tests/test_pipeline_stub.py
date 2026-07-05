@@ -6,11 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from renderflow.pipeline.assets import generate_images, generate_voice
+from renderflow.pipeline.assets import (
+    generate_avatar_clips,
+    generate_images,
+    generate_voice,
+)
 from renderflow.pipeline.script import generate_script
 from renderflow.schema import AssetStatus
 from renderflow.storage import ProjectPaths, load_plan, save_plan, slugify
-from tests.stubs import StubImage, StubLLM, StubTTS
+from tests.stubs import StubAvatar, StubImage, StubLLM, StubTTS
 
 
 @pytest.fixture
@@ -50,6 +54,26 @@ def test_completed_assets_are_skipped(paths: ProjectPaths):
     # Second run must not regenerate (would raise InvalidTransition otherwise)
     generate_images(plan, StubImage(), paths)
     assert {s.id: s.assets.image.path for s in plan.scenes} == first_run
+
+
+def test_talking_avatar_clip_generation(paths: ProjectPaths):
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    plan.scenes[0].type = "talking_avatar"
+    save_plan(plan, paths)
+
+    generate_images(plan, StubImage(), paths)
+    generate_voice(plan, StubTTS(), "voice-id", paths)
+    generate_avatar_clips(plan, StubAvatar(), paths)
+
+    avatar_scene = load_plan(paths).scenes[0]
+    narration_scene = load_plan(paths).scenes[1]
+    assert avatar_scene.assets.avatar_clip.status is AssetStatus.COMPLETED
+    assert Path(avatar_scene.assets.avatar_clip.path).read_bytes() == b"fake-mp4"
+    assert avatar_scene.assets.avatar_clip.provider == "stub-avatar"
+    assert narration_scene.assets.avatar_clip.status is AssetStatus.PENDING
+    assert load_plan(paths).total_asset_cost() == pytest.approx(
+        (0.003 + 0.002) * 2 + 0.004
+    )
 
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None

@@ -29,6 +29,7 @@ DOC_EXAMPLE = {
             "assets": {
                 "image": {"status": "pending", "path": None, "provider": None, "cost": None},
                 "voice": {"status": "pending", "path": None, "provider": None, "cost": None},
+                "avatar_clip": {"status": "pending", "path": None, "provider": None, "cost": None},
                 "subtitle": {"status": "pending", "path": None},
             },
         }
@@ -52,6 +53,28 @@ def test_scene_defaults():
     scene = Scene(id=1, duration_estimate_sec=15, narration="x", image_prompt="y")
     assert scene.type == "narration"
     assert scene.assets.image.status is AssetStatus.PENDING
+    assert scene.assets.avatar_clip.status is AssetStatus.PENDING
+
+
+def test_talking_avatar_scene_contract():
+    scene = Scene.model_validate(
+        {
+            "id": 1,
+            "type": "talking_avatar",
+            "duration_estimate_sec": 15,
+            "narration": "Welcome to the channel.",
+            "image_prompt": "Friendly fictional host in a small workshop",
+            "avatar": {
+                "name": "Mara Vale",
+                "description": "fictional synthetic presenter",
+                "background": "small workshop",
+                "disclosure": "AI-generated host",
+            },
+        }
+    )
+    assert scene.type == "talking_avatar"
+    assert scene.avatar is not None
+    assert scene.avatar.disclosure == "AI-generated host"
 
 
 def test_valid_transition_path():
@@ -111,4 +134,5 @@ def test_total_asset_cost():
     plan = ScenePlan.model_validate(DOC_EXAMPLE)
     plan.scenes[0].assets.image.cost = 0.003
     plan.scenes[0].assets.voice.cost = 0.02
-    assert plan.total_asset_cost() == pytest.approx(0.023)
+    plan.scenes[0].assets.avatar_clip.cost = 0.01
+    assert plan.total_asset_cost() == pytest.approx(0.033)

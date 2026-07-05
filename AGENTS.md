@@ -9,8 +9,9 @@ Working today, verified against live services:
 - Synchronous CLI pipeline: scene plan → images → voice → FFmpeg 1080p MP4
 - Providers: Claude (LLM, untested live — no API key yet), Pollinations + Flux-Replicate (image), Piper + ElevenLabs (TTS)
 - Resumable asset generation (completed assets skip on re-run), per-asset cost tracking
+- Talking-avatar scene contract + local `ffmpeg-still` placeholder provider (image + voice → presenter MP4 with disclosure; not photoreal lip sync)
 
-Not built yet (roadmap order): subtitles (faster-whisper → ASS), narrator character consistency, avatar/split-screen scenes, background music/crossfades, Celery/Redis workers, Postgres, FastAPI, Next.js dashboard.
+Not built yet (roadmap order): subtitles (faster-whisper → ASS), narrator character consistency, paid lip-sync avatar providers/split-screen scenes, background music/crossfades, Celery/Redis workers, Postgres, FastAPI, Next.js dashboard.
 
 ## Commands
 

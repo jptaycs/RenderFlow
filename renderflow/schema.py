@@ -64,6 +64,7 @@ class SubtitleRef(BaseModel):
 
 
 MotionEffect = Literal["zoom_in", "zoom_out", "pan_left", "pan_right"]
+SceneType = Literal["narration", "talking_avatar"]
 
 
 class Motion(BaseModel):
@@ -74,16 +75,27 @@ class Motion(BaseModel):
 class SceneAssets(BaseModel):
     image: AssetRef = Field(default_factory=AssetRef)
     voice: AssetRef = Field(default_factory=AssetRef)
+    avatar_clip: AssetRef = Field(default_factory=AssetRef)
     subtitle: SubtitleRef = Field(default_factory=SubtitleRef)
+
+
+class AvatarSpec(BaseModel):
+    """Fictional synthetic host guidance for talking-avatar scenes."""
+
+    name: str
+    description: str
+    background: str | None = None
+    disclosure: str = "AI-generated host"
 
 
 class Scene(BaseModel):
     id: int
-    type: Literal["narration"] = "narration"
+    type: SceneType = "narration"
     duration_estimate_sec: float
     narration: str
     image_prompt: str
     negative_prompt: str | None = None
+    avatar: AvatarSpec | None = None
     motion: Motion = Field(default_factory=Motion)
     assets: SceneAssets = Field(default_factory=SceneAssets)
 
@@ -97,7 +109,11 @@ class ScenePlan(BaseModel):
     def total_asset_cost(self) -> float:
         total = 0.0
         for scene in self.scenes:
-            for ref in (scene.assets.image, scene.assets.voice):
+            for ref in (
+                scene.assets.image,
+                scene.assets.voice,
+                scene.assets.avatar_clip,
+            ):
                 if ref.cost is not None:
                     total += ref.cost
         return total
@@ -121,10 +137,12 @@ class GeneratedScene(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: int
+    type: SceneType = "narration"
     duration_estimate_sec: float
     narration: str
     image_prompt: str
     negative_prompt: str
+    avatar: AvatarSpec | None = None
     motion: GeneratedMotion
 
 
@@ -139,10 +157,12 @@ class GeneratedScript(BaseModel):
         scenes = [
             Scene(
                 id=s.id,
+                type=s.type,
                 duration_estimate_sec=s.duration_estimate_sec,
                 narration=s.narration,
                 image_prompt=s.image_prompt,
                 negative_prompt=s.negative_prompt or None,
+                avatar=s.avatar,
                 motion=Motion(
                     effect=s.motion.effect,
                     intensity=min(max(s.motion.intensity, 0.0), 1.0),
