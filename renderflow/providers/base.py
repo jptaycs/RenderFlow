@@ -7,6 +7,7 @@ interfaces. Switching providers is a config change, not a code change.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -45,6 +46,19 @@ class TTSProvider(Protocol):
     name: str
 
     def synthesize(self, text: str, voice: str, **params: Any) -> GeneratedAsset: ...
+
+
+@runtime_checkable
+class AvatarProvider(Protocol):
+    name: str
+
+    def generate_clip(
+        self,
+        avatar_image: Path,
+        voice_audio: Path,
+        script_text: str,
+        **params: Any,
+    ) -> GeneratedAsset: ...
 
 
 @runtime_checkable

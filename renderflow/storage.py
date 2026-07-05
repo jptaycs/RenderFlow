@@ -24,7 +24,15 @@ class ProjectPaths:
     @classmethod
     def create(cls, projects_dir: Path, slug: str) -> "ProjectPaths":
         paths = cls(root=projects_dir / slug)
-        for sub in ("script", "images", "voice", "subtitles", "output", "logs"):
+        for sub in (
+            "script",
+            "images",
+            "voice",
+            "avatar",
+            "subtitles",
+            "output",
+            "logs",
+        ):
             (paths.root / sub).mkdir(parents=True, exist_ok=True)
         return paths
 
@@ -39,6 +47,10 @@ class ProjectPaths:
     @property
     def voice(self) -> Path:
         return self.root / "voice"
+
+    @property
+    def avatar(self) -> Path:
+        return self.root / "avatar"
 
     @property
     def subtitles(self) -> Path:

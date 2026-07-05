@@ -1,14 +1,15 @@
 import pytest
 
-from renderflow.providers.base import ImageProvider, LLMProvider, TTSProvider
+from renderflow.providers.base import AvatarProvider, ImageProvider, LLMProvider, TTSProvider
 from renderflow.providers.llm.claude import compute_cost
-from tests.stubs import StubImage, StubLLM, StubTTS
+from tests.stubs import StubAvatar, StubImage, StubLLM, StubTTS
 
 
 def test_stubs_satisfy_protocols():
     assert isinstance(StubLLM(), LLMProvider)
     assert isinstance(StubImage(), ImageProvider)
     assert isinstance(StubTTS(), TTSProvider)
+    assert isinstance(StubAvatar(), AvatarProvider)
 
 
 def test_claude_cost_calculation():

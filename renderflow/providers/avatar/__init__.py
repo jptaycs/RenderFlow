@@ -1,0 +1,2 @@
+"""Talking-avatar provider adapters."""
+

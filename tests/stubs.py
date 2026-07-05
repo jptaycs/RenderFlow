@@ -49,3 +49,22 @@ class StubTTS:
         return GeneratedAsset(
             data=b"fake-mp3", provider=self.name, params={"voice": voice}, cost=0.002
         )
+
+
+class StubAvatar:
+    name = "stub-avatar"
+
+    def generate_clip(
+        self, avatar_image, voice_audio, script_text: str, **params: Any
+    ) -> GeneratedAsset:
+        return GeneratedAsset(
+            data=b"fake-mp4",
+            provider=self.name,
+            params={
+                "avatar_image": str(avatar_image),
+                "voice_audio": str(voice_audio),
+                "script_chars": len(script_text),
+            },
+            cost=0.004,
+            meta={"format": "mp4"},
+        )

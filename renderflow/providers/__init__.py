@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from renderflow.config import Settings
-from renderflow.providers.base import ImageProvider, LLMProvider, TTSProvider
+from renderflow.providers.base import (
+    AvatarProvider,
+    ImageProvider,
+    LLMProvider,
+    TTSProvider,
+)
 
 
 def build_llm(settings: Settings) -> LLMProvider:
@@ -36,3 +41,11 @@ def build_tts(settings: Settings) -> TTSProvider:
 
         return PiperTTS()
     raise ValueError(f"unknown TTS provider: {settings.tts_provider}")
+
+
+def build_avatar(settings: Settings) -> AvatarProvider:
+    if settings.avatar_provider == "ffmpeg-still":
+        from renderflow.providers.avatar.ffmpeg_still import FFMpegStillAvatar
+
+        return FFMpegStillAvatar()
+    raise ValueError(f"unknown avatar provider: {settings.avatar_provider}")
