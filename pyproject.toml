@@ -14,6 +14,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# For the local dashboard (renderflow/api.py + web/)
+web = ["fastapi>=0.111", "uvicorn>=0.30"]
 # For the wav2lip-local avatar provider (see scripts/setup_wav2lip.py)
 wav2lip = [
     "torch>=2.2",

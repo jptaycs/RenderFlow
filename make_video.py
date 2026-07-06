@@ -21,7 +21,7 @@ from renderflow.pipeline.assets import (
     generate_images,
     generate_voice,
 )
-from renderflow.pipeline.render import render_video
+from renderflow.pipeline.render import render_thumbnail, render_video
 from renderflow.pipeline.script import (
     generate_script,
     script_markdown,
@@ -46,6 +46,9 @@ def main() -> int:
     parser.add_argument("--length", type=float, default=3.0, help="target minutes")
     parser.add_argument("--style", default="documentary")
     parser.add_argument("--slug", help="project directory name (default: from title)")
+    parser.add_argument(
+        "--title", help="video title (default: LLM-chosen or inferred from the script)"
+    )
     parser.add_argument(
         "--llm-split",
         action="store_true",
@@ -87,6 +90,9 @@ def main() -> int:
         plan, script_result = generate_script(llm, args.topic, args.length, args.style)
         script_cost = script_result.cost or 0.0
 
+    if args.title:
+        plan.title = args.title
+
     paths = ProjectPaths.create(settings.projects_dir, args.slug or slugify(plan.title))
     save_plan(plan, paths)
     (paths.script / "script.md").write_text(script_markdown(plan))
@@ -110,6 +116,8 @@ def main() -> int:
         render_step = "[5/5]"
     else:
         render_step = "[4/4]"
+
+    render_thumbnail(plan, paths)
 
     print(f"{render_step} Rendering with FFmpeg")
     final = render_video(plan, paths)

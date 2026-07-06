@@ -57,6 +57,18 @@ def test_completed_assets_are_skipped(paths: ProjectPaths):
     assert {s.id: s.assets.image.path for s in plan.scenes} == first_run
 
 
+def test_resume_retries_failed_assets(paths: ProjectPaths):
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    save_plan(plan, paths)
+    failed = plan.scenes[0].assets.image
+    failed.advance(AssetStatus.RUNNING)
+    failed.advance(AssetStatus.FAILED)
+    # A re-run must route failed → retrying → running, not raise InvalidTransition
+    generate_images(plan, StubImage(), paths)
+    assert failed.status is AssetStatus.COMPLETED
+    assert Path(failed.path).read_bytes() == b"fake-png"
+
+
 def test_talking_avatar_clip_generation(paths: ProjectPaths):
     plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
     plan.scenes[0].type = "talking_avatar"
@@ -156,6 +168,38 @@ def test_render_integration(paths: ProjectPaths):
     assert stream_types == {"audio", "video"}
 
 
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_render_thumbnail(paths: ProjectPaths):
+    from renderflow.pipeline.render import render_thumbnail
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    assert render_thumbnail(plan, paths) is None  # no images yet
+
+    img = paths.images / "scene_001.png"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=steelblue:s=640x360",
+         "-frames:v", "1", str(img)],
+        check=True, capture_output=True,
+    )
+    scene = plan.scenes[0]
+    scene.assets.image.advance(AssetStatus.RUNNING)
+    scene.assets.image.path = str(img)
+    scene.assets.image.advance(AssetStatus.COMPLETED)
+
+    thumb = render_thumbnail(plan, paths)
+    assert thumb == paths.output / "thumbnail.jpg" and thumb.exists()
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(thumb)],
+        check=True, capture_output=True, text=True,
+    )
+    assert probe.stdout.strip() == "1280,720"
+    # Resume: second call is a no-op that returns the existing file
+    mtime = thumb.stat().st_mtime_ns
+    assert render_thumbnail(plan, paths) == thumb
+    assert thumb.stat().st_mtime_ns == mtime
+
+
 def test_split_script_preserves_flow(paths: ProjectPaths):
     from renderflow.pipeline.script import split_script
 
@@ -183,6 +227,25 @@ def test_local_split_script_preserves_text_without_llm():
     assert all(scene.image_prompt for scene in plan.scenes)
     assert plan.scenes[0].type == "talking_avatar"
     assert plan.scenes[0].avatar is not None
+
+
+def test_local_split_script_paces_five_second_scenes():
+    from renderflow.pipeline.script import split_script_local
+
+    script = (
+        "The Colosseum could seat fifty thousand spectators, empty in under "
+        "ten minutes, and stage naval battles on a flooded arena floor built "
+        "by thousands of enslaved workers. It still stands today."
+    )
+
+    plan, _ = split_script_local(script, "documentary")
+
+    # ~2.5 words/sec: every scene stays around 5 seconds, long sentences
+    # split at clause breaks, and the text survives verbatim.
+    assert len(plan.scenes) >= 3
+    assert all(len(s.narration.split()) <= 16 for s in plan.scenes)
+    assert " ".join(s.narration for s in plan.scenes) == script
+    assert all("photograph" in s.image_prompt for s in plan.scenes)
 
 
 def test_local_split_script_ignores_block_comments():

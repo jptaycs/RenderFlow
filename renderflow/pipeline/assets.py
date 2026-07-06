@@ -17,6 +17,13 @@ def _skip(ref: AssetRef) -> bool:
     return ref.status is AssetStatus.COMPLETED and ref.path is not None
 
 
+def _start(ref: AssetRef) -> None:
+    """Move an asset into RUNNING, routing failed assets through RETRYING."""
+    if ref.status is AssetStatus.FAILED:
+        ref.advance(AssetStatus.RETRYING)
+    ref.advance(AssetStatus.RUNNING)
+
+
 def generate_images(
     plan: ScenePlan,
     provider: ImageProvider,
@@ -26,7 +33,7 @@ def generate_images(
     for scene in plan.scenes:
         ref = scene.assets.image
         if not _skip(ref):
-            ref.advance(AssetStatus.RUNNING)
+            _start(ref)
             save_plan(plan, paths)
             try:
                 asset = provider.generate(scene.image_prompt, scene.negative_prompt)
@@ -46,7 +53,7 @@ def generate_images(
         avatar_ref = scene.assets.avatar_image
         if scene.type != "talking_avatar" or _skip(avatar_ref):
             continue
-        avatar_ref.advance(AssetStatus.RUNNING)
+        _start(avatar_ref)
         save_plan(plan, paths)
         avatar_out = paths.images / f"scene_{scene.id:03d}_avatar{_image_ext(avatar_image)}"
         if avatar_image is not None:
@@ -85,7 +92,7 @@ def generate_voice(
         ref = scene.assets.voice
         if _skip(ref):
             continue
-        ref.advance(AssetStatus.RUNNING)
+        _start(ref)
         save_plan(plan, paths)
         try:
             asset = provider.synthesize(scene.narration, voice, **tts_params)
@@ -120,7 +127,7 @@ def generate_avatar_clips(
                 f"scene {scene.id} needs completed avatar image and voice before avatar"
             )
 
-        ref.advance(AssetStatus.RUNNING)
+        _start(ref)
         save_plan(plan, paths)
         try:
             asset = provider.generate_clip(

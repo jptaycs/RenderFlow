@@ -78,8 +78,6 @@ def _zoompan_expr(scene: Scene, frames: int) -> str:
 
 def render_scene_clip(scene: Scene, out: Path) -> Path:
     if scene.type == "talking_avatar" and scene.assets.avatar_clip.path:
-        if scene.id == 1:
-            return render_avatar_full_clip(Path(scene.assets.avatar_clip.path), out)
         assert scene.assets.image.path
         return render_avatar_split_clip(
             scene, Path(scene.assets.avatar_clip.path), Path(scene.assets.image.path), out
@@ -97,28 +95,6 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
             "-i", str(audio),
             "-filter_complex", f"[0:v]{_zoompan_expr(scene, frames)}[v]",
             "-map", "[v]", "-map", "1:a",
-            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
-            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-            "-t", f"{duration:.3f}",
-            "-shortest",
-            str(out),
-        ]
-    )
-    return out
-
-
-def render_avatar_full_clip(avatar_clip: Path, out: Path) -> Path:
-    duration = probe_duration(avatar_clip)
-    _run(
-        [
-            "ffmpeg", "-y",
-            "-i", str(avatar_clip),
-            "-vf",
-            (
-                f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
-                f"crop={WIDTH}:{HEIGHT},format=yuv420p"
-            ),
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
             "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
@@ -160,6 +136,32 @@ def render_avatar_split_clip(
         ]
     )
     return out
+
+
+def render_thumbnail(plan: ScenePlan, paths: ProjectPaths) -> Path | None:
+    """Project thumbnail (1280x720 JPEG) from the first completed scene image.
+
+    Runs at the end of asset generation; skipped if already present (resume).
+    """
+    thumb = paths.output / "thumbnail.jpg"
+    if thumb.exists():
+        return thumb
+    source = next(
+        (s.assets.image.path for s in plan.scenes if s.assets.image.path), None
+    )
+    if source is None:
+        return None
+    _run(
+        [
+            "ffmpeg", "-y",
+            "-i", source,
+            "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
+            "-frames:v", "1", "-q:v", "3",
+            str(thumb),
+        ]
+    )
+    log.info("thumbnail: %s", thumb)
+    return thumb
 
 
 def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:

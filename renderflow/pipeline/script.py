@@ -12,7 +12,7 @@ from renderflow.schema import AvatarSpec, GeneratedScript, Motion, Scene, SceneP
 
 log = logging.getLogger("renderflow.pipeline.script")
 
-SECONDS_PER_SCENE = 15
+SECONDS_PER_SCENE = 5
 LOCAL_AVATAR = AvatarSpec(
     name="David Lester",
     description=(
@@ -30,12 +30,19 @@ image with slow pan/zoom motion, narrated by a voiceover.
 Rules:
 - Narration must read naturally when spoken aloud: no headings, no markdown,
   no stage directions, no "Scene 1:" prefixes.
+- Keep scenes short: about 5 seconds each (10-16 spoken words), so the visual
+  changes constantly. Never pack several sentences into one scene.
 - Each scene's narration should take roughly its duration_estimate_sec to
   speak at a natural pace (~2.5 words per second).
-- image_prompt describes a single cinematic still for an image model: subject,
-  composition, lighting, mood. No text or lettering in the image.
-- negative_prompt lists things the image model should avoid
-  (e.g. "text, watermark, low quality, deformed hands").
+- image_prompt must read like the caption of a real photograph, not digital
+  art: a concrete subject in a concrete setting, camera framing (wide shot,
+  close-up, aerial), lens and film feel (e.g. "35mm documentary photograph,
+  shallow depth of field"), natural lighting, era-accurate details and
+  textures. No text or lettering in the image.
+- negative_prompt lists things the image model should avoid; always include
+  realism killers (e.g. "text, watermark, cartoon, illustration, painting,
+  3d render, CGI, plastic skin, oversaturated colors, deformed hands,
+  low quality").
 - Vary motion between scenes (zoom_in, zoom_out, pan_left, pan_right) with
   intensity between 0.05 and 0.15.
 - Scene ids start at 1 and increment by 1.
@@ -82,13 +89,19 @@ Rules:
   appear in exactly one scene's narration, in the original order. Do not add,
   remove, or rephrase anything. Only strip markdown/heading syntax if present.
 - Split at natural beats: a new visual idea, location, subject, or argument.
-  Aim for 20-50 spoken words per scene (roughly 10-20 seconds of speech).
+  Aim for 10-16 spoken words per scene (about 5 seconds of speech), so the
+  visual changes constantly. Split long sentences at natural clause breaks
+  (commas, dashes) instead of merging sentences into one scene.
 - duration_estimate_sec = narration word count / 2.5.
-- image_prompt: one cinematic, photorealistic still that matches the scene's
-  content: subject, composition, lighting, mood. No text or lettering.
-  Keep a consistent visual style across all scenes.
-- negative_prompt: what the image model should avoid
-  (e.g. "text, watermark, low quality, deformed hands").
+- image_prompt must read like the caption of a real photograph, not digital
+  art: a concrete subject in a concrete setting, camera framing (wide shot,
+  close-up, aerial), lens and film feel (e.g. "35mm documentary photograph,
+  shallow depth of field"), natural lighting, era-accurate details and
+  textures. No text or lettering. Keep a consistent photographic style
+  across all scenes.
+- negative_prompt: what the image model should avoid; always include realism
+  killers (e.g. "text, watermark, cartoon, illustration, painting, 3d render,
+  CGI, plastic skin, oversaturated colors, deformed hands, low quality").
 - Vary motion between scenes (zoom_in, zoom_out, pan_left, pan_right),
   intensity 0.05-0.15.
 - Scene ids start at 1 and increment by 1.
@@ -129,7 +142,11 @@ def split_script_local(script_text: str, style: str) -> tuple[ScenePlan, LLMResu
             duration_estimate_sec=max(2.0, len(chunk.split()) / 2.5),
             narration=chunk,
             image_prompt=_local_image_prompt(chunk, style),
-            negative_prompt="text, watermark, subtitles, captions, low quality, blurry",
+            negative_prompt=(
+                "text, watermark, subtitles, captions, cartoon, illustration, "
+                "painting, 3d render, CGI, plastic skin, oversaturated colors, "
+                "deformed hands, low quality, blurry"
+            ),
             avatar=LOCAL_AVATAR if _uses_local_avatar(index) else None,
             motion=Motion(
                 effect=motions[(index - 1) % len(motions)],
@@ -150,7 +167,9 @@ def split_script_local(script_text: str, style: str) -> tuple[ScenePlan, LLMResu
 
 
 def _uses_local_avatar(scene_index: int) -> bool:
-    return scene_index == 1 or scene_index % 4 == 0
+    # The host speaks in every scene: each ~5 s clip renders split-screen
+    # (avatar left, scene visual right) so the presenter is always on camera.
+    return True
 
 
 def _strip_script_markup(script_text: str) -> str:
@@ -175,24 +194,52 @@ def _sentences(text: str) -> list[str]:
 
 
 def _chunk_sentences(
-    sentences: list[str], min_words: int = 25, max_words: int = 55
+    sentences: list[str], min_words: int = 6, max_words: int = 16
 ) -> list[str]:
+    # ~2.5 spoken words/second, so max_words=16 keeps scenes around 5 seconds:
+    # the visual changes on every beat instead of lingering for half a minute.
+    pieces: list[str] = []
+    for sentence in sentences:
+        if len(sentence.split()) > max_words:
+            pieces.extend(_split_long_sentence(sentence, max_words))
+        else:
+            pieces.append(sentence)
+
     chunks: list[str] = []
     current: list[str] = []
     current_words = 0
 
-    for sentence in sentences:
-        words = len(sentence.split())
+    for piece in pieces:
+        words = len(piece.split())
         if current and current_words >= min_words and current_words + words > max_words:
             chunks.append(" ".join(current))
             current = []
             current_words = 0
-        current.append(sentence)
+        current.append(piece)
         current_words += words
 
     if current:
         chunks.append(" ".join(current))
     return chunks
+
+
+def _split_long_sentence(sentence: str, max_words: int) -> list[str]:
+    """Split an over-long sentence at clause breaks so TTS pauses naturally."""
+    clauses = re.split(r"(?<=[,;:—])\s+", sentence)
+    pieces: list[str] = []
+    current: list[str] = []
+    current_words = 0
+    for clause in clauses:
+        words = len(clause.split())
+        if current and current_words + words > max_words:
+            pieces.append(" ".join(current))
+            current = []
+            current_words = 0
+        current.append(clause)
+        current_words += words
+    if current:
+        pieces.append(" ".join(current))
+    return pieces
 
 
 def _infer_title(script_text: str) -> str:
@@ -207,9 +254,14 @@ def _local_image_prompt(narration: str, style: str) -> str:
     excerpt = narration
     if len(excerpt) > 180:
         excerpt = excerpt[:177].rsplit(" ", 1)[0] + "..."
+    excerpt = excerpt.rstrip(",;:— ")
+    if not excerpt.endswith((".", "!", "?", "…")):
+        excerpt += "."
     return (
-        f"Cinematic photorealistic {style} still illustrating this narration: "
-        f"{excerpt}. Natural lighting, documentary composition, no visible text."
+        f"Realistic {style} photograph depicting: {excerpt} "
+        "Shot on 35mm film, natural lighting, shallow depth of field, "
+        "documentary composition, era-accurate details, realistic skin and "
+        "surface textures, muted natural colors, no visible text."
     )
 
 
