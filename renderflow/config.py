@@ -24,7 +24,10 @@ class Settings:
 
     @classmethod
     def load(cls) -> "Settings":
-        load_dotenv()
+        # override=True: .env is the source of truth, so edits apply to the
+        # next run without restarting the API server (whose inherited env
+        # would otherwise pin subprocesses to stale values).
+        load_dotenv(override=True)
         return cls(
             llm_provider=os.getenv("RENDERFLOW_LLM_PROVIDER", "claude"),
             image_provider=os.getenv("RENDERFLOW_IMAGE_PROVIDER", "flux-replicate"),

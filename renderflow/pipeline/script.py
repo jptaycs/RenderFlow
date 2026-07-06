@@ -36,13 +36,19 @@ Rules:
   speak at a natural pace (~2.5 words per second).
 - image_prompt must read like the caption of a real photograph, not digital
   art: a concrete subject in a concrete setting, camera framing (wide shot,
-  close-up, aerial), lens and film feel (e.g. "35mm documentary photograph,
-  shallow depth of field"), natural lighting, era-accurate details and
-  textures. No text or lettering in the image.
+  medium shot, aerial), lens and film feel (e.g. "35mm documentary
+  photograph, shallow depth of field"), natural lighting, era-accurate
+  details and textures. No text or lettering in the image.
+- Never a lone human face or single-person headshot. Every image must
+  combine at least two visual elements: what the sentence talks about plus
+  its topic context (the setting, objects, actions, or secondary subjects).
+  Show people in their environment doing something — wide or medium shots,
+  not face close-ups.
 - negative_prompt lists things the image model should avoid; always include
-  realism killers (e.g. "text, watermark, cartoon, illustration, painting,
-  3d render, CGI, plastic skin, oversaturated colors, deformed hands,
-  low quality").
+  realism killers and lone-face killers (e.g. "text, watermark, cartoon,
+  illustration, painting, 3d render, CGI, plastic skin, oversaturated
+  colors, deformed hands, low quality, lone face close-up, single face
+  filling the frame").
 - Vary motion between scenes (zoom_in, zoom_out, pan_left, pan_right) with
   intensity between 0.05 and 0.15.
 - Scene ids start at 1 and increment by 1.
@@ -95,13 +101,20 @@ Rules:
 - duration_estimate_sec = narration word count / 2.5.
 - image_prompt must read like the caption of a real photograph, not digital
   art: a concrete subject in a concrete setting, camera framing (wide shot,
-  close-up, aerial), lens and film feel (e.g. "35mm documentary photograph,
-  shallow depth of field"), natural lighting, era-accurate details and
-  textures. No text or lettering. Keep a consistent photographic style
-  across all scenes.
+  medium shot, aerial), lens and film feel (e.g. "35mm documentary
+  photograph, shallow depth of field"), natural lighting, era-accurate
+  details and textures. No text or lettering. Keep a consistent
+  photographic style across all scenes.
+- Never a lone human face or single-person headshot. Every image must
+  combine at least two visual elements: what the sentence talks about plus
+  its topic context (the setting, objects, actions, or secondary subjects).
+  Show people in their environment doing something — wide or medium shots,
+  not face close-ups.
 - negative_prompt: what the image model should avoid; always include realism
-  killers (e.g. "text, watermark, cartoon, illustration, painting, 3d render,
-  CGI, plastic skin, oversaturated colors, deformed hands, low quality").
+  killers and lone-face killers (e.g. "text, watermark, cartoon,
+  illustration, painting, 3d render, CGI, plastic skin, oversaturated
+  colors, deformed hands, low quality, lone face close-up, single face
+  filling the frame").
 - Vary motion between scenes (zoom_in, zoom_out, pan_left, pan_right),
   intensity 0.05-0.15.
 - Scene ids start at 1 and increment by 1.
@@ -145,7 +158,8 @@ def split_script_local(script_text: str, style: str) -> tuple[ScenePlan, LLMResu
             negative_prompt=(
                 "text, watermark, subtitles, captions, cartoon, illustration, "
                 "painting, 3d render, CGI, plastic skin, oversaturated colors, "
-                "deformed hands, low quality, blurry"
+                "deformed hands, low quality, blurry, lone face close-up, "
+                "single face filling the frame, isolated headshot"
             ),
             avatar=LOCAL_AVATAR if _uses_local_avatar(index) else None,
             motion=Motion(
@@ -259,8 +273,10 @@ def _local_image_prompt(narration: str, style: str) -> str:
         excerpt += "."
     return (
         f"Realistic {style} photograph depicting: {excerpt} "
-        "Shot on 35mm film, natural lighting, shallow depth of field, "
-        "documentary composition, era-accurate details, realistic skin and "
+        "Wide or medium shot combining the subject with its surroundings — "
+        "setting, objects, and actions from the narration, never a lone "
+        "face close-up. Shot on 35mm film, natural lighting, shallow depth "
+        "of field, documentary composition, era-accurate details, realistic "
         "surface textures, muted natural colors, no visible text."
     )
 

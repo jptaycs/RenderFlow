@@ -106,18 +106,22 @@ class ScenePlan(BaseModel):
     title: str
     style: str
     scenes: list[Scene]
+    # Project-level clickbait thumbnail image (generated after scene assets).
+    thumbnail: AssetRef = Field(default_factory=AssetRef)
 
     def total_asset_cost(self) -> float:
         total = 0.0
+        refs = [self.thumbnail]
         for scene in self.scenes:
-            for ref in (
+            refs += [
                 scene.assets.image,
                 scene.assets.avatar_image,
                 scene.assets.voice,
                 scene.assets.avatar_clip,
-            ):
-                if ref.cost is not None:
-                    total += ref.cost
+            ]
+        for ref in refs:
+            if ref.cost is not None:
+                total += ref.cost
         return total
 
 

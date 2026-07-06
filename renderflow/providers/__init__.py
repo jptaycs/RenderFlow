@@ -40,6 +40,10 @@ def build_tts(settings: Settings) -> TTSProvider:
         from renderflow.providers.tts.piper_tts import PiperTTS
 
         return PiperTTS()
+    if settings.tts_provider == "kokoro":
+        from renderflow.providers.tts.kokoro_tts import KokoroTTS
+
+        return KokoroTTS()
     raise ValueError(f"unknown TTS provider: {settings.tts_provider}")
 
 

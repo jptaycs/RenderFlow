@@ -9,3 +9,4 @@ projects/
 *.egg-info/
 .pytest_cache/
 dist/
+.kokoro/

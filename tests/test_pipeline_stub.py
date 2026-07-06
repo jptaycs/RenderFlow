@@ -69,6 +69,16 @@ def test_resume_retries_failed_assets(paths: ProjectPaths):
     assert Path(failed.path).read_bytes() == b"fake-png"
 
 
+def test_resume_recovers_assets_orphaned_in_running_state(paths: ProjectPaths):
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    save_plan(plan, paths)
+    orphaned = plan.scenes[0].assets.image
+    orphaned.advance(AssetStatus.RUNNING)  # run crashed/killed mid-asset
+    generate_images(plan, StubImage(), paths)
+    assert orphaned.status is AssetStatus.COMPLETED
+    assert Path(orphaned.path).read_bytes() == b"fake-png"
+
+
 def test_talking_avatar_clip_generation(paths: ProjectPaths):
     plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
     plan.scenes[0].type = "talking_avatar"
@@ -111,9 +121,11 @@ HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is n
 
 
 @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
-def test_render_integration(paths: ProjectPaths):
+def test_render_integration(paths: ProjectPaths, monkeypatch):
     from renderflow.pipeline.render import probe_duration, render_video
 
+    # Keep the integration test hermetic: zoompan needs no depth model.
+    monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
     plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
     plan.scenes[1].type = "talking_avatar"
 
@@ -166,6 +178,48 @@ def test_render_integration(paths: ProjectPaths):
     )
     stream_types = {s["codec_type"] for s in json.loads(probe.stdout)["streams"]}
     assert stream_types == {"audio", "video"}
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_parallax_clip_renders_with_synthetic_depth(tmp_path, monkeypatch):
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("transformers")
+    from renderflow.pipeline import parallax
+    from renderflow.pipeline.render import probe_duration
+
+    img = tmp_path / "img.png"
+    arr = np.zeros((360, 640, 3), np.uint8)
+    arr[:180], arr[180:] = 200, 60
+    cv2.imwrite(str(img), arr)
+    # Synthetic depth gradient — no model download in tests.
+    monkeypatch.setattr(
+        parallax, "_depth",
+        lambda image: np.tile(
+            np.linspace(0.0, 1.0, image.shape[0], dtype=np.float32)[:, None],
+            (1, image.shape[1]),
+        ),
+    )
+
+    out = tmp_path / "clip.mp4"
+    assert parallax.render_parallax_clip(img, out, 0.5, 320, 180, "pan_right", 0.08)
+    assert probe_duration(out) == pytest.approx(0.5, abs=0.2)
+
+
+def test_generate_thumbnail_is_tracked_and_resumable(paths: ProjectPaths):
+    from renderflow.pipeline.assets import generate_thumbnail
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    save_plan(plan, paths)
+    generate_thumbnail(plan, StubImage(), paths)
+
+    assert plan.thumbnail.status is AssetStatus.COMPLETED
+    assert Path(plan.thumbnail.path).read_bytes() == b"fake-png"
+    assert plan.thumbnail.cost == 0.003
+    assert plan.total_asset_cost() == pytest.approx(0.003)  # images not yet run
+    first_path = plan.thumbnail.path
+    generate_thumbnail(plan, StubImage(), paths)  # resume skips
+    assert plan.thumbnail.path == first_path
 
 
 @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
@@ -246,6 +300,9 @@ def test_local_split_script_paces_five_second_scenes():
     assert all(len(s.narration.split()) <= 16 for s in plan.scenes)
     assert " ".join(s.narration for s in plan.scenes) == script
     assert all("photograph" in s.image_prompt for s in plan.scenes)
+    # Composition rule: subject + context, never a lone face
+    assert all("never a lone" in s.image_prompt for s in plan.scenes)
+    assert all("lone face close-up" in s.negative_prompt for s in plan.scenes)
 
 
 def test_local_split_script_ignores_block_comments():

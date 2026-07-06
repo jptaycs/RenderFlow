@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -18,7 +19,14 @@ def _skip(ref: AssetRef) -> bool:
 
 
 def _start(ref: AssetRef) -> None:
-    """Move an asset into RUNNING, routing failed assets through RETRYING."""
+    """Move an asset into RUNNING, routing failed assets through RETRYING.
+
+    An asset already marked RUNNING was orphaned by a crashed/killed run
+    (nothing else may run concurrently on a project) — fail it first so it
+    can legally re-enter RUNNING.
+    """
+    if ref.status is AssetStatus.RUNNING:
+        ref.advance(AssetStatus.FAILED)
     if ref.status is AssetStatus.FAILED:
         ref.advance(AssetStatus.RETRYING)
     ref.advance(AssetStatus.RUNNING)
@@ -151,6 +159,72 @@ def generate_avatar_clips(
         ref.advance(AssetStatus.COMPLETED)
         save_plan(plan, paths)
         log.info("scene %d avatar clip done (%s)", scene.id, out.name)
+
+
+def generate_thumbnail(
+    plan: ScenePlan, provider: ImageProvider, paths: ProjectPaths
+) -> None:
+    """Generate the clickbait thumbnail source image (one per project)."""
+    ref = plan.thumbnail
+    if _skip(ref):
+        return
+    _start(ref)
+    save_plan(plan, paths)
+    try:
+        asset = provider.generate(
+            _thumbnail_prompt(plan),
+            "text, words, letters, watermark, logo, cartoon, illustration, "
+            "3d render, low quality, blurry",
+        )
+    except Exception:
+        ref.advance(AssetStatus.FAILED)
+        save_plan(plan, paths)
+        raise
+    out = paths.output / "thumbnail_src.png"
+    out.write_bytes(asset.data)
+    ref.path = str(out)
+    ref.provider = asset.provider
+    ref.cost = asset.cost
+    ref.advance(AssetStatus.COMPLETED)
+    save_plan(plan, paths)
+    log.info("thumbnail image done (%s)", out.name)
+
+
+# Clickbait-template and stop words stripped from titles to find the topic.
+# Feeding the full title into the image model makes it render the title as
+# (garbled) text in the picture — learned the hard way.
+_TITLE_FILLER = frozenset(
+    """
+    the a an of in on for to and or is are was were it its it's this that
+    how why what when who which nobody everybody everyone anyone they you
+    your i we truth about tells tell told know knew known should would
+    could want wants dont don't wont won't really actually quietly hidden
+    untold story secret cost costing money wrong right before after too
+    late changes changed everything nothing looked into found
+    """.split()
+)
+
+
+def _topic_from_title(title: str) -> str:
+    words = [
+        w for w in re.findall(r"[A-Za-z0-9'-]+", title)
+        if w.lower() not in _TITLE_FILLER
+    ]
+    return " ".join(words) or title
+
+
+def _thumbnail_prompt(plan: ScenePlan) -> str:
+    # Topic-literal on purpose: the host portrait is composited on the left
+    # afterwards (render_thumbnail), so the subject sits right, no people.
+    topic = _topic_from_title(plan.title)
+    return (
+        f"Viral YouTube thumbnail background: a dramatic photograph of "
+        f"{topic}. One instantly recognizable {topic} scene, huge in the "
+        "frame and positioned toward the right side. No people, no faces. "
+        "Extreme contrast, vivid saturated colors, dramatic cinematic "
+        "lighting, photorealistic, absolutely no text, no words, no letters, "
+        "no typography."
+    )
 
 
 def _avatar_image_prompt(scene: Scene) -> str:

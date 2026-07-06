@@ -19,6 +19,7 @@ from renderflow.config import Settings
 from renderflow.pipeline.assets import (
     generate_avatar_clips,
     generate_images,
+    generate_thumbnail,
     generate_voice,
 )
 from renderflow.pipeline.render import render_thumbnail, render_video
@@ -106,6 +107,10 @@ def main() -> int:
     if settings.tts_provider == "piper":
         tts_params["length_scale"] = settings.tts_length_scale
         tts_params["sentence_pause_sec"] = settings.tts_sentence_pause
+    elif settings.tts_provider == "kokoro":
+        # Kokoro speed is the inverse of Piper's length_scale (1.0 = natural).
+        tts_params["speed"] = 1.0 / settings.tts_length_scale
+        tts_params["sentence_pause_sec"] = settings.tts_sentence_pause
     generate_voice(plan, tts, settings.tts_voice, paths, **tts_params)
 
     avatar_scene_count = sum(scene.type == "talking_avatar" for scene in plan.scenes)
@@ -117,7 +122,8 @@ def main() -> int:
     else:
         render_step = "[4/4]"
 
-    render_thumbnail(plan, paths)
+    generate_thumbnail(plan, image, paths)
+    render_thumbnail(plan, paths, avatar_image=avatar_image)
 
     print(f"{render_step} Rendering with FFmpeg")
     final = render_video(plan, paths)

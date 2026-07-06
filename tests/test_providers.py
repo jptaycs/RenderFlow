@@ -40,6 +40,22 @@ def test_memo_hf_satisfies_avatar_protocol():
     assert isinstance(MemoHFAvatar(), AvatarProvider)
 
 
+def test_kokoro_requires_setup(tmp_path):
+    from renderflow.providers.tts.kokoro_tts import KokoroTTS
+
+    with pytest.raises(ValueError, match="setup_kokoro"):
+        KokoroTTS(model_dir=tmp_path / "missing")
+
+
+def test_kokoro_satisfies_tts_protocol():
+    pytest.importorskip("kokoro_onnx")
+    from renderflow.providers.tts.kokoro_tts import DEFAULT_MODEL_DIR, KokoroTTS
+
+    if not (DEFAULT_MODEL_DIR / "kokoro-v1.0.onnx").exists():
+        pytest.skip("kokoro model files not downloaded")
+    assert isinstance(KokoroTTS(), TTSProvider)
+
+
 def test_split_sentences():
     from renderflow.providers.tts.piper_tts import _split_sentences
 

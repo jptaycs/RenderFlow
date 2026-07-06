@@ -13,14 +13,15 @@ RenderFlow is an AI video production **orchestration platform**: topic or script
 Working today, verified against live services:
 
 - Synchronous CLI pipeline: scene plan → images → voice → FFmpeg 1080p MP4
-- Providers: Claude (LLM, untested live — no API key yet), Pollinations + Flux-Replicate (image), Piper + ElevenLabs (TTS)
+- Providers: Claude (LLM, untested live — no API key yet), Pollinations + Flux-Replicate (image), Kokoro (**default TTS** — local, natural prosody) + Piper + ElevenLabs (TTS)
 - Resumable asset generation (completed assets skip on re-run), per-asset cost tracking
 - Talking-avatar scene contract with four providers: `wav2lip-local` (**default in practice** — free unlimited local lip sync + camera push-in, verified live, ~real-time on CPU), `ffmpeg-still` placeholder (static image + voice; no lip sync), `sadtalker-replicate` (paid lip sync + real head motion via Replicate; written, unverified — needs a funded `REPLICATE_API_TOKEN`), and `memo-hf` (free HF Space, demo-only: 4s audio cap)
 - Piper narration pacing: `RENDERFLOW_TTS_LENGTH_SCALE` + sentence-pause insertion (see Provider notes)
-- Fast visual pacing: scripts split into ~5-second scenes (clause-level splits for long sentences); image prompts are written as realistic photo captions with anti-AI-look negative prompts
+- Fast visual pacing: scripts split into ~5-second scenes (clause-level splits for long sentences); image prompts are written as realistic photo captions with anti-AI-look negative prompts. Composition rule: never a lone human face — every image combines the sentence's subject with its topic context (setting/objects/actions; wide or medium shots), enforced in both LLM prompts and the local prompt builder + negative prompts
 - Local web dashboard (`renderflow/api.py` + `web/index.html`): FastAPI serves project state, live scene thumbnails, and launches `make_video.py` runs as subprocesses (create / resume / regenerate-scene). Finished renders are download-only by design (no inline player — client preference); the download card shows the project thumbnail. Verified live end-to-end. Dev stand-in for the Week-2 worker queue — pipeline never runs inside a request handler.
-- Project thumbnail: `render_thumbnail()` (pipeline/render.py) writes `output/thumbnail.jpg` (1280×720, from the first completed scene image) at the end of asset generation, before the render step; skipped on resume if it exists.
+- Project thumbnail: a **generated clickbait image + host badge**, not a scene crop. `assets.generate_thumbnail()` extracts the topic from the title (`_topic_from_title` strips clickbait filler words — do NOT put the full title in the image prompt, the model renders it as garbled text; learned 2026-07), generates a topic-literal dramatic image (subject right, no people) via the ImageProvider, tracked as `ScenePlan.thumbnail` (plan-level `AssetRef`, in `total_asset_cost()`, resume-aware). `render.render_thumbnail()` crops to 1280×720 `output/thumbnail.jpg` and composites `RENDERFLOW_AVATAR_IMAGE` as a white-ringed circular host badge bottom-left (PIL; skipped gracefully if PIL/portrait missing; falls back to the first scene image if generation never ran). The New Video modal has a "Make it clickbait" button that cycles the typed topic through title templates client-side.
 - Dashboard render-state rule (`api.py`): a `final.mp4` counts as done only if **all assets are completed and the file is newer than scenes.json** (which is rewritten on every asset update) — a leftover video from an earlier run never shows as Complete/downloadable while assets are regenerating.
+- Run tracking survives API restarts: `_spawn` writes `logs/run.pid`; `_run_active` falls back to it and verifies the pid is a live `make_video.py` process. Assets orphaned in `running` state by a crashed/killed run are recovered on resume (`_start` routes running → failed → retrying → running). Learned the hard way: an in-memory-only `_runs` dict made live runs show "Paused" after a restart, and Resume then spawned a colliding duplicate that died with `InvalidTransition: running -> running`.
 
 Not built yet (roadmap order): stock-video B-roll (Pexels), subtitles (faster-whisper → ASS), narrator character consistency, more lip-sync avatar providers, background music/crossfades, Celery/Redis workers, Postgres, FastAPI, Next.js dashboard.
 
@@ -36,7 +37,9 @@ Not built yet (roadmap order): stock-video B-roll (Pexels), subtitles (faster-wh
 .venv/bin/python scripts/check_providers.py [claude|image|tts]   # live provider verification (< $0.02)
 .venv/bin/python scripts/check_providers.py avatar               # live lip-sync clip (opt-in; saves projects/avatar_check.mp4)
 .venv/bin/pip install '.[web]' && .venv/bin/python -m renderflow.api  # dashboard at http://127.0.0.1:8321
+.venv/bin/pip install '.[parallax]'   # deps for depth-parallax scene motion (default RENDERFLOW_MOTION)
 .venv/bin/pip install '.[wav2lip]' && .venv/bin/python scripts/setup_wav2lip.py  # one-time wav2lip-local setup (~520 MB)
+.venv/bin/pip install '.[kokoro]' && .venv/bin/python scripts/setup_kokoro.py    # one-time kokoro TTS setup (~340 MB)
 python -m piper.download_voices en_US-lessac-medium --data-dir .voices           # fetch a Piper voice
 ```
 
@@ -62,16 +65,17 @@ Key mechanics that span multiple files:
 - **Asset state machine is exactly** `pending → running → completed | failed → retrying → running | cancelled`, enforced by `AssetRef.advance` (raises `InvalidTransition`).
 - **Resume:** an asset with `status=completed` and a `path` is skipped on re-run. Consequence: config changes (voice, pacing, provider) do **not** retrofit an existing project — use a fresh `--slug` or delete the relevant `projects/<slug>/{voice,avatar}/` files.
 - **Provider layer:** `providers/base.py` defines `Protocol`s (`LLMProvider`, `ImageProvider`, `TTSProvider`, `AvatarProvider`) returning `GeneratedAsset`/`LLMResult`; `providers/__init__.py` is the registry mapping env-selected names to adapters. `retry.py` supplies the backoff decorator adapters wrap their live calls with.
-- **Rendering rules** (`pipeline/render.py`): scene duration always comes from ffprobe of the generated voice audio (or avatar clip) — never `duration_estimate_sec`. Stills get zoompan motion (prescaled 2560×1440 to avoid sub-pixel jitter). Every talking-avatar scene renders split-screen (768px lip-synced avatar left, zoompan visual right); the local splitter marks **every** scene `talking_avatar`, so the host is on camera for the whole video (full-screen avatar path removed 2026-07). Audio is loudness-normalized per clip; final concat re-encodes with `+faststart`.
+- **Rendering rules** (`pipeline/render.py`): scene duration always comes from ffprobe of the generated voice audio (or avatar clip) — never `duration_estimate_sec`. Scene visuals get **depth-parallax motion** by default (`pipeline/parallax.py`: Depth-Anything-V2-Small depth map + OpenCV remap, ~50 MB one-time HF download, ~2-5 s/scene on CPU; verified live 2026-07); `RENDERFLOW_MOTION=zoompan` opts out, and missing deps / depth failures fall back to zoompan automatically (flat Ken Burns, prescaled 2560×1440 to avoid sub-pixel jitter). Every talking-avatar scene renders split-screen (768px lip-synced avatar left, zoompan visual right); the local splitter marks **every** scene `talking_avatar`, so the host is on camera for the whole video (full-screen avatar path removed 2026-07). Audio is loudness-normalized per clip; final concat re-encodes with `+faststart`.
 - **File formats ripple:** Piper emits WAV, ElevenLabs MP3 — `pipeline/assets.py` derives the file extension from `asset.meta["format"]`; lip-sync models want WAV, so `providers/avatar/postprocess.py` transcodes. That module also burns the "AI-generated host" disclosure banner into every avatar clip — **but the burn-in silently degrades to no banner when ffmpeg lacks `drawtext`, and the dev machine's ffmpeg build has no drawtext filter (discovered 2026-07), so local clips currently ship without the disclosure.** Fix path: reinstall ffmpeg with libfreetype, or overlay a pre-rendered PNG instead of drawtext.
 
 ## Layout
 
 ```
 make_video.py               CLI entry point (the web API shells out to this too)
-web/index.html              dashboard UI (vanilla JS, embedded fonts, polls /api/state)
+web/index.html              dashboard UI (vanilla JS, embedded fonts; polls /api/state
+                            every 2.5s but re-renders only when state changed, preserving scroll)
 renderflow/
-  api.py                    FastAPI: /api/state, create/resume/regenerate, /files static
+  api.py                    FastAPI: /api/state, create/resume/regenerate/delete, /files static
   schema.py                 Scene JSON schema (Pydantic) + asset state machine — THE central contract
   config.py                 Settings from .env
   storage.py                projects/<slug>/{script,images,voice,avatar,subtitles,output,logs}/, plan save/load
@@ -79,16 +83,18 @@ renderflow/
   pipeline/
     script.py               topic→scenes and client-script→scenes prompts (LLM)
     assets.py               per-scene image/voice/avatar generation, state + cost persistence
-    render.py               FFmpeg zoompan, avatar full/split clips, concat, mux
+    render.py               FFmpeg scene clips (split-screen avatar), concat, mux
+    parallax.py             depth-parallax motion (Depth-Anything-V2 + cv2 remap)
   providers/
     base.py                 Protocol interfaces: LLMProvider, ImageProvider, TTSProvider, AvatarProvider + GeneratedAsset
     __init__.py             registry — env vars select active provider
-    llm/claude.py           image/{flux_replicate,pollinations}.py   tts/{elevenlabs_tts,piper_tts}.py
+    llm/claude.py           image/{flux_replicate,pollinations}.py   tts/{elevenlabs_tts,piper_tts,kokoro_tts}.py
     avatar/                 ffmpeg_still, wav2lip_local, sadtalker_replicate, memo_hf
                             + postprocess.py (shared wav transcode / disclosure burn-in)
 scripts/
   check_providers.py        one minimal live call per provider
   setup_wav2lip.py          one-time .wav2lip/ download for wav2lip-local
+  setup_kokoro.py           one-time .kokoro/ download for kokoro TTS
 tests/                      stub providers, schema/state-machine/pipeline tests, FFmpeg integration test
 ```
 
@@ -118,8 +124,10 @@ Tuning: `RENDERFLOW_TTS_LENGTH_SCALE` (Piper pace, higher = slower, 1.4 ≈ docu
 ## Provider notes (learned the hard way — do not rediscover)
 
 - **ElevenLabs free tier blocks "library" voices over the API** (402 `paid_plan_required`). Only the account's *premade* voices work — e.g. George `JBFqnCBsd6RMkjVDRZzb` (documentary storyteller). Free tier = 10k chars/month, **no commercial rights**.
-- **Pollinations** is keyless/free but anonymously caps at 1024×576 regardless of requested size (re-verified 2026-07); the renderer upscales, so output is 1080p but soft. A free registered token from auth.pollinations.ai (set `POLLINATIONS_TOKEN`) is sent as a Bearer header and lifts limits/watermark — whether it unlocks true 1080p is untested (no token yet). No `negative_prompt` input — the adapter folds it into the prompt. Can be slow (30–60 s/image); retries are configured.
-- **Piper** voices live in `.voices/` (~60 MB each). MIT license — commercial use OK. Current narrator: `en_US-john-medium` (deep older male); `en_US-lessac-medium` and `en_US-ryan-low` also downloaded. Client rule: visuals must be AI-generated, created for the story — **no stock photos/footage** (a Pexels provider was built and removed 2026-07).
+- **Pollinations** is keyless/free but anonymously caps at 1024×576 regardless of requested size (re-verified 2026-07); the renderer upscales, so output is 1080p but soft. A free registered token from auth.pollinations.ai (set `POLLINATIONS_TOKEN`) is sent as a Bearer header and lifts limits/watermark — whether it unlocks true 1080p is untested (no token yet). No `negative_prompt` input — the adapter folds it into the prompt. Can be slow (30–60 s/image). **Rate limits are real and sticky**: anonymous = 1 request/15 s, registered = 1/5 s; bursting past them earns persistent 429s that outlive short retries (hit 2026-07 after a 59-scene run). The adapter self-throttles to the allowed interval and retries with 20–60 s backoff — budget ~15-20 s/image anonymous.
+- **Kokoro** (`kokoro-onnx`, Apache-2.0 — commercial OK) is the default narrator: far more natural prosody than Piper, runs local CPU faster than realtime, 24 kHz WAV. Setup: `pip install '.[kokoro]' && python scripts/setup_kokoro.py` (~340 MB into `.kokoro/`). Current voice `bm_george` (older British male); alternates `am_onyx` (deep US), `am_fenrir`. `speed` = 1/`RENDERFLOW_TTS_LENGTH_SCALE` (mapped in make_video); sentence pauses inserted like Piper. No literal breath sounds — that tier is paid (ElevenLabs).
+- **Piper** voices live in `.voices/` (~60 MB each). MIT license — commercial use OK. Downloaded: `en_US-john-medium` (deep older male), `en_US-lessac-medium`, `en_US-ryan-low`. Fast but robotic — replaced by Kokoro as default 2026-07. Client rule: visuals must be AI-generated, created for the story — **no stock photos/footage** (a Pexels provider was built and removed 2026-07).
+- **dotenv gotcha:** `Settings.load()` uses `load_dotenv(override=True)` — `.env` is the source of truth even for pipeline subprocesses spawned by a long-running API server (without override, the server's stale inherited env pinned subprocess config; hit 2026-07 when a TTS switch didn't apply).
 - **Piper pacing:** raw Piper sounds rushed. `RENDERFLOW_TTS_LENGTH_SCALE` slows delivery; the adapter also splits text on `.!?…` and inserts `RENDERFLOW_TTS_SENTENCE_PAUSE` seconds of silence between sentences (an ellipsis in narration earns a dramatic pause). Remember the resume gotcha: existing projects keep their old audio.
 - **Wav2Lip avatar** (`wav2lip-local`): `scripts/setup_wav2lip.py` pulls code **and** weights from the `camenduru/Wav2Lip` HF mirror into `.wav2lip/` (~520 MB — the official OneDrive checkpoint links are dead) and patches `audio.py` for librosa ≥ 0.10 (kwargs-only `filters.mel`). Runs ~real-time on Apple-Silicon CPU (13 s narration → 15 s). Lips only — the model doesn't move the head, so the adapter adds a slow zoompan push-in; for real head motion use `sadtalker-replicate`. Verified live 2026-07.
 - **SadTalker avatar** (`cjwbw/sadtalker` on Replicate, version pinned in the adapter): billed per GPU second, so cost scales with narration length (~$0.08–0.15 for a short clip; cost computed from `predict_time`). Defaults `preprocess=full`, `still_mode=False` (head motion), `use_enhancer=True`; if the background warps around the moving head, set `still_mode=True`. The account's Replicate token exists but is **unfunded** — a credit purchase (min $10) is required, a saved card is not enough (402 `Insufficient credit`).

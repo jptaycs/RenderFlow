@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -21,6 +22,10 @@ from renderflow.retry import retryable
 log = logging.getLogger("renderflow.providers.pollinations")
 
 API_BASE = "https://image.pollinations.ai/prompt"
+# Published rate limits: anonymous = 1 request / 15 s, registered = 1 / 5 s.
+# Bursting past them earns sticky 429s, so space requests out ourselves.
+MIN_INTERVAL_ANON = 15.0
+MIN_INTERVAL_TOKEN = 5.0
 
 
 class PollinationsImage:
@@ -29,8 +34,17 @@ class PollinationsImage:
     def __init__(self, model: str = "flux", token: str | None = None) -> None:
         self.model = model
         self.token = token or os.environ.get("POLLINATIONS_TOKEN") or None
+        self._next_allowed = 0.0
 
-    @retryable(attempts=4, base_delay=5.0, exceptions=(httpx.HTTPError,))
+    def _throttle(self) -> None:
+        wait = self._next_allowed - time.monotonic()
+        if wait > 0:
+            log.info("pollinations rate limit: waiting %.1fs", wait)
+            time.sleep(wait)
+        interval = MIN_INTERVAL_TOKEN if self.token else MIN_INTERVAL_ANON
+        self._next_allowed = time.monotonic() + interval
+
+    @retryable(attempts=5, base_delay=20.0, max_delay=60.0, exceptions=(httpx.HTTPError,))
     def generate(
         self, prompt: str, negative_prompt: str | None = None, **params: Any
     ) -> GeneratedAsset:
@@ -50,6 +64,7 @@ class PollinationsImage:
             **params,
         }
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        self._throttle()
         log.info(
             "generating image via pollinations (%s, %s)",
             self.model,

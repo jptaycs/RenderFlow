@@ -80,6 +80,7 @@ const state = {
   selectedSceneId: null,
   modalOpen: false,
   newTitle: '',
+  newTopicBase: null,
   newScript: '',
   newStyle: 'documentary',
   busy: false,
@@ -89,25 +90,36 @@ function findProject(slug) { return state.projects.find(p => p.slug === slug); }
 
 /* ── server sync ─────────────────────────────────────────────────────── */
 
+let lastStateJson = '';
+
 async function refresh() {
+  let changed = false;
   try {
     const res = await fetch('/api/state');
-    const data = await res.json();
-    state.projects = data.projects;
-    state.jobs = data.jobs;
+    const text = await res.text();
+    changed = text !== lastStateJson || !state.connected;
+    if (changed) {
+      const data = JSON.parse(text);
+      state.projects = data.projects;
+      state.jobs = data.jobs;
+      lastStateJson = text;
+    }
     state.connected = true;
   } catch (err) {
+    changed = state.connected;
     state.connected = false;
   }
-  if (!state.modalOpen) render();
+  // Re-render only when the server state actually changed — a poll must
+  // never blow away the DOM (and the user's scroll position) for nothing.
+  if (changed && !state.modalOpen) render();
 }
 
-async function post(url, body) {
+async function post(url, body, method) {
   state.busy = true;
   render();
   try {
     const res = await fetch(url, {
-      method: 'POST',
+      method: method || 'POST',
       headers: body ? { 'Content-Type': 'application/json' } : {},
       body: body ? JSON.stringify(body) : undefined,
     });
@@ -195,6 +207,7 @@ function projectsScreenHtml() {
         '<div style="height:130px;position:relative;' + thumbBg(thumb) + ';display:flex;align-items:center;justify-content:center">' +
           (thumb ? '' : '<span style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:#4c4c52;letter-spacing:0.04em">NO IMAGES YET</span>') +
           '<div style="position:absolute;top:10px;left:10px;background:' + meta.bg + ';color:' + meta.color + ';font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;backdrop-filter:blur(4px)">' + esc(p.status) + '</div>' +
+          (p.running ? '' : '<div data-act="deleteProject" data-arg="' + esc(p.slug) + '" title="Delete project" style="position:absolute;top:10px;right:10px;width:24px;height:24px;border-radius:50%;background:rgba(0,0,0,0.55);color:#c8c8cc;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center;cursor:pointer;backdrop-filter:blur(4px)">✕</div>') +
         '</div>' +
         '<div style="padding:14px 16px 16px 16px">' +
           '<div style="font-size:14.5px;font-weight:600;line-height:1.35;margin-bottom:10px;text-wrap:pretty">' + esc(p.title) + '</div>' +
@@ -425,7 +438,7 @@ function scenePanelHtml() {
   const btnStyle = 'text-align:center;padding:10px 0;border-radius:8px;font-size:13px;font-weight:600;cursor:' + (disabled ? 'not-allowed' : 'pointer') + ';background:' + (disabled ? '#232327' : '#FF0000') + ';color:' + (disabled ? '#8a8a91' : '#ffffff');
   return '' +
   '<div data-act="closePanel" style="position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:20"></div>' +
-  '<div style="position:fixed;top:0;right:0;bottom:0;width:420px;max-width:92vw;background:#131315;border-left:1px solid #26262a;z-index:21;padding:26px;overflow-y:auto;animation:rf-slidein 0.22s ease-out">' +
+  '<div id="rf-panel" style="position:fixed;top:0;right:0;bottom:0;width:420px;max-width:92vw;background:#131315;border-left:1px solid #26262a;z-index:21;padding:26px;overflow-y:auto' + (panelJustOpened ? ';animation:rf-slidein 0.22s ease-out' : '') + '">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">' +
       '<div style="font-size:15px;font-weight:600">Scene ' + pad2(sc.number) + (sc.type === 'talking_avatar' ? ' · host on camera' : '') + '</div>' +
       '<div data-act="closePanel" style="cursor:pointer;color:#8a8a91;font-size:18px;line-height:1">✕</div>' +
@@ -459,9 +472,15 @@ function modalHtml() {
     '<div style="width:520px;max-width:94vw;background:#17171a;border:1px solid #2a2a2e;border-radius:14px;padding:26px;animation:rf-fadein 0.15s ease-out">' +
       '<div style="font-size:16px;font-weight:600;margin-bottom:4px">New video</div>' +
       '<div style="font-size:12.5px;color:#8a8a91;margin-bottom:20px">Paste a narration script — RenderFlow splits it into ~5-second scenes, generates images and voice, and renders the MP4</div>' +
-      '<div style="font-size:12px;color:#9a9aa1;margin-bottom:6px">Video title</div>' +
+      '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">' +
+        '<span style="font-size:12px;color:#9a9aa1">Video title</span>' +
+        '<span data-act="clickbaitTitle" style="font-size:11.5px;color:#FF0000;cursor:pointer;font-weight:500">✦ Make it clickbait</span>' +
+      '</div>' +
       '<input id="rf-title" value="' + esc(state.newTitle) + '" placeholder="e.g. The Solar Panel Trap" style="width:100%;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:8px;padding:10px 12px;color:#f2f2f4;font-size:13px;margin-bottom:16px;font-family:\'Inter\',sans-serif">' +
-      '<div style="font-size:12px;color:#9a9aa1;margin-bottom:6px">Script</div>' +
+      '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">' +
+        '<span style="font-size:12px;color:#9a9aa1">Script</span>' +
+        '<span data-act="randomTopic" style="font-size:11.5px;color:#FF0000;cursor:pointer;font-weight:500">🎲 Random topic</span>' +
+      '</div>' +
       '<textarea id="rf-script" rows="8" placeholder="Paste the narration script here…" style="width:100%;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:8px;padding:10px 12px;color:#f2f2f4;font-size:13px;line-height:1.5;margin-bottom:16px;font-family:\'Inter\',sans-serif;resize:vertical">' + esc(state.newScript) + '</textarea>' +
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:22px;align-items:end">' +
         '<div>' +
@@ -485,8 +504,21 @@ function modalHtml() {
 /* ── render ──────────────────────────────────────────────────────────── */
 
 const root = document.getElementById('root');
+let lastViewKey = '';
+let lastPanelKey = '';
+let panelJustOpened = false;
 
 function render() {
+  // Same view re-rendering (poll update)? Keep the user's scroll position.
+  // New view (navigation)? Start at the top.
+  const viewKey = state.screen + '|' + state.selectedSlug + '|' + state.detailTab;
+  const panelKey = state.selectedSceneId == null ? '' : state.selectedSlug + '|' + state.selectedSceneId;
+  const prevMain = document.getElementById('rf-main');
+  const mainScroll = prevMain && viewKey === lastViewKey ? prevMain.scrollTop : 0;
+  const prevPanel = document.getElementById('rf-panel');
+  const panelScroll = prevPanel && panelKey === lastPanelKey ? prevPanel.scrollTop : 0;
+  panelJustOpened = panelKey !== '' && panelKey !== lastPanelKey;
+
   let main;
   if (state.screen === 'activity') main = activityScreenHtml();
   else if (state.screen === 'detail') main = detailScreenHtml();
@@ -495,10 +527,17 @@ function render() {
   root.innerHTML =
     '<div style="display:flex;height:100vh;width:100%;background:#0b0b0d;color:#f2f2f4;font-family:\'Inter\',sans-serif;overflow:hidden">' +
       sidebarHtml() +
-      '<div style="flex:1;overflow-y:auto;position:relative">' + main + '</div>' +
+      '<div id="rf-main" style="flex:1;overflow-y:auto;position:relative">' + main + '</div>' +
       scenePanelHtml() +
       modalHtml() +
     '</div>';
+
+  const newMain = document.getElementById('rf-main');
+  if (newMain && mainScroll) newMain.scrollTop = mainScroll;
+  const newPanel = document.getElementById('rf-panel');
+  if (newPanel && panelScroll) newPanel.scrollTop = panelScroll;
+  lastViewKey = viewKey;
+  lastPanelKey = panelKey;
 
   const title = document.getElementById('rf-title');
   const script = document.getElementById('rf-script');
@@ -508,13 +547,43 @@ function render() {
     btn.style.background = on ? '#FF0000' : '#3a3a3f';
     btn.style.color = on ? '#ffffff' : '#8a8a91';
   };
-  if (title) title.addEventListener('input', () => { state.newTitle = title.value; syncSubmit(); });
+  if (title) title.addEventListener('input', () => {
+    state.newTitle = title.value;
+    if (!suppressBaseReset) state.newTopicBase = null;  // manual edit picks a new topic
+    syncSubmit();
+  });
   if (script) script.addEventListener('input', () => { state.newScript = script.value; syncSubmit(); });
   const style = document.getElementById('rf-style');
   if (style) style.addEventListener('change', () => { state.newStyle = style.value; });
 }
 
 /* ── actions ─────────────────────────────────────────────────────────── */
+
+const RANDOM_TOPICS = [
+  { title: 'The Food That Never Rots', script: 'Archaeologists opening Egyptian tombs found jars of honey more than three thousand years old, still perfectly good to eat. Bees turn nectar into a syrup so dense and acidic that no bacteria can survive inside it. Every jar in your kitchen could outlive you, your grandchildren, and the building you live in.' },
+  { title: 'The Tower That Grows Every Summer', script: 'Every summer, the Eiffel Tower quietly grows about fifteen centimeters taller, and nobody in Paris notices. Seven thousand tons of iron expand in the heat, leaning the tip gently away from the sun. When winter returns, the most famous landmark in France shrinks back down, like a creature breathing once a year.' },
+  { title: 'Every Banana You Eat Is a Clone', script: 'Every banana in your supermarket is a genetic clone, grown from cuttings of a single plant discovered in 1834. Your grandparents ate a completely different banana, until a fungus wiped it off the face of the earth in the 1950s. The same disease is now spreading toward the clones we eat today, and there is no backup plan.' },
+  { title: 'The War That Lasted 38 Minutes', script: 'In 1896, the British Empire fought an entire war against Zanzibar before breakfast was over. The sultan’s palace fell in thirty-eight minutes, the shortest war in recorded history. One side suffered a single wounded soldier, while the other lost five hundred men and an empire.' },
+  { title: 'The Town That Danced Itself to Death', script: 'In the summer of 1518, a woman stepped into a street in Strasbourg and began to dance, and she could not stop. Within a month, four hundred people were dancing day and night, their feet bleeding through their shoes. The city hired musicians to keep them moving, hoping they would dance it out, and people began dying of exhaustion.' },
+  { title: 'Rome Built Concrete That Heals Itself', script: 'Roman harbors built two thousand years ago still stand in seawater that destroys modern concrete within decades. Their secret was volcanic ash and burnt lime, which grow new crystals whenever a crack lets water in. Scientists only decoded the recipe in 2023, and engineers are still struggling to match it.' },
+  { title: 'The Shark Born Before America', script: 'Somewhere in the Arctic right now swims a shark that was already alive when the Mayflower set sail. Greenland sharks drift through freezing black water for four hundred years, growing a single centimeter each year. Researchers found one born around 1620, the oldest vertebrate ever discovered on earth.' },
+  { title: 'Australia Lost a War Against Birds', script: 'In 1932, Australia sent soldiers with machine guns to fight twenty thousand emus destroying wheat farms. The birds scattered into small groups, outran the trucks, and shrugged off the bullets. After a month, the army withdrew in defeat, and the emus kept the wheat.' },
+  { title: 'Carrots Were Never Supposed to Be Orange', script: 'For most of history, carrots were purple, white, or yellow, and nobody had ever seen an orange one. Dutch farmers in the 1600s bred the orange carrot, some say to honor their royal House of Orange. Their marketing worked so well that the whole world forgot the original vegetable ever existed.' },
+  { title: 'The Flood That Was Made of Beer', script: 'In 1814, a vat holding a million pints of porter burst inside a London brewery. A fifteen-foot wave of beer smashed through brick walls and flooded an entire neighborhood. Eight people drowned, and the brewery escaped punishment by convincing a court it was an act of God.' },
+];
+let lastRandomTopic = -1;
+
+const CLICKBAIT_TEMPLATES = [
+  'The Truth About {t} Nobody Tells You',
+  '{t}: What You Should Know Before It’s Too Late',
+  'How {t} Is Quietly Costing You Money',
+  'Why Everyone Is Wrong About {t}',
+  'What They Don’t Want You to Know About {t}',
+  '{t} — The Untold Story',
+  'I Looked Into {t}. What I Found Changes Everything',
+];
+let clickbaitIndex = 0;
+let suppressBaseReset = false;
 
 const actions = {
   goProjects() { state.screen = 'projects'; state.selectedSlug = null; state.selectedSceneId = null; render(); },
@@ -524,7 +593,38 @@ const actions = {
   setTabCost() { state.detailTab = 'cost'; render(); },
   openScene(id) { state.selectedSceneId = Number(id); render(); },
   closePanel() { state.selectedSceneId = null; render(); },
-  openModal() { state.modalOpen = true; state.newTitle = ''; state.newScript = ''; render(); const t = document.getElementById('rf-title'); if (t) t.focus(); },
+  openModal() { state.modalOpen = true; state.newTitle = ''; state.newScript = ''; state.newTopicBase = null; clickbaitIndex = 0; render(); const t = document.getElementById('rf-title'); if (t) t.focus(); },
+  randomTopic() {
+    let pick;
+    do { pick = Math.floor(Math.random() * RANDOM_TOPICS.length); }
+    while (RANDOM_TOPICS.length > 1 && pick === lastRandomTopic);
+    lastRandomTopic = pick;
+    const topic = RANDOM_TOPICS[pick];
+    state.newTitle = topic.title;
+    state.newScript = topic.script;
+    state.newTopicBase = null;
+    clickbaitIndex = 0;
+    render();
+  },
+  clickbaitTitle() {
+    // Topic = whatever base title the user typed (before any template), else
+    // the first few words of the script.
+    let topic = state.newTopicBase || state.newTitle.trim()
+      || state.newScript.trim().split(/\s+/).slice(0, 5).join(' ');
+    if (!topic) return;
+    topic = topic.replace(/^(the|a|an)\s+/i, '');
+    topic = topic.charAt(0).toUpperCase() + topic.slice(1);
+    state.newTopicBase = state.newTopicBase || topic;
+    state.newTitle = CLICKBAIT_TEMPLATES[clickbaitIndex % CLICKBAIT_TEMPLATES.length].replace('{t}', state.newTopicBase);
+    clickbaitIndex += 1;
+    const input = document.getElementById('rf-title');
+    if (input) {
+      suppressBaseReset = true;
+      input.value = state.newTitle;
+      input.dispatchEvent(new Event('input'));
+      suppressBaseReset = false;
+    }
+  },
   closeModal() { state.modalOpen = false; render(); },
   submitNewVideo() {
     if (!state.newTitle.trim() || !state.newScript.trim() || state.busy) return;
@@ -534,6 +634,12 @@ const actions = {
     post('/api/projects', { title, script, style: state.newStyle });
   },
   resumeProject(slug) { post('/api/projects/' + encodeURIComponent(slug) + '/resume'); },
+  deleteProject(slug) {
+    const p = findProject(slug);
+    if (!confirm('Delete "' + ((p && p.title) || slug) + '" and all its generated files? This cannot be undone.')) return;
+    if (state.selectedSlug === slug) { state.screen = 'projects'; state.selectedSlug = null; state.selectedSceneId = null; }
+    post('/api/projects/' + encodeURIComponent(slug), null, 'DELETE');
+  },
   regenerateScene(id) {
     if (!confirm('Delete this scene’s generated assets and re-run the pipeline?')) return;
     state.selectedSceneId = null;

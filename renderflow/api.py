@@ -11,6 +11,7 @@ Run:  .venv/bin/python -m renderflow.api   (serves http://127.0.0.1:8321)
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -41,10 +42,27 @@ def _projects_dir() -> Path:
     return Settings.load().projects_dir
 
 
+def _pid_is_pipeline(pid: int) -> bool:
+    proc = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True
+    )
+    return proc.returncode == 0 and "make_video.py" in proc.stdout
+
+
 def _run_active(slug: str) -> dict[str, Any] | None:
     run = _runs.get(slug)
     if run and run["proc"].poll() is None:
         return run
+    # Fall back to the pid file so runs survive an API restart: the
+    # subprocess keeps working either way, and the UI must keep seeing it.
+    pid_file = _projects_dir() / slug / "logs" / "run.pid"
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+        except ValueError:
+            return None
+        if _pid_is_pipeline(pid):
+            return {"proc": None, "started": pid_file.stat().st_mtime, "pid": pid}
     return None
 
 
@@ -59,6 +77,7 @@ def _spawn(slug: str, args: list[str]) -> None:
         stdout=log_file,
         stderr=subprocess.STDOUT,
     )
+    (paths.logs / "run.pid").write_text(str(proc.pid))
     _runs[slug] = {"proc": proc, "started": time.time()}
 
 
@@ -278,11 +297,29 @@ def create_project(body: NewProject) -> dict[str, str]:
     return {"slug": slug}
 
 
-@app.post("/api/projects/{slug}/resume")
-def resume_project(slug: str) -> dict[str, str]:
+def _existing_project(slug: str) -> ProjectPaths:
+    """Resolve a slug to its project dir, rejecting traversal and unknowns."""
+    if slug != slugify(slug):
+        raise HTTPException(404, f"no project {slug!r}")
     paths = ProjectPaths(root=_projects_dir() / slug)
     if not paths.scenes_json.exists():
         raise HTTPException(404, f"no project {slug!r}")
+    return paths
+
+
+@app.delete("/api/projects/{slug}")
+def delete_project(slug: str) -> dict[str, str]:
+    paths = _existing_project(slug)
+    if _run_active(slug):
+        raise HTTPException(409, "run in progress — wait for it to finish first")
+    shutil.rmtree(paths.root)
+    _runs.pop(slug, None)
+    return {"deleted": slug}
+
+
+@app.post("/api/projects/{slug}/resume")
+def resume_project(slug: str) -> dict[str, str]:
+    paths = _existing_project(slug)
     if _run_active(slug):
         raise HTTPException(409, "run already in progress")
     _spawn(slug, ["--scenes-file", str(paths.scenes_json)])
@@ -291,9 +328,7 @@ def resume_project(slug: str) -> dict[str, str]:
 
 @app.post("/api/projects/{slug}/scenes/{scene_id}/regenerate")
 def regenerate_scene(slug: str, scene_id: int) -> dict[str, str]:
-    paths = ProjectPaths(root=_projects_dir() / slug)
-    if not paths.scenes_json.exists():
-        raise HTTPException(404, f"no project {slug!r}")
+    paths = _existing_project(slug)
     if _run_active(slug):
         raise HTTPException(409, "run already in progress")
     plan = load_plan(paths)

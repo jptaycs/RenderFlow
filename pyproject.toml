@@ -16,6 +16,16 @@ dependencies = [
 dev = ["pytest>=8.0"]
 # For the local dashboard (renderflow/api.py + web/)
 web = ["fastapi>=0.111", "uvicorn>=0.30"]
+# For the kokoro local TTS provider (see scripts/setup_kokoro.py)
+kokoro = ["kokoro-onnx>=0.4", "soundfile>=0.12"]
+# For depth-parallax scene motion (renderflow/pipeline/parallax.py)
+parallax = [
+    "transformers>=4.45",
+    "torch>=2.2",
+    "opencv-python>=4.9",
+    "numpy",
+    "pillow",
+]
 # For the wav2lip-local avatar provider (see scripts/setup_wav2lip.py)
 wav2lip = [
     "torch>=2.2",
