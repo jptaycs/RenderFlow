@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import wave
 from pathlib import Path
 from typing import Any
@@ -43,18 +44,43 @@ class PiperTTS:
         log.info("piper synthesizing %d chars with %s", len(text), voice)
         piper_voice = self._load(voice)
         length_scale = params.pop("length_scale", None)
+        # Piper runs sentences together; real narration breathes between them.
+        sentence_pause = float(params.pop("sentence_pause_sec", 0) or 0)
         syn_config = None
         if length_scale is not None:
             from piper.config import SynthesisConfig
 
             syn_config = SynthesisConfig(length_scale=float(length_scale))
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wav:
-            piper_voice.synthesize_wav(text, wav, syn_config=syn_config)
+
+        sentences = _split_sentences(text) if sentence_pause > 0 else [text]
+        chunks: list[bytes] = []
+        wav_params = None
+        for sentence in sentences:
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wav:
+                piper_voice.synthesize_wav(sentence, wav, syn_config=syn_config)
+            with wave.open(io.BytesIO(buf.getvalue())) as wav:
+                wav_params = wav.getparams()
+                chunks.append(wav.readframes(wav.getnframes()))
+        assert wav_params is not None
+        silence = b"\x00" * (
+            int(sentence_pause * wav_params.framerate)
+            * wav_params.sampwidth
+            * wav_params.nchannels
+        )
+        out = io.BytesIO()
+        with wave.open(out, "wb") as wav:
+            wav.setparams(wav_params)
+            wav.writeframes(silence.join(chunks))
         return GeneratedAsset(
-            data=buf.getvalue(),
+            data=out.getvalue(),
             provider=self.name,
-            params={"voice": voice, "length_scale": length_scale, **params},
+            params={
+                "voice": voice,
+                "length_scale": length_scale,
+                "sentence_pause_sec": sentence_pause,
+                **params,
+            },
             cost=0.0,
             meta={
                 "format": "wav",
@@ -62,3 +88,8 @@ class PiperTTS:
                 "length_scale": length_scale,
             },
         )
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?…])\s+", text.strip())
+    return [part for part in parts if part]

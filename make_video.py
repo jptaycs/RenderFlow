@@ -99,6 +99,7 @@ def main() -> int:
     tts_params = {}
     if settings.tts_provider == "piper":
         tts_params["length_scale"] = settings.tts_length_scale
+        tts_params["sentence_pause_sec"] = settings.tts_sentence_pause
     generate_voice(plan, tts, settings.tts_voice, paths, **tts_params)
 
     avatar_scene_count = sum(scene.type == "talking_avatar" for scene in plan.scenes)

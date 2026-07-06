@@ -1,1 +1,131 @@
-@AGENTS.md
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+RenderFlow is an AI video production **orchestration platform**: topic or script in → narrated, rendered MP4 out. It coordinates external AI providers (LLM, image, TTS, avatar) behind swappable interfaces — it is not a model itself. Target: long-form YouTube documentaries (20–30 min), currently at the Week-1 walking-skeleton stage producing short videos end-to-end.
+
+`AGENTS.md` points here; this file is the single source of truth — keep it honest as things change.
+
+## Current state
+
+Working today, verified against live services:
+
+- Synchronous CLI pipeline: scene plan → images → voice → FFmpeg 1080p MP4
+- Providers: Claude (LLM, untested live — no API key yet), Pollinations + Flux-Replicate (image), Piper + ElevenLabs (TTS)
+- Resumable asset generation (completed assets skip on re-run), per-asset cost tracking
+- Talking-avatar scene contract with four providers: `wav2lip-local` (**default in practice** — free unlimited local lip sync + camera push-in, verified live, ~real-time on CPU), `ffmpeg-still` placeholder (static image + voice; no lip sync), `sadtalker-replicate` (paid lip sync + real head motion via Replicate; written, unverified — needs a funded `REPLICATE_API_TOKEN`), and `memo-hf` (free HF Space, demo-only: 4s audio cap)
+- Piper narration pacing: `RENDERFLOW_TTS_LENGTH_SCALE` + sentence-pause insertion (see Provider notes)
+
+Not built yet (roadmap order): stock-video B-roll (Pexels), subtitles (faster-whisper → ASS), narrator character consistency, more lip-sync avatar providers, background music/crossfades, Celery/Redis workers, Postgres, FastAPI, Next.js dashboard.
+
+## Commands
+
+```bash
+# Python 3.12 venv (system python is 3.9 — do not use it)
+.venv/bin/python -m pytest                 # run tests
+.venv/bin/python -m pytest -k avatar       # run tests matching a keyword
+.venv/bin/python make_video.py --topic "..." --length 3          # LLM writes script (needs ANTHROPIC_API_KEY)
+.venv/bin/python make_video.py --script-file script.txt --slug x # split client script (needs ANTHROPIC_API_KEY)
+.venv/bin/python make_video.py --scenes-file plan.json --slug x  # from existing scene JSON (no key needed)
+.venv/bin/python scripts/check_providers.py [claude|image|tts]   # live provider verification (< $0.02)
+.venv/bin/python scripts/check_providers.py avatar               # live lip-sync clip (opt-in; saves projects/avatar_check.mp4)
+.venv/bin/pip install '.[wav2lip]' && .venv/bin/python scripts/setup_wav2lip.py  # one-time wav2lip-local setup (~520 MB)
+python -m piper.download_voices en_US-lessac-medium --data-dir .voices           # fetch a Piper voice
+```
+
+## Architecture — how a video gets made
+
+```
+make_video.py (CLI)
+  [1] script:  topic --LLM--> GeneratedScript.to_plan() -> ScenePlan   (pipeline/script.py)
+               or --scenes-file loads scenes.json directly (no LLM)
+  [2] images:  per scene, ImageProvider.generate(image_prompt)          (pipeline/assets.py)
+               talking_avatar scenes also get an avatar portrait
+               (RENDERFLOW_AVATAR_IMAGE local file, or generated)
+  [3] voice:   per scene, TTSProvider.synthesize(narration)             (pipeline/assets.py)
+  [4] avatar:  talking_avatar scenes: AvatarProvider.generate_clip(
+               portrait, voice, narration) -> lip-synced MP4            (pipeline/assets.py)
+  [5] render:  per-scene clip (zoompan still, or avatar full/split),
+               concat + loudnorm + faststart -> output/final.mp4        (pipeline/render.py)
+```
+
+Key mechanics that span multiple files:
+
+- **`renderflow/schema.py` is THE central contract.** `ScenePlan` → `Scene` → `SceneAssets` (`image`, `avatar_image`, `voice`, `avatar_clip` as `AssetRef`s). Everything reads/writes these models; the plan is persisted to `projects/<slug>/script/scenes.json` after every asset state change. Treat schema changes like breaking API changes; update docs example and tests together. There is a parallel `Generated*` schema (what the LLM emits, no numeric constraints — unsupported by structured outputs) clamped into the real contract by `GeneratedScript.to_plan()`.
+- **Asset state machine is exactly** `pending → running → completed | failed → retrying → running | cancelled`, enforced by `AssetRef.advance` (raises `InvalidTransition`).
+- **Resume:** an asset with `status=completed` and a `path` is skipped on re-run. Consequence: config changes (voice, pacing, provider) do **not** retrofit an existing project — use a fresh `--slug` or delete the relevant `projects/<slug>/{voice,avatar}/` files.
+- **Provider layer:** `providers/base.py` defines `Protocol`s (`LLMProvider`, `ImageProvider`, `TTSProvider`, `AvatarProvider`) returning `GeneratedAsset`/`LLMResult`; `providers/__init__.py` is the registry mapping env-selected names to adapters. `retry.py` supplies the backoff decorator adapters wrap their live calls with.
+- **Rendering rules** (`pipeline/render.py`): scene duration always comes from ffprobe of the generated voice audio (or avatar clip) — never `duration_estimate_sec`. Stills get zoompan motion (prescaled 2560×1440 to avoid sub-pixel jitter). Talking-avatar scene 1 renders full-screen; later avatar scenes render split-screen (768px avatar left, zoompan visual right). Audio is loudness-normalized per clip; final concat re-encodes with `+faststart`.
+- **File formats ripple:** Piper emits WAV, ElevenLabs MP3 — `pipeline/assets.py` derives the file extension from `asset.meta["format"]`; lip-sync models want WAV, so `providers/avatar/postprocess.py` transcodes. That module also burns the "AI-generated host" disclosure banner into every avatar clip.
+
+## Layout
+
+```
+make_video.py               CLI entry point (the only executable surface today)
+renderflow/
+  schema.py                 Scene JSON schema (Pydantic) + asset state machine — THE central contract
+  config.py                 Settings from .env
+  storage.py                projects/<slug>/{script,images,voice,avatar,subtitles,output,logs}/, plan save/load
+  retry.py                  backoff decorator for external calls
+  pipeline/
+    script.py               topic→scenes and client-script→scenes prompts (LLM)
+    assets.py               per-scene image/voice/avatar generation, state + cost persistence
+    render.py               FFmpeg zoompan, avatar full/split clips, concat, mux
+  providers/
+    base.py                 Protocol interfaces: LLMProvider, ImageProvider, TTSProvider, AvatarProvider + GeneratedAsset
+    __init__.py             registry — env vars select active provider
+    llm/claude.py           image/{flux_replicate,pollinations}.py   tts/{elevenlabs_tts,piper_tts}.py
+    avatar/                 ffmpeg_still, wav2lip_local, sadtalker_replicate, memo_hf
+                            + postprocess.py (shared wav transcode / disclosure burn-in)
+scripts/
+  check_providers.py        one minimal live call per provider
+  setup_wav2lip.py          one-time .wav2lip/ download for wav2lip-local
+tests/                      stub providers, schema/state-machine/pipeline tests, FFmpeg integration test
+```
+
+Gitignored working dirs: `.venv/` (python 3.12), `.voices/` (Piper models), `.wav2lip/` (Wav2Lip code + weights), `projects/` (generated videos), `.env` (keys).
+
+## Hard rules
+
+- **Never call an external API from business logic.** Everything goes through the `Protocol` interfaces in `providers/base.py` and the registry in `providers/__init__.py`. Fix response-shape problems in the provider adapter, not the pipeline.
+- **Cost tracking from day one.** Every provider call records its cost on the asset/result; the system must always be able to answer "this video cost $X".
+- **Never commit `.env`.** Keys live only there. `.env.example` documents the variables.
+- Backend stays Python-only. Type hints everywhere; Pydantic for schema and API contracts.
+- Keep changes minimal and surgical — Week 2 (workers, Postgres, FastAPI) will build on this structure; don't restructure preemptively.
+
+## Configuration (.env)
+
+Free vs paid stacks are pure `.env` swaps — no code changes:
+
+| Variable | Free stack | Paid stack |
+|---|---|---|
+| `RENDERFLOW_IMAGE_PROVIDER` | `pollinations` (keyless) | `flux-replicate` (`REPLICATE_API_TOKEN`) |
+| `RENDERFLOW_TTS_PROVIDER` | `piper` (local) | `elevenlabs` (`ELEVENLABS_API_KEY`) |
+| `RENDERFLOW_TTS_VOICE` | Piper voice name | ElevenLabs voice id |
+| `RENDERFLOW_AVATAR_PROVIDER` | `wav2lip-local` (or `ffmpeg-still`) | `sadtalker-replicate` |
+
+Tuning: `RENDERFLOW_TTS_LENGTH_SCALE` (Piper pace, higher = slower, 1.4 ≈ documentary), `RENDERFLOW_TTS_SENTENCE_PAUSE` (seconds between sentences), `RENDERFLOW_AVATAR_IMAGE` (local presenter portrait), `RENDERFLOW_LLM_MODEL`, `RENDERFLOW_PROJECTS_DIR`. See `.env.example` for the full annotated list.
+
+## Provider notes (learned the hard way — do not rediscover)
+
+- **ElevenLabs free tier blocks "library" voices over the API** (402 `paid_plan_required`). Only the account's *premade* voices work — e.g. George `JBFqnCBsd6RMkjVDRZzb` (documentary storyteller). Free tier = 10k chars/month, **no commercial rights**.
+- **Pollinations** is keyless/free but anonymously caps at 1024×576 regardless of requested size; the renderer upscales, so output is 1080p but soft. No `negative_prompt` input — the adapter folds it into the prompt. Can be slow (30–60 s/image); retries are configured.
+- **Piper** voices live in `.voices/` (~60 MB each). MIT license — commercial use OK.
+- **Piper pacing:** raw Piper sounds rushed. `RENDERFLOW_TTS_LENGTH_SCALE` slows delivery; the adapter also splits text on `.!?…` and inserts `RENDERFLOW_TTS_SENTENCE_PAUSE` seconds of silence between sentences (an ellipsis in narration earns a dramatic pause). Remember the resume gotcha: existing projects keep their old audio.
+- **Wav2Lip avatar** (`wav2lip-local`): `scripts/setup_wav2lip.py` pulls code **and** weights from the `camenduru/Wav2Lip` HF mirror into `.wav2lip/` (~520 MB — the official OneDrive checkpoint links are dead) and patches `audio.py` for librosa ≥ 0.10 (kwargs-only `filters.mel`). Runs ~real-time on Apple-Silicon CPU (13 s narration → 15 s). Lips only — the model doesn't move the head, so the adapter adds a slow zoompan push-in; for real head motion use `sadtalker-replicate`. Verified live 2026-07.
+- **SadTalker avatar** (`cjwbw/sadtalker` on Replicate, version pinned in the adapter): billed per GPU second, so cost scales with narration length (~$0.08–0.15 for a short clip; cost computed from `predict_time`). Defaults `preprocess=full`, `still_mode=False` (head motion), `use_enhancer=True`; if the background warps around the moving head, set `still_mode=True`. The account's Replicate token exists but is **unfunded** — a credit purchase (min $10) is required, a saved card is not enough (402 `Insufficient credit`).
+- **MEMO avatar** (`memo-hf`, public `fffiloni/MEMO` Gradio Space via `gradio_client`): demo-grade only — the Space **trims input audio to 4 seconds** and requests a 240s ZeroGPU slot that anonymous users are refused outright; a free `HF_TOKEN` is required just to be admitted. Verified 2026-07: every public talking-head Space has similar guards (EchoMimic trims to 5s / requests 200–300s). **There is no free hosted lip-sync API fit for full-length scene narrations.** Also: `gradio_client>=2` renamed `hf_token=` to `token=`, and needs `httpx_kwargs={"timeout": httpx.Timeout(30, read=None)}` or long generations die with `ReadTimeout`.
+- **Claude LLM step:** uses structured outputs (`output_config.format` with `GeneratedScript.model_json_schema()`); the generation schema deliberately has no numeric constraints (unsupported there) — bounds are clamped in `GeneratedScript.to_plan()`. No `ANTHROPIC_API_KEY` funded yet; the key-free workflow is: a Claude Code session writes `scenes.json` by hand → `--scenes-file`.
+
+## Testing conventions
+
+- Stub providers in `tests/stubs.py` satisfy the Protocols — use them; never hit live APIs in tests.
+- The FFmpeg integration test generates media with lavfi and is skipped when ffmpeg is absent.
+- Live provider verification is `scripts/check_providers.py`, run manually, never in CI. The `avatar` check is excluded from the default run (slow; costs money on paid providers).
+
+## What NOT to do
+
+- Don't generate AI video clips (only stills + motion) — cost control, Phase 4+ decision. For "alive" B-roll the planned route is free stock footage (Pexels API), not video generation.
+- Don't build auth, billing, publishing, or dashboards before the pipeline they'd serve exists.
+- Don't render synchronously inside API requests once the FastAPI layer exists (Week 2+) — queue it.
+- Don't change the scene schema casually, and don't bypass the provider registry.

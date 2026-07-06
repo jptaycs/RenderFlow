@@ -18,6 +18,7 @@ class Settings:
     llm_model: str
     tts_voice: str
     tts_length_scale: float
+    tts_sentence_pause: float
     avatar_image: Path | None
     projects_dir: Path
 
@@ -31,7 +32,8 @@ class Settings:
             avatar_provider=os.getenv("RENDERFLOW_AVATAR_PROVIDER", "ffmpeg-still"),
             llm_model=os.getenv("RENDERFLOW_LLM_MODEL", "claude-opus-4-8"),
             tts_voice=os.getenv("RENDERFLOW_TTS_VOICE", "21m00Tcm4TlvDq8ikWAM"),
-            tts_length_scale=float(os.getenv("RENDERFLOW_TTS_LENGTH_SCALE", "1.25")),
+            tts_length_scale=float(os.getenv("RENDERFLOW_TTS_LENGTH_SCALE", "1.4")),
+            tts_sentence_pause=float(os.getenv("RENDERFLOW_TTS_SENTENCE_PAUSE", "0.45")),
             avatar_image=(
                 Path(value)
                 if (value := os.getenv("RENDERFLOW_AVATAR_IMAGE"))
