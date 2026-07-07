@@ -10,10 +10,11 @@ import pytest
 from renderflow.pipeline.assets import (
     generate_avatar_clips,
     generate_images,
+    generate_subtitles,
     generate_voice,
 )
 from renderflow.pipeline.script import generate_script
-from renderflow.schema import AssetStatus
+from renderflow.schema import AssetStatus, Scene
 from renderflow.storage import ProjectPaths, load_plan, save_plan, slugify
 from tests.stubs import StubAvatar, StubImage, StubLLM, StubTTS
 
@@ -79,6 +80,134 @@ def test_resume_recovers_assets_orphaned_in_running_state(paths: ProjectPaths):
     assert Path(orphaned.path).read_bytes() == b"fake-png"
 
 
+def test_one_failed_scene_does_not_stop_the_batch(paths: ProjectPaths):
+    """A provider error on scene 1 must not prevent scene 2 from generating —
+    a single rate-limited/timed-out scene used to raise and kill the whole
+    run before any other scene was even attempted."""
+
+    class FlakyImage:
+        name = "flaky-image"
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, prompt, negative_prompt=None, **params):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("simulated rate limit")
+            return StubImage().generate(prompt, negative_prompt, **params)
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    save_plan(plan, paths)
+
+    generate_images(plan, FlakyImage(), paths)
+
+    assert plan.scenes[0].assets.image.status is AssetStatus.FAILED
+    assert plan.scenes[1].assets.image.status is AssetStatus.COMPLETED
+    assert Path(plan.scenes[1].assets.image.path).read_bytes() == b"fake-png"
+
+
+def _plain_scene(scene_id: int, avatar_layout: str = "auto") -> Scene:
+    return Scene(
+        id=scene_id, duration_estimate_sec=5.0, narration="x", image_prompt="x",
+        avatar_layout=avatar_layout,
+    )
+
+
+def test_scene_is_avatar_solo_cycles_every_three():
+    from renderflow.pipeline.script import scene_is_avatar_solo
+
+    solo_ids = [n for n in range(1, 13) if scene_is_avatar_solo(_plain_scene(n))]
+    assert solo_ids == [1, 4, 7, 10]
+
+
+def test_scene_is_avatar_solo_override_wins_over_the_cycle():
+    from renderflow.pipeline.script import scene_is_avatar_solo
+
+    # id 2 would normally be split (cycle), id 4 would normally be solo.
+    assert scene_is_avatar_solo(_plain_scene(2, "solo")) is True
+    assert scene_is_avatar_solo(_plain_scene(4, "split")) is False
+    assert scene_is_avatar_solo(_plain_scene(2, "auto")) is False
+    assert scene_is_avatar_solo(_plain_scene(4, "auto")) is True
+
+
+def test_generate_images_skips_background_for_solo_scenes(paths: ProjectPaths):
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    for scene in plan.scenes:  # ids 1, 2
+        scene.type = "talking_avatar"
+    save_plan(plan, paths)
+
+    generate_images(plan, StubImage(), paths)
+
+    solo, split = plan.scenes  # id 1 solo, id 2 split
+    assert solo.assets.image.status is AssetStatus.PENDING
+    assert solo.assets.image.path is None
+    assert split.assets.image.status is AssetStatus.COMPLETED
+    assert split.assets.image.path is not None
+    # Both still get the avatar portrait — solo vs. split only affects the
+    # background visual, not the lip-sync source image.
+    assert solo.assets.avatar_image.status is AssetStatus.COMPLETED
+    assert split.assets.avatar_image.status is AssetStatus.COMPLETED
+
+
+def test_has_prominent_face_returns_false_for_blank_image():
+    pytest.importorskip("cv2")
+    from PIL import Image
+    import io
+    from renderflow.pipeline.facecheck import has_prominent_face
+
+    buf = io.BytesIO()
+    Image.new("RGB", (640, 360), (80, 80, 80)).save(buf, format="PNG")
+    assert has_prominent_face(buf.getvalue()) is False
+
+
+def test_has_prominent_face_handles_garbage_bytes_gracefully():
+    pytest.importorskip("cv2")
+    from renderflow.pipeline.facecheck import has_prominent_face
+
+    assert has_prominent_face(b"not an image") is False
+
+
+def test_generate_face_free_retries_until_no_face_detected(monkeypatch):
+    from renderflow.pipeline import assets, facecheck
+
+    calls = []
+
+    class CountingImage:
+        name = "counting-image"
+
+        def generate(self, prompt, negative_prompt=None, **params):
+            calls.append(1)
+            return StubImage().generate(prompt, negative_prompt, **params)
+
+    # Face detected on the first two attempts, clean on the third.
+    results = iter([True, True, False])
+    monkeypatch.setattr(facecheck, "has_prominent_face", lambda data: next(results))
+
+    asset = assets._generate_face_free(CountingImage(), "a prompt", None, "test")
+    assert len(calls) == 3
+    assert asset.data == b"fake-png"
+
+
+def test_generate_face_free_gives_up_after_max_retries(monkeypatch):
+    from renderflow.pipeline import assets, facecheck
+
+    calls = []
+
+    class AlwaysFaceImage:
+        name = "always-face-image"
+
+        def generate(self, prompt, negative_prompt=None, **params):
+            calls.append(1)
+            return StubImage().generate(prompt, negative_prompt, **params)
+
+    monkeypatch.setattr(facecheck, "has_prominent_face", lambda data: True)
+
+    asset = assets._generate_face_free(AlwaysFaceImage(), "a prompt", None, "test")
+    assert len(calls) == assets.MAX_FACE_RETRIES
+    assert asset.data == b"fake-png"  # keeps the last result rather than failing the scene
+
+
 def test_talking_avatar_clip_generation(paths: ProjectPaths):
     plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
     plan.scenes[0].type = "talking_avatar"
@@ -96,9 +225,13 @@ def test_talking_avatar_clip_generation(paths: ProjectPaths):
     assert Path(avatar_scene.assets.avatar_clip.path).read_bytes() == b"fake-mp4"
     assert avatar_scene.assets.avatar_clip.provider == "stub-avatar"
     assert narration_scene.assets.avatar_clip.status is AssetStatus.PENDING
+    # Scene id 1 is solo-layout (scene_is_avatar_solo), so its background
+    # image is skipped: only scene 2's image (0.003) + both scenes' voice
+    # (0.002 each) + the avatar image (0.003) + avatar clip (0.004).
     assert load_plan(paths).total_asset_cost() == pytest.approx(
-        (0.003 + 0.002) * 2 + 0.003 + 0.004
+        0.003 + 0.002 * 2 + 0.003 + 0.004
     )
+    assert avatar_scene.assets.image.status is AssetStatus.PENDING
 
 
 def test_talking_avatar_uses_local_avatar_image(paths: ProjectPaths):
@@ -122,11 +255,16 @@ HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is n
 
 @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
 def test_render_integration(paths: ProjectPaths, monkeypatch):
+    pytest.importorskip("PIL")
     from renderflow.pipeline.render import probe_duration, render_video
 
     # Keep the integration test hermetic: zoompan needs no depth model.
     monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
     plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    # Scene id 1 is solo-layout (full-screen avatar, no visual) and id 2 is
+    # split-screen — exercises both render_avatar_full_clip and
+    # render_avatar_split_clip in one real-ffmpeg pass.
+    plan.scenes[0].type = "talking_avatar"
     plan.scenes[1].type = "talking_avatar"
 
     for scene in plan.scenes:
@@ -161,10 +299,17 @@ def test_render_integration(paths: ProjectPaths, monkeypatch):
             scene.assets.avatar_clip.path = str(avatar_clip)
             scene.assets.avatar_clip.advance(AssetStatus.COMPLETED)
 
+    generate_subtitles(plan, paths)
+    for scene in plan.scenes:
+        assert scene.assets.subtitle.status is AssetStatus.COMPLETED
+        assert Path(scene.assets.subtitle.path).exists()
+
     final = render_video(plan, paths)
     assert final.exists()
-    # Two 1-second scenes → roughly 2 seconds of video
-    assert probe_duration(final) == pytest.approx(2.0, abs=0.5)
+    # Two 1-second scenes, each padded with a trailing SCENE_GAP_SEC pause,
+    # hard-cut concatenated → a bit over 2s, never less (no crossfade shrink).
+    assert probe_duration(final) > 2.0
+    assert probe_duration(final) == pytest.approx(2.0, abs=1.0)
     probe = subprocess.run(
         [
             "ffprobe", "-v", "error",
@@ -178,6 +323,130 @@ def test_render_integration(paths: ProjectPaths, monkeypatch):
     )
     stream_types = {s["codec_type"] for s in json.loads(probe.stdout)["streams"]}
     assert stream_types == {"audio", "video"}
+
+
+def test_build_caption_chunks_covers_full_duration_in_order():
+    from renderflow.pipeline.subtitles import build_chunks
+
+    narration = "The Colosseum could seat fifty thousand roaring spectators in ancient Rome"
+    chunks = build_chunks(narration, duration=10.0)
+
+    assert len(chunks) >= 2
+    assert chunks[0][1] == 0.0
+    assert chunks[-1][2] == pytest.approx(10.0)
+    for (_, start, end), (_, next_start, _) in zip(chunks, chunks[1:]):
+        assert end == pytest.approx(next_start)
+        assert start < end
+    # Every narration word survives, in order, across the chunks.
+    assert " ".join(text for text, _, _ in chunks) == narration
+
+
+def test_build_caption_chunks_handles_empty_narration():
+    from renderflow.pipeline.subtitles import build_chunks
+
+    assert build_chunks("", duration=5.0) == []
+    assert build_chunks("hello", duration=0.0) == []
+
+
+def test_write_scene_subtitles_renders_pngs_and_json(paths: ProjectPaths):
+    pytest.importorskip("PIL")
+    from renderflow.pipeline.subtitles import load_scene_subtitles, write_scene_subtitles
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    scene = plan.scenes[0]
+    meta_path = write_scene_subtitles(scene, duration=6.0, paths=paths)
+
+    assert meta_path.exists()
+    entries = load_scene_subtitles(meta_path)
+    assert len(entries) >= 1
+    for entry in entries:
+        assert Path(entry["image"]).exists()
+        assert Path(entry["image"]).suffix == ".png"
+        assert 0.0 <= entry["start"] < entry["end"] <= 6.0
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_generate_subtitles_needs_completed_audio_and_is_resumable(paths: ProjectPaths):
+    pytest.importorskip("PIL")
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    save_plan(plan, paths)
+
+    # No voice asset yet: nothing to time captions against.
+    generate_subtitles(plan, paths)
+    assert plan.scenes[0].assets.subtitle.status is AssetStatus.PENDING
+
+    audio = paths.voice / "scene_001.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440", "-t", "2", str(audio)],
+        check=True, capture_output=True,
+    )
+    scene = plan.scenes[0]
+    scene.assets.voice.advance(AssetStatus.RUNNING)
+    scene.assets.voice.path = str(audio)
+    scene.assets.voice.advance(AssetStatus.COMPLETED)
+
+    generate_subtitles(plan, paths)
+    assert scene.assets.subtitle.status is AssetStatus.COMPLETED
+    first_path = scene.assets.subtitle.path
+
+    generate_subtitles(plan, paths)  # resume: already completed, must not redo
+    assert scene.assets.subtitle.path == first_path
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_scene_clip_bakes_in_trailing_pause(paths: ProjectPaths, monkeypatch):
+    """Regression: an earlier acrossfade crossfade blended the tail of one
+    line's audio into the head of the next, so scenes sounded like the
+    narrator talked over themselves. Each clip must now be exactly its own
+    narration length plus SCENE_GAP_SEC of true silence, with no overlap."""
+    monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
+    from renderflow.pipeline.render import SCENE_GAP_SEC, probe_duration, render_scene_clip
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    scene = plan.scenes[0]
+    img = paths.images / "scene_001.png"
+    audio = paths.voice / "scene_001.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=steelblue:s=640x360",
+         "-frames:v", "1", str(img)],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440", "-t", "2", str(audio)],
+        check=True, capture_output=True,
+    )
+    for ref, path in ((scene.assets.image, img), (scene.assets.voice, audio)):
+        ref.advance(AssetStatus.RUNNING)
+        ref.path = str(path)
+        ref.advance(AssetStatus.COMPLETED)
+
+    clip = paths.output / "clip_001.mp4"
+    render_scene_clip(scene, clip)
+    assert probe_duration(clip) == pytest.approx(2.0 + SCENE_GAP_SEC, abs=0.1)
+
+
+def test_caption_filter_chain_builds_overlay_and_inputs():
+    from renderflow.pipeline.render import _caption_filter_chain
+
+    chunks = [
+        {"image": "/tmp/a.png", "start": 0.0, "end": 1.5},
+        {"image": "/tmp/b.png", "start": 1.5, "end": 3.0},
+    ]
+    label, inputs, filt = _caption_filter_chain("base", chunks, start_index=2)
+
+    assert inputs == ["-i", "/tmp/a.png", "-i", "/tmp/b.png"]
+    assert label == "base_cap1"
+    assert "[2:v]" in filt and "[3:v]" in filt
+    assert "between(t,0.000,1.500)" in filt
+    assert "between(t,1.500,3.000)" in filt
+
+
+def test_caption_filter_chain_is_noop_when_no_chunks():
+    from renderflow.pipeline.render import _caption_filter_chain
+
+    label, inputs, filt = _caption_filter_chain("base", [], start_index=2)
+    assert (label, inputs, filt) == ("base", [], "")
 
 
 @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
@@ -215,11 +484,29 @@ def test_generate_thumbnail_is_tracked_and_resumable(paths: ProjectPaths):
 
     assert plan.thumbnail.status is AssetStatus.COMPLETED
     assert Path(plan.thumbnail.path).read_bytes() == b"fake-png"
-    assert plan.thumbnail.cost == 0.003
-    assert plan.total_asset_cost() == pytest.approx(0.003)  # images not yet run
+    # Two images now: the topic background (thumbnail.path) plus a separate
+    # host reaction face — cost is the sum of both generate() calls.
+    assert plan.thumbnail.cost == pytest.approx(0.006)
+    assert plan.total_asset_cost() == pytest.approx(0.006)  # images not yet run
+    reaction_path = paths.output / "thumbnail_reaction.png"
+    assert reaction_path.exists()
+    assert reaction_path.read_bytes() == b"fake-png"
     first_path = plan.thumbnail.path
     generate_thumbnail(plan, StubImage(), paths)  # resume skips
     assert plan.thumbnail.path == first_path
+
+
+def test_thumbnail_reaction_prompt_strips_calm_expression_wording():
+    from renderflow.pipeline.assets import _thumbnail_reaction_prompt
+    from renderflow.pipeline.script import LOCAL_AVATAR
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    plan.scenes[0].avatar = LOCAL_AVATAR
+    prompt = _thumbnail_reaction_prompt(plan)
+
+    assert "calm serious expression" not in prompt
+    assert "shocked" in prompt.lower()
+    assert "surprise" in prompt.lower()
 
 
 @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
@@ -300,8 +587,9 @@ def test_local_split_script_paces_five_second_scenes():
     assert all(len(s.narration.split()) <= 16 for s in plan.scenes)
     assert " ".join(s.narration for s in plan.scenes) == script
     assert all("photograph" in s.image_prompt for s in plan.scenes)
-    # Composition rule: subject + context, never a lone face
-    assert all("never a lone" in s.image_prompt for s in plan.scenes)
+    # Composition rule: no visible human face at all, not just no close-up
+    assert all("no visible human face" in s.image_prompt for s in plan.scenes)
+    assert all("human face" in s.negative_prompt for s in plan.scenes)
     assert all("lone face close-up" in s.negative_prompt for s in plan.scenes)
 
 

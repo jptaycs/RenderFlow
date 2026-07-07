@@ -39,16 +39,18 @@ Rules:
   medium shot, aerial), lens and film feel (e.g. "35mm documentary
   photograph, shallow depth of field"), natural lighting, era-accurate
   details and textures. No text or lettering in the image.
-- Never a lone human face or single-person headshot. Every image must
-  combine at least two visual elements: what the sentence talks about plus
-  its topic context (the setting, objects, actions, or secondary subjects).
-  Show people in their environment doing something — wide or medium shots,
-  not face close-ups.
+- Avoid a visible human face entirely — never a portrait, never a lone
+  face close-up, never a person looking at the camera. If the sentence is
+  genuinely about a person, show them from behind, in silhouette, at a
+  distance, or cropped to hands/objects only. Every image must combine at
+  least two visual elements: what the sentence talks about plus its topic
+  context (the setting, objects, actions, or secondary subjects). Wide or
+  medium shots only.
 - negative_prompt lists things the image model should avoid; always include
-  realism killers and lone-face killers (e.g. "text, watermark, cartoon,
+  realism killers and face killers (e.g. "text, watermark, cartoon,
   illustration, painting, 3d render, CGI, plastic skin, oversaturated
-  colors, deformed hands, low quality, lone face close-up, single face
-  filling the frame").
+  colors, deformed hands, low quality, human face, portrait, lone face
+  close-up, single face filling the frame, person looking at camera").
 - Vary motion between scenes (zoom_in, zoom_out, pan_left, pan_right) with
   intensity between 0.05 and 0.15.
 - Scene ids start at 1 and increment by 1.
@@ -105,16 +107,18 @@ Rules:
   photograph, shallow depth of field"), natural lighting, era-accurate
   details and textures. No text or lettering. Keep a consistent
   photographic style across all scenes.
-- Never a lone human face or single-person headshot. Every image must
-  combine at least two visual elements: what the sentence talks about plus
-  its topic context (the setting, objects, actions, or secondary subjects).
-  Show people in their environment doing something — wide or medium shots,
-  not face close-ups.
+- Avoid a visible human face entirely — never a portrait, never a lone
+  face close-up, never a person looking at the camera. If the sentence is
+  genuinely about a person, show them from behind, in silhouette, at a
+  distance, or cropped to hands/objects only. Every image must combine at
+  least two visual elements: what the sentence talks about plus its topic
+  context (the setting, objects, actions, or secondary subjects). Wide or
+  medium shots only.
 - negative_prompt: what the image model should avoid; always include realism
-  killers and lone-face killers (e.g. "text, watermark, cartoon,
-  illustration, painting, 3d render, CGI, plastic skin, oversaturated
-  colors, deformed hands, low quality, lone face close-up, single face
-  filling the frame").
+  killers and face killers (e.g. "text, watermark, cartoon, illustration,
+  painting, 3d render, CGI, plastic skin, oversaturated colors, deformed
+  hands, low quality, human face, portrait, lone face close-up, single
+  face filling the frame, person looking at camera").
 - Vary motion between scenes (zoom_in, zoom_out, pan_left, pan_right),
   intensity 0.05-0.15.
 - Scene ids start at 1 and increment by 1.
@@ -156,10 +160,11 @@ def split_script_local(script_text: str, style: str) -> tuple[ScenePlan, LLMResu
             narration=chunk,
             image_prompt=_local_image_prompt(chunk, style),
             negative_prompt=(
-                "text, watermark, subtitles, captions, cartoon, illustration, "
-                "painting, 3d render, CGI, plastic skin, oversaturated colors, "
-                "deformed hands, low quality, blurry, lone face close-up, "
-                "single face filling the frame, isolated headshot"
+                "human face, face, portrait, person looking at camera, "
+                "lone face close-up, single face filling the frame, isolated "
+                "headshot, text, watermark, subtitles, captions, "
+                "cartoon, illustration, painting, 3d render, CGI, plastic skin, "
+                "oversaturated colors, deformed hands, low quality, blurry"
             ),
             avatar=LOCAL_AVATAR if _uses_local_avatar(index) else None,
             motion=Motion(
@@ -181,9 +186,29 @@ def split_script_local(script_text: str, style: str) -> tuple[ScenePlan, LLMResu
 
 
 def _uses_local_avatar(scene_index: int) -> bool:
-    # The host speaks in every scene: each ~5 s clip renders split-screen
-    # (avatar left, scene visual right) so the presenter is always on camera.
+    # The host speaks in every scene — solo or split-screen (see
+    # scene_is_avatar_solo), the presenter is always on camera.
     return True
+
+
+def scene_is_avatar_solo(scene: Scene) -> bool:
+    """Solo full-screen avatar vs. split-screen (avatar left + that scene's
+    own visual right).
+
+    A per-scene `avatar_layout` override ("solo"/"split") wins outright —
+    it's a deliberate user choice, made from the dashboard when the
+    generated visual isn't wanted for that beat. The default, "auto", falls
+    back to a repeating cycle of 3 (1 solo, then 2 split; scene ids start
+    at 1 and increment by 1, so id 1, 4, 7, ... are solo) — most projects
+    never need to touch the override at all. Every caller (render.py: which
+    layout to draw; assets.py: skip generating an unused background image
+    for solo scenes) derives its answer from this single function.
+    """
+    if scene.avatar_layout == "solo":
+        return True
+    if scene.avatar_layout == "split":
+        return False
+    return (scene.id - 1) % 3 == 0
 
 
 def _strip_script_markup(script_text: str) -> str:
@@ -271,13 +296,25 @@ def _local_image_prompt(narration: str, style: str) -> str:
     excerpt = excerpt.rstrip(",;:— ")
     if not excerpt.endswith((".", "!", "?", "…")):
         excerpt += "."
+    # The composition rule leads, before the narration content: image models
+    # weight earlier prompt tokens more heavily, and for abstract narration
+    # (no concrete noun — "he was told he would be independent") Pollinations
+    # otherwise defaults to a generic stock-portrait face, which the
+    # negative_prompt alone doesn't reliably suppress. Learned 2026-07 on a
+    # 59-scene render: ~30% of scenes fell back to a face-forward shot even
+    # with the "never a lone face close-up" wording — client feedback was to
+    # avoid a visible face altogether, not just avoid it being a close-up.
     return (
-        f"Realistic {style} photograph depicting: {excerpt} "
-        "Wide or medium shot combining the subject with its surroundings — "
-        "setting, objects, and actions from the narration, never a lone "
-        "face close-up. Shot on 35mm film, natural lighting, shallow depth "
-        "of field, documentary composition, era-accurate details, realistic "
-        "surface textures, muted natural colors, no visible text."
+        "Wide or medium documentary b-roll photograph — absolutely no "
+        "visible human face, never a portrait, never a person looking at "
+        "the camera. If people appear, show them from behind, in "
+        "silhouette, at a distance, or cropped to hands/objects only — "
+        f"never a face. Show the concrete setting, objects, tools, or "
+        f"action of this moment: {excerpt} "
+        f"Realistic {style} photograph, shot on 35mm film, natural lighting, "
+        "shallow depth of field, documentary composition, era-accurate "
+        "details, realistic surface textures, muted natural colors, "
+        "no visible text."
     )
 
 

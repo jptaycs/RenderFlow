@@ -10,3 +10,4 @@ projects/
 .pytest_cache/
 dist/
 .kokoro/
+.cv2_models/

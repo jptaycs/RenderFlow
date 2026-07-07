@@ -11,6 +11,7 @@ Run:  .venv/bin/python -m renderflow.api   (serves http://127.0.0.1:8321)
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from renderflow.config import Settings
+from renderflow.pipeline.script import scene_is_avatar_solo
 from renderflow.schema import AssetStatus, Scene, ScenePlan
 from renderflow.storage import ProjectPaths, load_plan, save_plan, slugify
 
@@ -85,32 +87,58 @@ def _spawn(slug: str, args: list[str]) -> None:
 # State assembly
 # ---------------------------------------------------------------------------
 
-_ASSET_KEYS = ("image", "voice", "avatar_clip")
-
-
 def _scene_assets(scene: Scene) -> dict[str, str]:
-    assets = {
-        "image": scene.assets.image.status.value,
-        "voice": scene.assets.voice.status.value,
-    }
+    assets: dict[str, str] = {}
+    # Solo-layout scenes never generate a background image (see
+    # scene_is_avatar_solo) — showing an "Image: pending" chip that can
+    # never complete looked like a stuck pipeline step.
+    if not (scene.type == "talking_avatar" and scene_is_avatar_solo(scene)):
+        assets["image"] = scene.assets.image.status.value
+    assets["voice"] = scene.assets.voice.status.value
     if scene.type == "talking_avatar":
         assets["avatar"] = scene.assets.avatar_clip.status.value
     return assets
 
 
-def _file_url(slug: str, path: str | None) -> str | None:
-    """Map an absolute asset path to its /files URL (projects dir only)."""
+def _file_url(slug: str, path: str | Path | None) -> str | None:
+    """Map an absolute asset path to its /files URL (projects dir only).
+
+    Appends the file's mtime as a cache-busting query param. Scene/thumbnail/
+    video filenames are deterministic (scene_002.png, thumbnail.jpg,
+    final.mp4) — regenerating a scene or resuming a project overwrites the
+    same path, so without this the URL is byte-identical to before and the
+    browser keeps showing the stale cached image/video after a "regenerate."
+    """
     if not path:
         return None
+    file_path = Path(path)
     try:
-        rel = Path(path).resolve().relative_to(_projects_dir().resolve() / slug)
+        rel = file_path.resolve().relative_to(_projects_dir().resolve() / slug)
     except ValueError:
         return None
-    return f"/files/{slug}/{rel.as_posix()}"
+    try:
+        version = int(file_path.stat().st_mtime)
+    except OSError:
+        version = 0
+    return f"/files/{slug}/{rel.as_posix()}?v={version}"
+
+
+def _scene_thumb(slug: str, scene: Scene) -> str | None:
+    if scene.assets.image.status is AssetStatus.COMPLETED:
+        return _file_url(slug, scene.assets.image.path)
+    # Solo-layout scenes have no background image — preview the avatar
+    # portrait instead of leaving the card blank.
+    if scene.assets.avatar_image.status is AssetStatus.COMPLETED:
+        return _file_url(slug, scene.assets.avatar_image.path)
+    return None
 
 
 def _refs(scene: Scene):
-    yield scene.assets.image
+    # Solo-layout scenes never get a background image (see
+    # scene_is_avatar_solo) — counting it here would keep progress stuck
+    # below 100% forever.
+    if not (scene.type == "talking_avatar" and scene_is_avatar_solo(scene)):
+        yield scene.assets.image
     yield scene.assets.voice
     if scene.type == "talking_avatar":
         yield scene.assets.avatar_image
@@ -129,8 +157,12 @@ def _project_view(slug: str, plan: ScenePlan, paths: ProjectPaths) -> dict[str, 
     # A final.mp4 left over from an earlier run must not count: the render is
     # done only if every asset is completed AND the video is newer than the
     # last scene-plan change (scenes.json is rewritten on every asset update).
+    # Also gate on "not run": ffmpeg creates final.mp4 on disk the instant it
+    # starts encoding, with a fresh mtime — a still-active render would
+    # otherwise look "ready" (and downloadable) while the file is mid-write.
     final_ready = (
-        all_done
+        not run
+        and all_done
         and final.exists()
         and final.stat().st_mtime >= paths.scenes_json.stat().st_mtime
     )
@@ -179,8 +211,12 @@ def _project_view(slug: str, plan: ScenePlan, paths: ProjectPaths) -> dict[str, 
             "provider": s.assets.image.provider or "—",
             "cost": sum(r.cost or 0.0 for r in _refs(s)),
             "assets": _scene_assets(s),
-            "thumb": _file_url(slug, s.assets.image.path)
-            if s.assets.image.status is AssetStatus.COMPLETED else None,
+            "thumb": _scene_thumb(slug, s),
+            "avatarLayout": s.avatar_layout if s.type == "talking_avatar" else None,
+            "effectiveLayout": (
+                ("solo" if scene_is_avatar_solo(s) else "split")
+                if s.type == "talking_avatar" else None
+            ),
         }
         for s in plan.scenes
     ]
@@ -208,8 +244,8 @@ def _project_view(slug: str, plan: ScenePlan, paths: ProjectPaths) -> dict[str, 
         ).strftime("%b %-d"),
         "stages": stages,
         "scenes": scenes,
-        "videoUrl": f"/files/{slug}/output/final.mp4" if final_ready else None,
-        "thumbnailUrl": f"/files/{slug}/output/thumbnail.jpg"
+        "videoUrl": _file_url(slug, paths.output / "final.mp4") if final_ready else None,
+        "thumbnailUrl": _file_url(slug, paths.output / "thumbnail.jpg")
         if (paths.output / "thumbnail.jpg").exists() else None,
         "running": bool(run),
     }
@@ -326,6 +362,29 @@ def resume_project(slug: str) -> dict[str, str]:
     return {"slug": slug}
 
 
+# A fresh random seed on the exact same prompt often keeps a similar
+# composition (the prompt text drives composition far more than the seed
+# does) — so a manual "Regenerate" swaps in a different framing instruction
+# too, to actually give a visibly different shot rather than a near-repeat.
+_VARIATION_MARKER = " Try this take: "
+_REGENERATE_VARIATIONS = (
+    "from a different camera angle",
+    "as a wider establishing shot",
+    "as a closer detail shot",
+    "at a different time of day",
+    "from a different camera position",
+    "with a different composition and framing",
+)
+
+
+def _vary_prompt(prompt: str) -> str:
+    # Strip any variation clause appended by an earlier regenerate so
+    # repeated clicks don't grow the prompt without bound.
+    base = prompt.split(_VARIATION_MARKER)[0].rstrip()
+    variation = random.choice(_REGENERATE_VARIATIONS)
+    return f"{base}{_VARIATION_MARKER}{variation}."
+
+
 @app.post("/api/projects/{slug}/scenes/{scene_id}/regenerate")
 def regenerate_scene(slug: str, scene_id: int) -> dict[str, str]:
     paths = _existing_project(slug)
@@ -340,10 +399,52 @@ def regenerate_scene(slug: str, scene_id: int) -> dict[str, str]:
             Path(ref.path).unlink(missing_ok=True)
     from renderflow.schema import SceneAssets
 
+    if not (scene.type == "talking_avatar" and scene_is_avatar_solo(scene)):
+        scene.image_prompt = _vary_prompt(scene.image_prompt)
     scene.assets = SceneAssets()
     (paths.output / "final.mp4").unlink(missing_ok=True)
     save_plan(plan, paths)
-    _spawn(slug, ["--scenes-file", str(paths.scenes_json)])
+    # Skip the final render here — regenerating one scene must not force a
+    # multi-minute re-encode of the whole video before the project unlocks
+    # for the next regenerate. The dashboard's "Resume run" (already shown
+    # once a project has no fresh final.mp4) does the one render pass once
+    # the user is done regenerating whatever scenes they wanted to fix.
+    _spawn(slug, ["--scenes-file", str(paths.scenes_json), "--skip-render"])
+    return {"slug": slug}
+
+
+class SceneLayoutUpdate(BaseModel):
+    layout: str  # "auto" | "solo" | "split"
+
+
+@app.post("/api/projects/{slug}/scenes/{scene_id}/layout")
+def set_scene_layout(slug: str, scene_id: int, body: SceneLayoutUpdate) -> dict[str, str]:
+    """Override solo-vs-split for one scene — e.g. the user doesn't want
+    the generated visual for this beat and would rather the host just talk
+    full-screen instead (or the reverse). Persisted on the scene itself
+    (`avatar_layout`); see scene_is_avatar_solo for how "auto" falls back to
+    the default cycle."""
+    if body.layout not in ("auto", "solo", "split"):
+        raise HTTPException(422, "layout must be 'auto', 'solo', or 'split'")
+    paths = _existing_project(slug)
+    if _run_active(slug):
+        raise HTTPException(409, "run already in progress")
+    plan = load_plan(paths)
+    scene = next((s for s in plan.scenes if s.id == scene_id), None)
+    if scene is None:
+        raise HTTPException(404, f"no scene {scene_id} in {slug!r}")
+    if scene.type != "talking_avatar":
+        raise HTTPException(422, "layout override only applies to talking-avatar scenes")
+
+    scene.avatar_layout = body.layout
+    # Split needs a background visual — generate one if this scene never
+    # had one (it was solo up to now). Solo needs nothing generated; any
+    # existing image is just left alone, unused, in case they switch back.
+    needs_image = not scene_is_avatar_solo(scene) and scene.assets.image.status != AssetStatus.COMPLETED
+    (paths.output / "final.mp4").unlink(missing_ok=True)
+    save_plan(plan, paths)
+    if needs_image:
+        _spawn(slug, ["--scenes-file", str(paths.scenes_json), "--skip-render"])
     return {"slug": slug}
 
 

@@ -1,0 +1,328 @@
+================================================================
+LOOM WALKTHROUGH SCRIPT — RenderFlow paid test for David
+================================================================
+Read the [SPOKEN] lines out loud while recording your screen.
+[SHOW: ...] lines tell you exactly what to click/have on screen.
+Total runtime target: ~9-12 minutes. Don't rush — pauses are fine,
+you can trim dead air in editing.
+
+Before you hit record:
+  1. Start the dashboard:  .venv/bin/python -m renderflow.api
+  2. Open http://127.0.0.1:8321 in your browser, full-screen it.
+  3. Have this script open on a second monitor/phone, NOT on the
+     screen you're recording.
+  4. Know which finished project is the real deliverable:
+     "Why My Amish Farm Never Pays a Power Bill" — this is the
+     one built from David's actual test script, verbatim.
+  5. Have your code editor already open on the RenderFlow folder
+     (and a terminal tab ready in it) so Section 7 is a quick
+     alt-tab, not a fumble.
+
+================================================================
+SECTION 1 — Cold open (~15s)
+================================================================
+[SHOW: Projects screen, whatever is currently on it]
+
+[SPOKEN]
+"Hey David, this is Jerome. This is a full screen recording of
+RenderFlow, the video pipeline I built for your test — I'm going
+to show you the actual interface generating a video live, not
+just hand you a finished file. Let's jump in."
+
+================================================================
+SECTION 2 — What you're looking at (~30s)
+================================================================
+[SHOW: Point at the sidebar — Projects / Activity / Overview nav]
+
+[SPOKEN]
+"This is the dashboard. On the left: Projects, where every video
+lives; Activity, a live feed of every job running across all
+projects; and Overview, which is a one-page breakdown of every
+tool I used and what the paid upgrade path looks like for each
+— I'll come back to that one near the end."
+
+================================================================
+SECTION 3 — Start a video live, on camera (~45s)
+================================================================
+[SHOW: Click "+ New Video" top right]
+[SHOW: The New Video modal opens — Title field, Script field, style dropdown]
+
+[SPOKEN]
+"Let's start one from scratch so you can watch the whole process.
+I'll give it a title..."
+
+[SHOW: Type a short title, e.g. "Why Aluminum Was Once Worth More Than Gold"
+        (or click the little dice icon for a random topic + script)]
+
+[SPOKEN]
+"...and paste in a script. You could type your own topic and let
+it write one, but since we're doing a live demo, I'll use one of
+the sample scripts already loaded in the tool."
+
+[SHOW: Click the 🎲 "Random topic" button — it fills in a title + script]
+[SHOW: Point at "documentary" style dropdown, leave as-is]
+[SHOW: Click "Start generating"]
+
+[SPOKEN]
+"That's it — one click. No API keys needed for any of this,
+everything runs on free or local tools, which I'll break down
+at the end."
+
+================================================================
+SECTION 4 — Watch it generate live (~90s)
+================================================================
+[SHOW: You're dropped onto the new project's detail page —
+        Pipeline tab, stage tracker: Script → Scenes → Assets → Render]
+
+[SPOKEN]
+"Here's the pipeline stage tracker — it's live, it's actually
+updating right now. Script and Scenes are already done because
+the splitting happens instantly and locally. Assets is where the
+real work happens: each scene needs an image, a voiceover clip,
+and a lip-synced avatar clip of the host."
+
+[SHOW: Scroll down to the scene cards grid — point at asset chips
+        changing from "pending" to "running" to "complete"]
+
+[SPOKEN]
+"Every scene is only about five seconds of narration — that's
+deliberate, it keeps the visuals changing constantly instead of
+sitting on one image for thirty seconds like a lot of AI
+documentary channels do."
+
+[SHOW: Click into one scene card that's mid-generation — the side panel opens]
+
+[SPOKEN]
+"If I open a scene, you can see exactly what's driving it: the
+narration line, the actual image prompt sent to the AI model, which
+provider generated it, and the cost — which for this stack is
+always zero. Every asset here is generated specifically for this
+scene, nothing is stock footage."
+
+[SHOW: Close the panel, point at a scene where the layout alternates —
+        some scenes are full-screen avatar, others are split-screen
+        avatar + visual]
+
+[SPOKEN]
+"One more thing worth pointing out here: the host isn't on
+screen the same way every time. It cycles — sometimes it's just
+the presenter talking full-screen, sometimes it's split-screen
+with the visual next to them. That's on purpose, it's closer to
+how a real documentary channel cuts between talking-head and
+b-roll."
+
+[Wait/let it keep generating in the background. If it's taking a
+while on camera, say the next line and cut forward in editing:]
+
+[SPOKEN — optional, if waiting]
+"This part is rate-limited by the free image API, so it takes a
+few minutes for a full video — I'll speed through this bit in
+editing, but I wanted you to see it's real, not a mockup."
+
+================================================================
+SECTION 5 — The actual deliverable (finished project) (~3 min)
+================================================================
+[SHOW: Click "All projects" (top-left arrow), then open the project
+        titled "Why My Amish Farm Never Pays a Power Bill"]
+
+[SPOKEN]
+"Now let's look at your actual test script, fully rendered. This
+is built from your script word-for-word — nothing paraphrased."
+
+[SHOW: Point at the status pill — "Complete", the cost, the duration]
+
+[SPOKEN]
+"Fifty-nine scenes, full pipeline, and the total cost is zero
+dollars — that's the free stack end to end."
+
+[SHOW: Scroll the scene grid — click a couple of different scene
+        cards, alternating solo-avatar and split-screen ones]
+
+[SPOKEN]
+"You can see the same pacing and layout pattern held for the
+entire five-minute video — captions burned in on every scene,
+timed to the actual voice audio, not just a rough guess."
+
+[SHOW: Click into one finished scene card — the side panel opens]
+
+[SPOKEN]
+"Two features worth showing you here, since you'll want control
+over the output, not just a black box. First — this avatar layout
+control."
+
+[SHOW: Point at the "Avatar layout" row — Auto / Solo / Split buttons]
+
+[SPOKEN]
+"If the AI-generated visual for a scene just doesn't fit the
+story, I don't need to keep regenerating it and hoping for
+something better. I can force that scene to Solo — the host just
+talks, full-screen, no visual at all. Or the other direction:
+force a scene that's normally solo to Split, so it pulls in a
+visual. This is a real saved choice, not just a preview — it
+renders into the final video automatically, same as everything
+else here."
+
+[SHOW: Click "Solo" or "Split" to demonstrate it switching]
+
+[SPOKEN]
+"Second — if a specific scene's image doesn't land at all, I
+don't have to redo the whole video for it. I just click
+Regenerate, right here..."
+
+[SHOW: Click "Regenerate scene" in the side panel]
+
+[SPOKEN]
+"...and it swaps in a fresh AI image for just that one scene — it
+even nudges the prompt so you get a genuinely different shot, not
+the same image with a new coat of paint. If I want to fix several
+scenes in a row, I can queue them up one after another instead of
+waiting for each one to finish before starting the next, and the
+final video re-renders by itself automatically once everything
+I queued is done — I don't have to remember to click anything
+else."
+
+[SHOW: Close the panel]
+
+[SHOW: Click "Cost" tab]
+
+[SPOKEN]
+"Cost breakdown by category — images, voice, avatar — all zero on
+this stack. If you ever want to push quality further, this exact
+tab is where you'd see the cost shift if we swapped any piece for
+a paid provider."
+
+[SHOW: Click back to "Pipeline" tab, scroll to top, click "Download MP4"]
+
+[SPOKEN]
+"And here's the final export."
+
+[SHOW: Open the downloaded MP4 in your video player, or use the
+        OS quick-look preview — play about 15-20 seconds of it]
+
+[SPOKEN — while it plays]
+"Split-screen avatar and visual, captions, camera motion on the
+still images instead of a flat zoom, and a clean pause between
+lines instead of talking over itself — that last part actually
+took a couple of iterations to get right, I'll be honest about
+that in the write-up."
+
+[SHOW: Stop playback]
+
+================================================================
+SECTION 6 — Tools used, and what paid quality buys you (~2 min)
+================================================================
+[SHOW: Click "Overview" in the sidebar]
+
+[SPOKEN]
+"Last thing — this page is basically the write-up you asked for,
+built into the tool itself instead of a separate doc. Let me walk
+through exactly what's running under the hood."
+
+[SHOW: Point at the pipeline strip across the top]
+
+[SPOKEN]
+"Script splitting is a custom tool I built, runs locally, no AI
+call needed. Scene images come from Pollinations, running the
+Flux model, free. Camera motion — that slow push and drift you
+saw on the stills instead of a flat zoom — that's a depth model
+called Depth-Anything-V2, it builds an actual depth map of the
+image so the motion feels like a real camera move through the
+scene. Voiceover is Kokoro, an open-source text-to-speech model
+running entirely on my machine, no API cost. The host's lip-sync
+is Wav2Lip, also local. Captions are a custom renderer I built.
+And the whole thing gets assembled with FFmpeg, the same
+open-source engine most professional editing software is built on
+under the hood."
+
+[SHOW: Scroll to the free-vs-paid table]
+
+[SPOKEN]
+"Now here's the important part. Everything I just named is the
+free tier. This table shows what upgrading each piece to a paid
+version costs, and exactly what it buys you. Images through Flux
+on Replicate — about fifteen to thirty cents for a whole video —
+gets you sharper native 1080p with no rate limiting. Voiceover
+through ElevenLabs adds real emotional range and breath to the
+narration. Avatar through SadTalker or HeyGen gets you actual
+head movement, not just lip-sync on a still photo."
+
+[SPOKEN]
+"Here's my honest read: the free stack you're watching right now
+already matches the format and pacing of a channel like Elias
+Yoder's. If we turn on the paid tier for images, voice, and
+avatar — which realistically runs somewhere around six to
+thirteen dollars a video, all laid out right here in this table —
+the visual and audio quality would be the same as, or better
+than, what you see on that channel. Sharper images, a more human-
+sounding narrator, a host with real head motion instead of just a
+moving mouth. And the pipeline itself doesn't change at all to
+get there — it's a one-line config swap per provider, nothing
+gets rebuilt."
+
+[SHOW: Point at the automated-vs-manual columns]
+
+[SPOKEN]
+"And this splits out what's fully automated — which is basically
+the entire pipeline, one click start to finish — versus what's a
+one-time setup, like picking the presenter photo, or a manual
+judgment call, like final review before publishing."
+
+================================================================
+SECTION 7 — Quick look at the codebase (~15s)
+================================================================
+[SHOW: Switch to your code editor with the RenderFlow repo open]
+[SHOW: Scroll the file tree for 2-3 seconds — renderflow/pipeline/,
+        renderflow/providers/, web/, tests/ — no need to open files]
+
+[SPOKEN]
+"Last thing, quickly — this isn't a no-code wrapper, it's a real
+codebase. Script, rendering, and every provider are cleanly
+separated, there's a full automated test suite behind it, and
+it's structured to drop in a real job queue and database for the
+full build without a rewrite."
+
+[SHOW: Optional — open a terminal, run:  .venv/bin/python -m pytest -q
+        let the "passed" line sit on screen for a second, then cut away]
+
+================================================================
+SECTION 8 — Close (~20s)
+================================================================
+[SHOW: Back to Projects screen]
+
+[SPOKEN]
+"That's the full loop — script in, real AI visuals, avatar,
+captions, and a finished export, on a completely free stack. I'll
+send over the tools-and-cost write-up alongside this recording.
+Thanks for taking the time to look at it, David — looking forward
+to hearing what you think."
+
+================================================================
+NOTES FOR YOU (not spoken — just reminders)
+================================================================
+- If the live demo in Section 3-4 is too slow to sit through on
+  camera, it's fine to jump-cut: record it, then speed up or trim
+  the waiting in your editor. The client asked to SEE the process,
+  not watch it in real time.
+- Don't forget to actually mention the cost is $0.00 out loud at
+  least twice — it's your strongest selling point in this test.
+- The "paid quality matches or beats Elias Yoder" claim is now
+  spoken directly in Section 6 — say it with confidence, the
+  dollar figures backing it are the exact ones on the Overview
+  page, this isn't a stretch.
+- If David pushes back and asks "so why not just show me the paid
+  version," the honest answer: the test brief said free/low-cost
+  tools only, so that's what this demo proves out — the paid
+  swap is a config change away, not new engineering, and only
+  makes sense to spend once he confirms the MVP direction.
+- The Regenerate demo in Section 5 takes about 15-20 seconds to
+  actually produce a new image — that's fine to show in real time
+  (it's short), but if you want to cut it, just trim the wait and
+  hard-cut to the new thumbnail once it lands. Pick a scene where
+  the "before" image is a bit generic, so the "after" reads as a
+  clear improvement on camera.
+- For the Avatar layout demo, switching to Solo is instant (nothing
+  to generate) — good for a snappy live cut. Switching a solo scene
+  to Split takes ~15-20s if that scene never had a visual generated
+  before (same wait as Regenerate). Pick whichever fits your pacing;
+  demoing Solo first is the faster, cleaner beat if you're worried
+  about runtime.

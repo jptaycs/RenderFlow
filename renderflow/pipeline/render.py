@@ -13,7 +13,8 @@ import subprocess
 from pathlib import Path
 
 from renderflow.pipeline import parallax
-from renderflow.schema import Scene, ScenePlan
+from renderflow.pipeline.script import scene_is_avatar_solo
+from renderflow.schema import AssetStatus, Scene, ScenePlan
 from renderflow.storage import ProjectPaths
 
 log = logging.getLogger("renderflow.pipeline.render")
@@ -24,6 +25,17 @@ AVATAR_W = 768
 VISUAL_W = WIDTH - AVATAR_W
 # Upscale before zoompan so sub-pixel motion doesn't jitter.
 PRESCALE_W, PRESCALE_H = 2560, 1440
+# Gap between the caption image's bottom edge and the frame's bottom edge.
+CAPTION_MARGIN = 34
+# Silent beat appended to the end of every scene clip, so narration never
+# runs straight into the next line. NOT an audio crossfade: crossfading two
+# narration tracks blends the tail of one sentence into the head of the
+# next, so both play at once — it sounds like the speaker interrupts
+# themselves. A held pause (silence + a still frame) avoids that entirely
+# while still giving each cut a small breath. Learned 2026-07: an earlier
+# xfade/acrossfade transition did exactly this and made every scene boundary
+# sound like overlapping speech.
+SCENE_GAP_SEC = 0.3
 
 
 class RenderError(RuntimeError):
@@ -98,8 +110,45 @@ def _parallax_visual(
     return tmp if ok else None
 
 
+def _subtitle_chunks(scene: Scene) -> list[dict]:
+    ref = scene.assets.subtitle
+    if ref.status is not AssetStatus.COMPLETED or not ref.path:
+        return []
+    from renderflow.pipeline.subtitles import load_scene_subtitles
+
+    return load_scene_subtitles(ref.path)
+
+
+def _caption_filter_chain(
+    base_label: str, chunks: list[dict], start_index: int
+) -> tuple[str, list[str], str]:
+    """Overlay each caption PNG onto base_label, timed to its (start, end).
+
+    Returns (final_label, extra ffmpeg "-i" args, filter_complex additions).
+    Empty chunks return base_label unchanged and no-op additions.
+    """
+    if not chunks:
+        return base_label, [], ""
+    extra_inputs: list[str] = []
+    filters: list[str] = []
+    label = base_label
+    y_expr = f"H-h-{CAPTION_MARGIN}"
+    for i, chunk in enumerate(chunks):
+        idx = start_index + i
+        extra_inputs += ["-i", chunk["image"]]
+        out_label = f"{base_label}_cap{i}"
+        filters.append(
+            f"[{label}][{idx}:v]overlay=(W-w)/2:{y_expr}:"
+            f"enable='between(t,{chunk['start']:.3f},{chunk['end']:.3f})'[{out_label}]"
+        )
+        label = out_label
+    return label, extra_inputs, ";".join(filters)
+
+
 def render_scene_clip(scene: Scene, out: Path) -> Path:
     if scene.type == "talking_avatar" and scene.assets.avatar_clip.path:
+        if scene_is_avatar_solo(scene):
+            return render_avatar_full_clip(scene, Path(scene.assets.avatar_clip.path), out)
         assert scene.assets.image.path
         return render_avatar_split_clip(
             scene, Path(scene.assets.avatar_clip.path), Path(scene.assets.image.path), out
@@ -108,21 +157,31 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
     assert scene.assets.image.path and scene.assets.voice.path
     image = Path(scene.assets.image.path)
     audio = Path(scene.assets.voice.path)
-    duration = probe_duration(audio)
+    # Render the visual (and hold the audio silent) for the full narration
+    # plus a trailing pause — see SCENE_GAP_SEC.
+    duration = probe_duration(audio) + SCENE_GAP_SEC
+    audio_filter = f"loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur={SCENE_GAP_SEC:.3f}"
+
+    chunks = _subtitle_chunks(scene)
 
     visual = _parallax_visual(scene, WIDTH, HEIGHT, duration, out)
     if visual is not None:
+        cap_label, cap_inputs, cap_filter = _caption_filter_chain("v0", chunks, 2)
+        filter_complex = f"[0:v]fps={FPS},format=yuv420p[v0]"
+        if cap_filter:
+            filter_complex += ";" + cap_filter
         _run(
             [
                 "ffmpeg", "-y",
                 "-i", str(visual),
                 "-i", str(audio),
-                "-map", "0:v", "-map", "1:a",
-                "-c:v", "copy",
-                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                *cap_inputs,
+                "-filter_complex", filter_complex,
+                "-map", f"[{cap_label}]", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+                "-af", audio_filter,
                 "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
                 "-t", f"{duration:.3f}",
-                "-shortest",
                 str(out),
             ]
         )
@@ -130,18 +189,52 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
         return out
 
     frames = math.ceil(duration * FPS)
+    cap_label, cap_inputs, cap_filter = _caption_filter_chain("base", chunks, 2)
+    filter_complex = f"[0:v]{_zoompan_expr(scene, frames)}[base]"
+    if cap_filter:
+        filter_complex += ";" + cap_filter
     _run(
         [
             "ffmpeg", "-y",
             "-i", str(image),
             "-i", str(audio),
-            "-filter_complex", f"[0:v]{_zoompan_expr(scene, frames)}[v]",
-            "-map", "[v]", "-map", "1:a",
+            *cap_inputs,
+            "-filter_complex", filter_complex,
+            "-map", f"[{cap_label}]", "-map", "1:a",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
-            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-af", audio_filter,
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-t", f"{duration:.3f}",
-            "-shortest",
+            str(out),
+        ]
+    )
+    return out
+
+
+def render_avatar_full_clip(scene: Scene, avatar_clip: Path, out: Path) -> Path:
+    """Full-screen solo avatar shot — no background visual (see
+    scene_is_avatar_solo)."""
+    duration = probe_duration(avatar_clip) + SCENE_GAP_SEC
+    filter_complex = (
+        f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={WIDTH}:{HEIGHT},"
+        f"tpad=stop_mode=clone:stop_duration={SCENE_GAP_SEC:.3f},format=yuv420p[vbase]"
+    )
+    chunks = _subtitle_chunks(scene)
+    cap_label, cap_inputs, cap_filter = _caption_filter_chain("vbase", chunks, 1)
+    if cap_filter:
+        filter_complex += ";" + cap_filter
+    _run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(avatar_clip),
+            *cap_inputs,
+            "-filter_complex", filter_complex,
+            "-map", f"[{cap_label}]", "-map", "0:a",
+            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur={SCENE_GAP_SEC:.3f}",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-t", f"{duration:.3f}",
             str(out),
         ]
     )
@@ -151,7 +244,12 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
 def render_avatar_split_clip(
     scene: Scene, avatar_clip: Path, visual_image: Path, out: Path
 ) -> Path:
-    duration = probe_duration(avatar_clip)
+    # Render both panels (and hold the audio silent) for the full clip plus
+    # a trailing pause — see SCENE_GAP_SEC. The avatar clip's own video ends
+    # exactly when its narration does, so it needs its last frame held
+    # (tpad) to cover the pause too; the visual panel is generated fresh for
+    # the full padded duration, so it needs no such patch.
+    duration = probe_duration(avatar_clip) + SCENE_GAP_SEC
 
     visual = _parallax_visual(scene, VISUAL_W, HEIGHT, duration, out)
     if visual is not None:
@@ -167,22 +265,27 @@ def render_avatar_split_clip(
 
     filter_complex = (
         f"[0:v]scale={AVATAR_W}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={AVATAR_W}:{HEIGHT},format=yuv420p[left];"
+        f"crop={AVATAR_W}:{HEIGHT},"
+        f"tpad=stop_mode=clone:stop_duration={SCENE_GAP_SEC:.3f},format=yuv420p[left];"
         + right_filter +
-        "[left][right]hstack=inputs=2[v]"
+        "[left][right]hstack=inputs=2[vbase]"
     )
+    chunks = _subtitle_chunks(scene)
+    cap_label, cap_inputs, cap_filter = _caption_filter_chain("vbase", chunks, 2)
+    if cap_filter:
+        filter_complex += ";" + cap_filter
     _run(
         [
             "ffmpeg", "-y",
             "-i", str(avatar_clip),
             *right_input,
+            *cap_inputs,
             "-filter_complex", filter_complex,
-            "-map", "[v]", "-map", "0:a",
+            "-map", f"[{cap_label}]", "-map", "0:a",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
-            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur={SCENE_GAP_SEC:.3f}",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-t", f"{duration:.3f}",
-            "-shortest",
             str(out),
         ]
     )
@@ -194,11 +297,14 @@ def render_avatar_split_clip(
 def render_thumbnail(
     plan: ScenePlan, paths: ProjectPaths, avatar_image: Path | None = None
 ) -> Path | None:
-    """Project thumbnail (1280x720 JPEG): topic image + host badge.
+    """Project thumbnail (1280x720 JPEG): topic image + host reaction badge.
 
     Prefers the generated clickbait image (output/thumbnail_src.png, see
     assets.generate_thumbnail); falls back to the first completed scene image.
-    The presenter portrait is composited bottom-left as a circular badge.
+    The badge prefers the generated reaction face (output/thumbnail_reaction.png
+    — exaggerated shocked/excited expression, built for attracting clicks)
+    over the plain neutral avatar portrait; falls back to the portrait for
+    older projects rendered before the reaction face existed.
     Runs at the end of asset generation; skipped if already present (resume).
     """
     thumb = paths.output / "thumbnail.jpg"
@@ -221,8 +327,10 @@ def render_thumbnail(
             str(thumb),
         ]
     )
-    if avatar_image is not None and avatar_image.exists():
-        _overlay_host_badge(thumb, avatar_image)
+    reaction = paths.output / "thumbnail_reaction.png"
+    badge_source = reaction if reaction.exists() else avatar_image
+    if badge_source is not None and badge_source.exists():
+        _overlay_host_badge(thumb, badge_source)
     log.info("thumbnail: %s", thumb)
     return thumb
 
@@ -264,12 +372,10 @@ def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
         log.info("rendering scene %d", scene.id)
         clips.append(render_scene_clip(scene, clip))
 
-    concat_list = paths.output / "concat.txt"
-    concat_list.write_text(
-        "".join(f"file '{clip.resolve()}'\n" for clip in clips)
-    )
     final = paths.output / "final.mp4"
     concat_inputs = [arg for clip in clips for arg in ("-i", str(clip))]
+    # Plain hard-cut concat — each clip already carries its own trailing
+    # pause (SCENE_GAP_SEC), so cuts read cleanly without an audio crossfade.
     concat_streams = "".join(f"[{i}:v][{i}:a]" for i in range(len(clips)))
     _run(
         [
