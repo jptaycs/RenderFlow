@@ -11,8 +11,10 @@ Run:  .venv/bin/python -m renderflow.api   (serves http://127.0.0.1:8321)
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -27,8 +29,15 @@ from pydantic import BaseModel
 
 from renderflow.config import Settings
 from renderflow.pipeline.script import scene_is_avatar_solo
-from renderflow.schema import AssetStatus, Scene, ScenePlan
-from renderflow.storage import ProjectPaths, load_plan, save_plan, slugify
+from renderflow.schema import AssetStatus, ProjectPerformance, Scene, ScenePlan
+from renderflow.storage import (
+    ProjectPaths,
+    load_performance,
+    load_plan,
+    save_performance,
+    save_plan,
+    slugify,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = REPO_ROOT / "web"
@@ -78,9 +87,66 @@ def _spawn(slug: str, args: list[str]) -> None:
         cwd=REPO_ROOT,
         stdout=log_file,
         stderr=subprocess.STDOUT,
+        # New session (own process group) so _kill_run can signal the whole
+        # tree at once — make_video.py shells out to real subprocesses of
+        # its own (wav2lip's inference.py, ffmpeg); killing only the direct
+        # child left those running to completion as orphans (found live
+        # 2026-07 testing cancel: a wav2lip inference.py kept burning CPU
+        # for a minute after "cancel" had already returned).
+        start_new_session=True,
     )
     (paths.logs / "run.pid").write_text(str(proc.pid))
     _runs[slug] = {"proc": proc, "started": time.time()}
+
+
+def _kill_run(slug: str) -> bool:
+    """Stop an active run and its whole subprocess tree, if any.
+
+    make_video.py is spawned in its own process group (_spawn,
+    start_new_session=True) so a single os.killpg reaches the pipeline's own
+    subprocess children too (wav2lip's inference.py, ffmpeg) — killing only
+    the direct child left those running to completion as orphans (found
+    live 2026-07 testing cancel: a wav2lip inference.py kept burning CPU for
+    a minute after "cancel" had already returned). Falls back to signaling
+    just the pid for a run spawned before this change, which predates the
+    process group and so has none to target.
+
+    Whatever asset was mid-generation is left in RUNNING state on disk —
+    that's already handled without any extra bookkeeping here: `_start`
+    (pipeline/assets.py) treats an orphaned RUNNING asset exactly like one
+    left behind by a crash, routing it through FAILED -> RETRYING the next
+    time a run starts on this project.
+    """
+    run = _run_active(slug)
+    if not run:
+        return False
+    pid = run["proc"].pid if run.get("proc") is not None else run["pid"]
+
+    def _signal(sig: int) -> None:
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+
+    _signal(signal.SIGTERM)
+    for _ in range(20):
+        if not _pid_is_pipeline(pid):
+            break
+        time.sleep(0.25)
+    else:
+        _signal(signal.SIGKILL)
+    proc = run.get("proc")
+    if proc is not None:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    _runs.pop(slug, None)
+    (_projects_dir() / slug / "logs" / "run.pid").unlink(missing_ok=True)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +209,33 @@ def _refs(scene: Scene):
     if scene.type == "talking_avatar":
         yield scene.assets.avatar_image
         yield scene.assets.avatar_clip
+
+
+def _best_effort_created_at(paths: ProjectPaths) -> float:
+    # Projects created before performance.json existed have no recorded
+    # creation time. st_birthtime (true creation time) isn't available on
+    # every platform, so fall back to the scenes.json mtime — a rough
+    # approximation is enough for a "production time" figure on old projects;
+    # every project created going forward gets an exact value from
+    # create_project() instead.
+    try:
+        return paths.root.stat().st_birthtime  # type: ignore[attr-defined]
+    except AttributeError:
+        return paths.scenes_json.stat().st_mtime
+
+
+def _load_performance_view(paths: ProjectPaths, final_ready: bool, final: Path) -> ProjectPerformance:
+    perf = load_performance(paths)
+    dirty = False
+    if perf.created_at is None:
+        perf.created_at = _best_effort_created_at(paths)
+        dirty = True
+    if final_ready and perf.completed_at is None:
+        perf.completed_at = final.stat().st_mtime
+        dirty = True
+    if dirty:
+        save_performance(perf, paths)
+    return perf
 
 
 def _project_view(slug: str, plan: ScenePlan, paths: ProjectPaths) -> dict[str, Any]:
@@ -230,13 +323,22 @@ def _project_view(slug: str, plan: ScenePlan, paths: ProjectPaths) -> dict[str, 
         "Avatar": sum(s.assets.avatar_clip.cost or 0.0 for s in plan.scenes),
     }
 
+    cost = plan.total_asset_cost()
+    perf = _load_performance_view(paths, final_ready, final)
+    production_time_sec = (
+        perf.completed_at - perf.created_at
+        if perf.completed_at is not None and perf.created_at is not None
+        else None
+    )
+    profit = perf.revenue_usd - cost if perf.revenue_usd is not None else None
+
     return {
         "slug": slug,
         "title": plan.title,
         "style": plan.style,
         "status": status,
         "progress": progress,
-        "cost": plan.total_asset_cost(),
+        "cost": cost,
         "costByCategory": cost_by_category,
         "estDurationSec": est_sec,
         "createdLabel": datetime.fromtimestamp(
@@ -248,6 +350,13 @@ def _project_view(slug: str, plan: ScenePlan, paths: ProjectPaths) -> dict[str, 
         "thumbnailUrl": _file_url(slug, paths.output / "thumbnail.jpg")
         if (paths.output / "thumbnail.jpg").exists() else None,
         "running": bool(run),
+        "views": perf.views,
+        "watchTimeMinutes": perf.watch_time_minutes,
+        "revenueUsd": perf.revenue_usd,
+        "notes": perf.notes,
+        "profit": profit,
+        "productionTimeSec": production_time_sec,
+        "createdAt": perf.created_at,
     }
 
 
@@ -329,6 +438,7 @@ def create_project(body: NewProject) -> dict[str, str]:
     paths = ProjectPaths.create(_projects_dir(), slug)
     source = paths.script / "source.txt"
     source.write_text(script)
+    save_performance(ProjectPerformance(created_at=time.time()), paths)
     _spawn(slug, ["--script-file", str(source), "--style", body.style, "--title", title])
     return {"slug": slug}
 
@@ -346,11 +456,20 @@ def _existing_project(slug: str) -> ProjectPaths:
 @app.delete("/api/projects/{slug}")
 def delete_project(slug: str) -> dict[str, str]:
     paths = _existing_project(slug)
-    if _run_active(slug):
-        raise HTTPException(409, "run in progress — wait for it to finish first")
+    # Stop an active run before removing its files out from under it, rather
+    # than blocking the delete — the client asked to be able to delete a
+    # project while it's still generating, not just after.
+    _kill_run(slug)
     shutil.rmtree(paths.root)
-    _runs.pop(slug, None)
     return {"deleted": slug}
+
+
+@app.post("/api/projects/{slug}/cancel")
+def cancel_project(slug: str) -> dict[str, str]:
+    _existing_project(slug)
+    if not _kill_run(slug):
+        raise HTTPException(409, "no run in progress")
+    return {"slug": slug}
 
 
 @app.post("/api/projects/{slug}/resume")
@@ -359,6 +478,31 @@ def resume_project(slug: str) -> dict[str, str]:
     if _run_active(slug):
         raise HTTPException(409, "run already in progress")
     _spawn(slug, ["--scenes-file", str(paths.scenes_json)])
+    return {"slug": slug}
+
+
+class PerformanceUpdate(BaseModel):
+    views: int | None = None
+    watchTimeMinutes: float | None = None
+    revenueUsd: float | None = None
+    notes: str = ""
+
+
+@app.post("/api/projects/{slug}/performance")
+def set_performance(slug: str, body: PerformanceUpdate) -> dict[str, str]:
+    """Manual YouTube performance entry — there is no YouTube API integration,
+    the dashboard's Revenue form always submits the full set of fields at
+    once, so this is a full replace of the user-entered fields (not a partial
+    merge) — that's what lets clearing a field back to blank actually stick.
+    created_at/completed_at are untouched; the pipeline owns those."""
+    paths = _existing_project(slug)
+    perf = load_performance(paths)
+    perf.views = body.views
+    perf.watch_time_minutes = body.watchTimeMinutes
+    perf.revenue_usd = body.revenueUsd
+    perf.notes = body.notes
+    perf.updated_at = time.time()
+    save_performance(perf, paths)
     return {"slug": slug}
 
 
@@ -451,6 +595,11 @@ def set_scene_layout(slug: str, scene_id: int, body: SceneLayoutUpdate) -> dict[
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(WEB_DIR / "index.html")
+
+
+@app.get("/logo.png")
+def logo() -> FileResponse:
+    return FileResponse(WEB_DIR / "logo.png")
 
 
 @app.on_event("startup")

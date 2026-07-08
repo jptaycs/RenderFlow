@@ -130,6 +130,27 @@ class ScenePlan(BaseModel):
         return total
 
 
+class ProjectPerformance(BaseModel):
+    """Manually-entered YouTube performance for one project, tracked
+    alongside generation cost so the dashboard can report profit.
+
+    RenderFlow has no YouTube API integration — these numbers are typed in
+    by hand (from YouTube Studio) once a video is published, and re-entered
+    whenever the user wants an updated profit picture. created_at/completed_at
+    are the exception: those are set automatically by the pipeline itself
+    (project creation, and the moment final.mp4 first becomes ready) to
+    derive production time without any manual input.
+    """
+
+    views: int | None = None
+    watch_time_minutes: float | None = None
+    revenue_usd: float | None = None
+    notes: str = ""
+    created_at: float | None = None
+    completed_at: float | None = None
+    updated_at: float | None = None
+
+
 # ---------------------------------------------------------------------------
 # LLM generation schema — what the model emits during script generation.
 # Kept free of numeric constraints (unsupported by structured outputs);

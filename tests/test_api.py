@@ -114,3 +114,80 @@ def test_vary_prompt_does_not_grow_unbounded_across_repeated_calls():
     assert twice.count("Try this take:") == 1
     assert thrice.count("Try this take:") == 1
     assert thrice.startswith(base)
+
+
+def test_load_performance_returns_default_when_missing(tmp_path):
+    from renderflow.schema import ProjectPerformance
+    from renderflow.storage import ProjectPaths, load_performance
+
+    paths = ProjectPaths.create(tmp_path, "demo")
+    perf = load_performance(paths)
+    assert perf == ProjectPerformance()
+
+
+def test_save_and_load_performance_roundtrip(tmp_path):
+    from renderflow.schema import ProjectPerformance
+    from renderflow.storage import ProjectPaths, load_performance, save_performance
+
+    paths = ProjectPaths.create(tmp_path, "demo")
+    save_performance(
+        ProjectPerformance(views=1000, watch_time_minutes=42.5, revenue_usd=12.34, notes="ok"),
+        paths,
+    )
+    reloaded = load_performance(paths)
+    assert reloaded.views == 1000
+    assert reloaded.revenue_usd == 12.34
+    assert reloaded.notes == "ok"
+
+
+def test_project_view_computes_profit_and_production_time(tmp_path, monkeypatch):
+    import os
+    import time
+
+    import pytest
+
+    from renderflow import api
+    from renderflow.schema import (
+        AssetRef,
+        AssetStatus,
+        ProjectPerformance,
+        Scene,
+        SceneAssets,
+        ScenePlan,
+    )
+    from renderflow.storage import ProjectPaths, save_performance, save_plan
+
+    monkeypatch.setattr(api, "_projects_dir", lambda: tmp_path)
+    slug = "demo-project"
+    paths = ProjectPaths.create(tmp_path, slug)
+
+    scene = Scene(
+        id=1,
+        type="narration",
+        duration_estimate_sec=5.0,
+        narration="Hello.",
+        image_prompt="A photo.",
+        assets=SceneAssets(
+            image=AssetRef(status=AssetStatus.COMPLETED, path=str(paths.images / "scene_001.png"), cost=0.0),
+            voice=AssetRef(status=AssetStatus.COMPLETED, path=str(paths.voice / "scene_001.wav"), cost=0.0),
+        ),
+    )
+    plan = ScenePlan(title="Demo", style="documentary", scenes=[scene])
+    save_plan(plan, paths)
+
+    final = paths.output / "final.mp4"
+    final.write_bytes(b"data")
+    now = time.time() + 5  # ensure final.mp4 is newer than scenes.json
+    os.utime(final, (now, now))
+
+    created_at = now - 120
+    completed_at = now
+    save_performance(
+        ProjectPerformance(created_at=created_at, completed_at=completed_at, revenue_usd=25.0),
+        paths,
+    )
+
+    view = api._project_view(slug, plan, paths)
+    assert view["status"] == "Complete"
+    assert view["productionTimeSec"] == pytest.approx(completed_at - created_at)
+    assert view["profit"] == pytest.approx(25.0 - view["cost"])

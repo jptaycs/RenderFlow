@@ -9,6 +9,7 @@ from pathlib import Path
 
 from renderflow.pipeline import facecheck
 from renderflow.pipeline.script import scene_is_avatar_solo
+from renderflow.pipeline.text_normalize import normalize_for_speech
 from renderflow.providers.base import AvatarProvider, GeneratedAsset, ImageProvider, TTSProvider
 from renderflow.schema import AssetRef, AssetStatus, Scene, ScenePlan
 from renderflow.storage import ProjectPaths, save_plan
@@ -143,7 +144,9 @@ def generate_voice(
         _start(ref)
         save_plan(plan, paths)
         try:
-            asset = provider.synthesize(scene.narration, voice, **tts_params)
+            asset = provider.synthesize(
+                normalize_for_speech(scene.narration), voice, **tts_params
+            )
         except Exception:
             log.warning("scene %d voice failed, continuing", scene.id, exc_info=True)
             ref.advance(AssetStatus.FAILED)
