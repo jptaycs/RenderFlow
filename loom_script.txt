@@ -1,0 +1,165 @@
+================================================================
+LOOM WALKTHROUGH SCRIPT — RenderFlow demo for David
+================================================================
+Read [SPOKEN] lines out loud while recording. [SHOW: ...] tells you
+what to click. Target runtime: ~5-6 minutes. Trim dead air in editing.
+
+Before you hit record:
+  1. Start the dashboard:  .venv/bin/python -m renderflow.api
+  2. Open http://127.0.0.1:8321, full-screen it.
+  3. Have the repo open in VS Code, ready to alt-tab to for the cold open.
+  4. Know an existing finished project to point at (e.g. the solar
+     panel one) and have a topic ready for the live "New Video" demo.
+
+================================================================
+SECTION 1 — Cold open: codebase, not no-code (~20s)
+================================================================
+[SHOW: VS Code, repo open]
+
+[SPOKEN]
+"Hey David, it's JP. Today I'll demo the project you wanted. Right
+now we're in the repo, in VS Code — so just to be clear, this is a
+real codebase, not a no-code project."
+
+[SHOW: Switch to the dashboard in the browser]
+
+[SPOKEN]
+"Let's move to the app. I named it RenderFlow — because it takes a
+topic or a script, and renders it through a flow: script, scenes,
+images, voice, avatar, captions, all the way to a finished video.
+Render, plus the flow it goes through — RenderFlow."
+
+================================================================
+SECTION 2 — Sidebar tour (~30s)
+================================================================
+[SHOW: Point at sidebar nav — Projects, Activity, Overview, Reporting]
+
+[SPOKEN]
+"On the sidebar: Projects is where all the projects, or videos, live.
+Activity is where we can see the live jobs currently running.
+Overview is where we compare the free stack versus the paid stack.
+And Reporting is where we see the numbers — cost and revenue — so
+we can track performance and adjust based on the data."
+
+================================================================
+SECTION 3 — Projects module: existing work (~30s)
+================================================================
+[SHOW: Projects screen, list of completed projects]
+
+[SPOKEN]
+"Let's look at the Projects module first. As you can see, there are
+already completed projects — including the script you provided about
+solar panels, which took a while to generate and process. But for
+this demo, we'll create a brand new video from scratch."
+
+================================================================
+SECTION 4 — Create a new video, live (~30s)
+================================================================
+[SHOW: Click "+ New Video" → modal opens]
+[SHOW: Fill in Title and Script fields]
+[SHOW: Select a style preset — Documentary / Cinematic / Explainer]
+[SHOW: Click "Start generating"]
+
+[SPOKEN]
+"First step is New Video. I fill in the title and the script, then
+pick a style preset — documentary, cinematic, or explainer — and hit
+Start Generating."
+
+================================================================
+SECTION 5 — Watch the pipeline run (~45s)
+================================================================
+[SHOW: Stage tracker: Script → Scenes → Assets → Render]
+
+[SPOKEN]
+"As you can see, the pipeline starts the process — from script, to
+scenes, to assets, to rendering."
+
+[SHOW: Scroll scene cards below, chips flipping pending → running → done]
+
+[SPOKEN]
+"Below are the scenes the system generated. Here we can see which
+material is being processed and which is still pending."
+
+================================================================
+SECTION 6 — Scene detail, layout, and regenerate (~60s)
+================================================================
+[SHOW: Click into a scene to open the side panel]
+
+[SPOKEN]
+"If we click a scene, we can see the details — the narration, the
+image prompt, the provider, the cost, the duration, and the type."
+
+[SHOW: Point at the layout control — Auto / Solo / Split]
+
+[SPOKEN]
+"We can also change the video layout — auto, solo full-screen avatar,
+or split with the scene's visual."
+
+[SHOW: Click "Solo" on a scene]
+
+[SPOKEN]
+"So if we don't like a scene, or it's not really relevant, we can
+just switch it to solo avatar talking instead."
+
+[SHOW: Click "Regenerate scene"]
+
+[SPOKEN]
+"And if we don't like the current scene or image at all, we can
+regenerate it."
+
+================================================================
+SECTION 7 — Completed project and cost (~45s)
+================================================================
+[SHOW: Wait for / open a completed project with thumbnail]
+
+[SPOKEN]
+"And as we can see, the project is now completed — with a thumbnail,
+and ready to download and upload straight to YouTube. All of this
+cost zero dollars. But if we switch on the paid tier, the quality
+would be noticeably better than something like an Elias Yoder video."
+
+[SHOW: Point at the cost tile and revenue tile at the top of the project]
+
+[SPOKEN]
+"At the top here, we can also see the cost of the project, and the
+revenue once it's live."
+
+================================================================
+SECTION 8 — Overview and Reporting (~30s)
+================================================================
+[SHOW: Click "Overview"]
+
+[SPOKEN]
+"Quick look at Overview — this is where we compare the free stack
+against the paid stack, module by module, with real dollar figures."
+
+[SHOW: Click "Reporting"]
+
+[SPOKEN]
+"And Reporting rolls that up across every video — cost, revenue, and
+profit — so we know what's working and what to adjust."
+
+================================================================
+SECTION 9 — Close (~15s)
+================================================================
+[SHOW: Back to Projects screen]
+
+[SPOKEN]
+"That's the full flow — topic or script in, AI visuals, avatar,
+captions, finished export — for free. Thanks David, let me know what
+you think."
+
+================================================================
+NOTES FOR YOU (not spoken)
+================================================================
+- Jump-cut the generation wait (Section 5) — client wants to SEE
+  the process, not sit through it in real time.
+- Say "$0.00" / "zero dollars" out loud — it's the strongest selling
+  point.
+- The "why RenderFlow" line in Section 1 is a one-liner — don't
+  over-explain it, let the rest of the demo prove it.
+- The "better than Elias Yoder" claim: say it with confidence, the
+  dollar figures are the exact ones on the Overview page.
+- If David asks "why not just show the paid version": the brief
+  said free/low-cost tools only — the paid swap is a config change,
+  not new engineering, worth spending once he confirms direction.

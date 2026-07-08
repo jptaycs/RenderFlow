@@ -40,6 +40,10 @@ def build_tts(settings: Settings) -> TTSProvider:
         from renderflow.providers.tts.piper_tts import PiperTTS
 
         return PiperTTS()
+    if settings.tts_provider == "kokoro":
+        from renderflow.providers.tts.kokoro_tts import KokoroTTS
+
+        return KokoroTTS()
     raise ValueError(f"unknown TTS provider: {settings.tts_provider}")
 
 
@@ -48,4 +52,16 @@ def build_avatar(settings: Settings) -> AvatarProvider:
         from renderflow.providers.avatar.ffmpeg_still import FFMpegStillAvatar
 
         return FFMpegStillAvatar()
+    if settings.avatar_provider == "sadtalker-replicate":
+        from renderflow.providers.avatar.sadtalker_replicate import SadTalkerReplicate
+
+        return SadTalkerReplicate()
+    if settings.avatar_provider == "memo-hf":
+        from renderflow.providers.avatar.memo_hf import MemoHFAvatar
+
+        return MemoHFAvatar()
+    if settings.avatar_provider == "wav2lip-local":
+        from renderflow.providers.avatar.wav2lip_local import Wav2LipLocal
+
+        return Wav2LipLocal()
     raise ValueError(f"unknown avatar provider: {settings.avatar_provider}")

@@ -65,6 +65,10 @@ class SubtitleRef(BaseModel):
 
 MotionEffect = Literal["zoom_in", "zoom_out", "pan_left", "pan_right"]
 SceneType = Literal["narration", "talking_avatar"]
+# "auto" follows the default repeating solo/split cycle (see
+# pipeline.script.scene_is_avatar_solo); "solo"/"split" is a deliberate
+# per-scene user override — persisted, since it's a choice, not derived.
+AvatarLayout = Literal["auto", "solo", "split"]
 
 
 class Motion(BaseModel):
@@ -74,6 +78,7 @@ class Motion(BaseModel):
 
 class SceneAssets(BaseModel):
     image: AssetRef = Field(default_factory=AssetRef)
+    avatar_image: AssetRef = Field(default_factory=AssetRef)
     voice: AssetRef = Field(default_factory=AssetRef)
     avatar_clip: AssetRef = Field(default_factory=AssetRef)
     subtitle: SubtitleRef = Field(default_factory=SubtitleRef)
@@ -96,6 +101,7 @@ class Scene(BaseModel):
     image_prompt: str
     negative_prompt: str | None = None
     avatar: AvatarSpec | None = None
+    avatar_layout: AvatarLayout = "auto"
     motion: Motion = Field(default_factory=Motion)
     assets: SceneAssets = Field(default_factory=SceneAssets)
 
@@ -105,18 +111,44 @@ class ScenePlan(BaseModel):
     title: str
     style: str
     scenes: list[Scene]
+    # Project-level clickbait thumbnail image (generated after scene assets).
+    thumbnail: AssetRef = Field(default_factory=AssetRef)
 
     def total_asset_cost(self) -> float:
         total = 0.0
+        refs = [self.thumbnail]
         for scene in self.scenes:
-            for ref in (
+            refs += [
                 scene.assets.image,
+                scene.assets.avatar_image,
                 scene.assets.voice,
                 scene.assets.avatar_clip,
-            ):
-                if ref.cost is not None:
-                    total += ref.cost
+            ]
+        for ref in refs:
+            if ref.cost is not None:
+                total += ref.cost
         return total
+
+
+class ProjectPerformance(BaseModel):
+    """Manually-entered YouTube performance for one project, tracked
+    alongside generation cost so the dashboard can report profit.
+
+    RenderFlow has no YouTube API integration — these numbers are typed in
+    by hand (from YouTube Studio) once a video is published, and re-entered
+    whenever the user wants an updated profit picture. created_at/completed_at
+    are the exception: those are set automatically by the pipeline itself
+    (project creation, and the moment final.mp4 first becomes ready) to
+    derive production time without any manual input.
+    """
+
+    views: int | None = None
+    watch_time_minutes: float | None = None
+    revenue_usd: float | None = None
+    notes: str = ""
+    created_at: float | None = None
+    completed_at: float | None = None
+    updated_at: float | None = None
 
 
 # ---------------------------------------------------------------------------

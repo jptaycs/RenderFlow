@@ -8,7 +8,7 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
-from renderflow.schema import ScenePlan
+from renderflow.schema import ProjectPerformance, ScenePlan
 
 
 def slugify(text: str) -> str:
@@ -68,6 +68,10 @@ class ProjectPaths:
     def scenes_json(self) -> Path:
         return self.script / "scenes.json"
 
+    @property
+    def performance_json(self) -> Path:
+        return self.root / "performance.json"
+
 
 def save_plan(plan: ScenePlan, paths: ProjectPaths) -> None:
     paths.scenes_json.write_text(plan.model_dump_json(indent=2))
@@ -75,3 +79,15 @@ def save_plan(plan: ScenePlan, paths: ProjectPaths) -> None:
 
 def load_plan(paths: ProjectPaths) -> ScenePlan:
     return ScenePlan.model_validate(json.loads(paths.scenes_json.read_text()))
+
+
+def save_performance(perf: ProjectPerformance, paths: ProjectPaths) -> None:
+    paths.performance_json.write_text(perf.model_dump_json(indent=2))
+
+
+def load_performance(paths: ProjectPaths) -> ProjectPerformance:
+    if not paths.performance_json.exists():
+        return ProjectPerformance()
+    return ProjectPerformance.model_validate(
+        json.loads(paths.performance_json.read_text())
+    )

@@ -1,21 +1,24 @@
 """Phase 1 provider verification: one minimal live call per provider.
 
 Usage:
-    .venv/bin/python scripts/check_providers.py [claude|image|tts ...]
+    .venv/bin/python scripts/check_providers.py [claude|image|tts|avatar ...]
 
-With no arguments, checks all three. Prints result summary and cost per
-provider; exits non-zero if any check fails. Total cost of a full run is
-well under $0.02.
+With no arguments, checks claude/image/tts. Prints result summary and cost
+per provider; exits non-zero if any check fails. Total cost of a default run
+is well under $0.02. The avatar check runs only when named explicitly — a
+lip-sync clip takes minutes and, on paid providers, costs ~$0.09.
 """
 
 from __future__ import annotations
 
 import sys
+import tempfile
 import traceback
 from collections.abc import Callable
+from pathlib import Path
 
 from renderflow.config import Settings
-from renderflow.providers import build_image, build_llm, build_tts
+from renderflow.providers import build_avatar, build_image, build_llm, build_tts
 
 OK = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
@@ -55,16 +58,44 @@ def check_tts(settings: Settings) -> str:
     )
 
 
+def check_avatar(settings: Settings) -> str:
+    if settings.avatar_image is None or not settings.avatar_image.exists():
+        raise FileNotFoundError(
+            "avatar check needs RENDERFLOW_AVATAR_IMAGE pointing at a portrait"
+        )
+    avatar = build_avatar(settings)
+    tts = build_tts(settings)
+    voice = tts.synthesize("RenderFlow avatar check.", settings.tts_voice)
+    with tempfile.TemporaryDirectory() as tmp:
+        ext = voice.meta.get("format", "mp3").split("_")[0]
+        voice_path = Path(tmp) / f"voice.{ext}"
+        voice_path.write_bytes(voice.data)
+        asset = avatar.generate_clip(
+            settings.avatar_image, voice_path, "RenderFlow avatar check."
+        )
+    assert len(asset.data) > 10_000, f"suspiciously small clip: {len(asset.data)} bytes"
+    preview = settings.projects_dir / "avatar_check.mp4"
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    preview.write_bytes(asset.data)
+    return (
+        f"provider={asset.provider} {len(asset.data)} bytes "
+        f"cost=${(asset.cost or 0) + (voice.cost or 0):.4f} saved={preview}"
+    )
+
+
 CHECKS: dict[str, Callable[[Settings], str]] = {
     "claude": check_claude,
     "image": check_image,
     "tts": check_tts,
+    "avatar": check_avatar,
 }
+# The avatar check spends real GPU money (~$0.09); run it only when asked.
+DEFAULT_CHECKS = ["claude", "image", "tts"]
 
 
 def main() -> int:
     settings = Settings.load()
-    names = sys.argv[1:] or list(CHECKS)
+    names = sys.argv[1:] or DEFAULT_CHECKS
     failures = 0
     total_cost_note = []
     for name in names:

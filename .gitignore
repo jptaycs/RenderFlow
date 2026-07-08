@@ -5,6 +5,9 @@ venv/
 .env
 projects/
 .voices/
+.wav2lip/
 *.egg-info/
 .pytest_cache/
 dist/
+.kokoro/
+.cv2_models/
