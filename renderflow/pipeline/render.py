@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 
 from renderflow.pipeline import parallax
-from renderflow.pipeline.script import scene_is_avatar_solo
+from renderflow.pipeline.script import scene_is_avatar_solo, scene_is_visual_only
 from renderflow.schema import AssetStatus, Scene, ScenePlan
 from renderflow.storage import ProjectPaths
 
@@ -146,7 +146,15 @@ def _caption_filter_chain(
 
 
 def render_scene_clip(scene: Scene, out: Path) -> Path:
-    if scene.type == "talking_avatar" and scene.assets.avatar_clip.path:
+    # Visual-only (see scene_is_visual_only) always falls through to the
+    # plain image+voice path below, even if an avatar clip happens to
+    # already exist for this scene (a harmless leftover from before the
+    # scene was switched to visual-only) — it is simply never used.
+    if (
+        scene.type == "talking_avatar"
+        and not scene_is_visual_only(scene)
+        and scene.assets.avatar_clip.path
+    ):
         if scene_is_avatar_solo(scene):
             return render_avatar_full_clip(scene, Path(scene.assets.avatar_clip.path), out)
         assert scene.assets.image.path
@@ -217,7 +225,7 @@ def render_avatar_full_clip(scene: Scene, avatar_clip: Path, out: Path) -> Path:
     duration = probe_duration(avatar_clip) + SCENE_GAP_SEC
     filter_complex = (
         f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={WIDTH}:{HEIGHT},"
+        f"crop={WIDTH}:{HEIGHT},fps={FPS},"
         f"tpad=stop_mode=clone:stop_duration={SCENE_GAP_SEC:.3f},format=yuv420p[vbase]"
     )
     chunks = _subtitle_chunks(scene)
@@ -265,7 +273,7 @@ def render_avatar_split_clip(
 
     filter_complex = (
         f"[0:v]scale={AVATAR_W}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={AVATAR_W}:{HEIGHT},"
+        f"crop={AVATAR_W}:{HEIGHT},fps={FPS},"
         f"tpad=stop_mode=clone:stop_duration={SCENE_GAP_SEC:.3f},format=yuv420p[left];"
         + right_filter +
         "[left][right]hstack=inputs=2[vbase]"

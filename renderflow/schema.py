@@ -65,10 +65,12 @@ class SubtitleRef(BaseModel):
 
 MotionEffect = Literal["zoom_in", "zoom_out", "pan_left", "pan_right"]
 SceneType = Literal["narration", "talking_avatar"]
-# "auto" follows the default repeating solo/split cycle (see
-# pipeline.script.scene_is_avatar_solo); "solo"/"split" is a deliberate
-# per-scene user override — persisted, since it's a choice, not derived.
-AvatarLayout = Literal["auto", "solo", "split"]
+# "auto" always means "split" (avatar + background visual — see
+# pipeline.script.effective_avatar_layout). "solo" (full-screen avatar, no
+# background visual), "split", and "visual" (background visual only, no
+# avatar shown at all) are deliberate per-scene overrides — persisted,
+# since they're a choice, not derived.
+AvatarLayout = Literal["auto", "solo", "split", "visual"]
 
 
 class Motion(BaseModel):

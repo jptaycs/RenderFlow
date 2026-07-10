@@ -28,7 +28,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from renderflow.config import Settings
-from renderflow.pipeline.script import scene_is_avatar_solo
+from renderflow.pipeline.script import (
+    effective_avatar_layout,
+    scene_is_avatar_solo,
+    scene_is_visual_only,
+)
 from renderflow.schema import AssetStatus, ProjectPerformance, Scene, ScenePlan
 from renderflow.storage import (
     ProjectPaths,
@@ -155,13 +159,15 @@ def _kill_run(slug: str) -> bool:
 
 def _scene_assets(scene: Scene) -> dict[str, str]:
     assets: dict[str, str] = {}
+    is_avatar_type = scene.type == "talking_avatar"
     # Solo-layout scenes never generate a background image (see
     # scene_is_avatar_solo) — showing an "Image: pending" chip that can
     # never complete looked like a stuck pipeline step.
-    if not (scene.type == "talking_avatar" and scene_is_avatar_solo(scene)):
+    if not (is_avatar_type and scene_is_avatar_solo(scene)):
         assets["image"] = scene.assets.image.status.value
     assets["voice"] = scene.assets.voice.status.value
-    if scene.type == "talking_avatar":
+    # Visual-only scenes (see scene_is_visual_only) never get an avatar clip.
+    if is_avatar_type and not scene_is_visual_only(scene):
         assets["avatar"] = scene.assets.avatar_clip.status.value
     return assets
 
@@ -200,13 +206,15 @@ def _scene_thumb(slug: str, scene: Scene) -> str | None:
 
 
 def _refs(scene: Scene):
+    is_avatar_type = scene.type == "talking_avatar"
     # Solo-layout scenes never get a background image (see
     # scene_is_avatar_solo) — counting it here would keep progress stuck
     # below 100% forever.
-    if not (scene.type == "talking_avatar" and scene_is_avatar_solo(scene)):
+    if not (is_avatar_type and scene_is_avatar_solo(scene)):
         yield scene.assets.image
     yield scene.assets.voice
-    if scene.type == "talking_avatar":
+    # Visual-only scenes (see scene_is_visual_only) never get avatar assets.
+    if is_avatar_type and not scene_is_visual_only(scene):
         yield scene.assets.avatar_image
         yield scene.assets.avatar_clip
 
@@ -307,7 +315,7 @@ def _project_view(slug: str, plan: ScenePlan, paths: ProjectPaths) -> dict[str, 
             "thumb": _scene_thumb(slug, s),
             "avatarLayout": s.avatar_layout if s.type == "talking_avatar" else None,
             "effectiveLayout": (
-                ("solo" if scene_is_avatar_solo(s) else "split")
+                effective_avatar_layout(s)
                 if s.type == "talking_avatar" else None
             ),
         }
@@ -439,7 +447,17 @@ def create_project(body: NewProject) -> dict[str, str]:
     source = paths.script / "source.txt"
     source.write_text(script)
     save_performance(ProjectPerformance(created_at=time.time()), paths)
-    _spawn(slug, ["--script-file", str(source), "--style", body.style, "--title", title])
+    # --skip-render: stop after assets so the project lands on "Paused" —
+    # the user gets a chance to regenerate scenes or change avatar layouts
+    # (now all split-screen by default, see scene_is_avatar_solo) before
+    # committing to a multi-minute FFmpeg pass, instead of it rendering
+    # immediately with whatever the first generation happened to produce.
+    # The dashboard's existing "Resume run" button (shown for Paused
+    # projects) does the render pass whenever they're ready.
+    _spawn(
+        slug,
+        ["--script-file", str(source), "--style", body.style, "--title", title, "--skip-render"],
+    )
     return {"slug": slug}
 
 
@@ -558,18 +576,21 @@ def regenerate_scene(slug: str, scene_id: int) -> dict[str, str]:
 
 
 class SceneLayoutUpdate(BaseModel):
-    layout: str  # "auto" | "solo" | "split"
+    layout: str  # "auto" | "solo" | "split" | "visual"
 
 
 @app.post("/api/projects/{slug}/scenes/{scene_id}/layout")
 def set_scene_layout(slug: str, scene_id: int, body: SceneLayoutUpdate) -> dict[str, str]:
-    """Override solo-vs-split for one scene — e.g. the user doesn't want
-    the generated visual for this beat and would rather the host just talk
-    full-screen instead (or the reverse). Persisted on the scene itself
-    (`avatar_layout`); see scene_is_avatar_solo for how "auto" falls back to
-    the default cycle."""
-    if body.layout not in ("auto", "solo", "split"):
-        raise HTTPException(422, "layout must be 'auto', 'solo', or 'split'")
+    """Override the avatar layout for one scene: full-screen solo avatar,
+    avatar + background visual split-screen, or visual-only (background
+    visual with narration audio, no avatar shown at all) — e.g. the user
+    doesn't want the generated visual for this beat and would rather the
+    host talk full-screen instead, doesn't want the avatar visible at all
+    for this beat, or the reverse. Persisted on the scene itself
+    (`avatar_layout`); see effective_avatar_layout for how "auto" always
+    means split-screen."""
+    if body.layout not in ("auto", "solo", "split", "visual"):
+        raise HTTPException(422, "layout must be 'auto', 'solo', 'split', or 'visual'")
     paths = _existing_project(slug)
     if _run_active(slug):
         raise HTTPException(409, "run already in progress")
@@ -581,13 +602,24 @@ def set_scene_layout(slug: str, scene_id: int, body: SceneLayoutUpdate) -> dict[
         raise HTTPException(422, "layout override only applies to talking-avatar scenes")
 
     scene.avatar_layout = body.layout
-    # Split needs a background visual — generate one if this scene never
-    # had one (it was solo up to now). Solo needs nothing generated; any
-    # existing image is just left alone, unused, in case they switch back.
-    needs_image = not scene_is_avatar_solo(scene) and scene.assets.image.status != AssetStatus.COMPLETED
+    # Split/visual need a background visual — generate one if this scene
+    # never had one (it was solo up to now). Solo/split need the avatar
+    # portrait + lip-synced clip — generate them if this scene never had
+    # them (it was visual-only up to now). Whichever assets a layout
+    # doesn't need are just left alone, unused, in case they switch back.
+    needs_generation = (
+        not scene_is_avatar_solo(scene)
+        and scene.assets.image.status != AssetStatus.COMPLETED
+    ) or (
+        not scene_is_visual_only(scene)
+        and (
+            scene.assets.avatar_image.status != AssetStatus.COMPLETED
+            or scene.assets.avatar_clip.status != AssetStatus.COMPLETED
+        )
+    )
     (paths.output / "final.mp4").unlink(missing_ok=True)
     save_plan(plan, paths)
-    if needs_image:
+    if needs_generation:
         _spawn(slug, ["--scenes-file", str(paths.scenes_json), "--skip-render"])
     return {"slug": slug}
 

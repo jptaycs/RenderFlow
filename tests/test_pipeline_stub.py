@@ -114,32 +114,86 @@ def _plain_scene(scene_id: int, avatar_layout: str = "auto") -> Scene:
     )
 
 
-def test_scene_is_avatar_solo_cycles_every_three():
+def test_scene_is_avatar_solo_defaults_to_split_for_every_scene():
     from renderflow.pipeline.script import scene_is_avatar_solo
 
+    # "auto" is always split-screen now — solo is opt-in per scene, not an
+    # automatic cycle (see scene_is_avatar_solo docstring).
     solo_ids = [n for n in range(1, 13) if scene_is_avatar_solo(_plain_scene(n))]
-    assert solo_ids == [1, 4, 7, 10]
+    assert solo_ids == []
 
 
-def test_scene_is_avatar_solo_override_wins_over_the_cycle():
+def test_scene_is_avatar_solo_manual_override():
     from renderflow.pipeline.script import scene_is_avatar_solo
 
-    # id 2 would normally be split (cycle), id 4 would normally be solo.
     assert scene_is_avatar_solo(_plain_scene(2, "solo")) is True
     assert scene_is_avatar_solo(_plain_scene(4, "split")) is False
     assert scene_is_avatar_solo(_plain_scene(2, "auto")) is False
-    assert scene_is_avatar_solo(_plain_scene(4, "auto")) is True
+    assert scene_is_avatar_solo(_plain_scene(4, "auto")) is False
+
+
+def test_effective_avatar_layout_resolves_all_three_modes():
+    from renderflow.pipeline.script import effective_avatar_layout, scene_is_visual_only
+
+    assert effective_avatar_layout(_plain_scene(1, "solo")) == "solo"
+    assert effective_avatar_layout(_plain_scene(1, "split")) == "split"
+    assert effective_avatar_layout(_plain_scene(1, "visual")) == "visual"
+    assert effective_avatar_layout(_plain_scene(1, "auto")) == "split"
+    assert scene_is_visual_only(_plain_scene(1, "visual")) is True
+    assert scene_is_visual_only(_plain_scene(1, "solo")) is False
+    assert scene_is_visual_only(_plain_scene(1, "split")) is False
+    assert scene_is_visual_only(_plain_scene(1, "auto")) is False
+
+
+def test_load_plan_migrates_legacy_auto_solo_scenes(paths: ProjectPaths, tmp_path: Path):
+    """Regression: projects generated before "auto" always meant split had
+    scenes the old 1-in-3 cycle picked as solo, which never got a
+    background image (correct at the time — see effective_avatar_layout's
+    docstring). Loading one of those scenes.json files today must not leave
+    it looking permanently broken (an "Image: pending" that can never
+    complete) — load_plan should recognize and repair it in place."""
+    import time
+
+    from renderflow.storage import load_plan, save_plan
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    scene = plan.scenes[0]
+    scene.type = "talking_avatar"
+    # Simulate the old system: avatar_layout left at "auto", but generated
+    # as solo — image never touched (still PENDING), avatar assets done.
+    scene.assets.avatar_image.advance(AssetStatus.RUNNING)
+    scene.assets.avatar_image.path = "x"
+    scene.assets.avatar_image.advance(AssetStatus.COMPLETED)
+    scene.assets.avatar_clip.advance(AssetStatus.RUNNING)
+    scene.assets.avatar_clip.path = "y"
+    scene.assets.avatar_clip.advance(AssetStatus.COMPLETED)
+    save_plan(plan, paths)
+    original_mtime = paths.scenes_json.stat().st_mtime
+
+    time.sleep(0.05)  # would bump mtime if load_plan rewrote unconditionally
+    reloaded = load_plan(paths)
+
+    assert reloaded.scenes[0].avatar_layout == "solo"
+    # The migration write must not make an already-correct final.mp4 look
+    # stale to api.py's render-staleness check.
+    assert paths.scenes_json.stat().st_mtime == original_mtime
+
+    # A second load is a no-op — nothing left to migrate, no further write.
+    reloaded_again = load_plan(paths)
+    assert reloaded_again.scenes[0].avatar_layout == "solo"
+    assert paths.scenes_json.stat().st_mtime == original_mtime
 
 
 def test_generate_images_skips_background_for_solo_scenes(paths: ProjectPaths):
     plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
     for scene in plan.scenes:  # ids 1, 2
         scene.type = "talking_avatar"
+    plan.scenes[0].avatar_layout = "solo"  # auto now defaults to split
     save_plan(plan, paths)
 
     generate_images(plan, StubImage(), paths)
 
-    solo, split = plan.scenes  # id 1 solo, id 2 split
+    solo, split = plan.scenes  # id 1 solo (manual override), id 2 split (auto)
     assert solo.assets.image.status is AssetStatus.PENDING
     assert solo.assets.image.path is None
     assert split.assets.image.status is AssetStatus.COMPLETED
@@ -148,6 +202,27 @@ def test_generate_images_skips_background_for_solo_scenes(paths: ProjectPaths):
     # background visual, not the lip-sync source image.
     assert solo.assets.avatar_image.status is AssetStatus.COMPLETED
     assert split.assets.avatar_image.status is AssetStatus.COMPLETED
+
+
+def test_generate_images_and_avatar_clips_skip_avatar_assets_for_visual_only(
+    paths: ProjectPaths,
+):
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    plan.scenes[0].type = "talking_avatar"
+    plan.scenes[0].avatar_layout = "visual"
+    save_plan(plan, paths)
+
+    generate_images(plan, StubImage(), paths)
+    generate_voice(plan, StubTTS(), "voice-id", paths)
+    generate_avatar_clips(plan, StubAvatar(), paths)
+
+    visual_scene = load_plan(paths).scenes[0]
+    # Visual-only still needs the background image + voice, like a plain
+    # narration scene, but never the avatar portrait or lip-synced clip.
+    assert visual_scene.assets.image.status is AssetStatus.COMPLETED
+    assert visual_scene.assets.voice.status is AssetStatus.COMPLETED
+    assert visual_scene.assets.avatar_image.status is AssetStatus.PENDING
+    assert visual_scene.assets.avatar_clip.status is AssetStatus.PENDING
 
 
 def test_has_prominent_face_returns_false_for_blank_image():
@@ -211,6 +286,7 @@ def test_generate_face_free_gives_up_after_max_retries(monkeypatch):
 def test_talking_avatar_clip_generation(paths: ProjectPaths):
     plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
     plan.scenes[0].type = "talking_avatar"
+    plan.scenes[0].avatar_layout = "solo"  # auto now defaults to split
     save_plan(plan, paths)
 
     generate_images(plan, StubImage(), paths)
@@ -225,7 +301,7 @@ def test_talking_avatar_clip_generation(paths: ProjectPaths):
     assert Path(avatar_scene.assets.avatar_clip.path).read_bytes() == b"fake-mp4"
     assert avatar_scene.assets.avatar_clip.provider == "stub-avatar"
     assert narration_scene.assets.avatar_clip.status is AssetStatus.PENDING
-    # Scene id 1 is solo-layout (scene_is_avatar_solo), so its background
+    # Scene id 1 is solo-layout (manual override), so its background
     # image is skipped: only scene 2's image (0.003) + both scenes' voice
     # (0.002 each) + the avatar image (0.003) + avatar clip (0.004).
     assert load_plan(paths).total_asset_cost() == pytest.approx(
@@ -261,11 +337,16 @@ def test_render_integration(paths: ProjectPaths, monkeypatch):
     # Keep the integration test hermetic: zoompan needs no depth model.
     monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
     plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
-    # Scene id 1 is solo-layout (full-screen avatar, no visual) and id 2 is
-    # split-screen — exercises both render_avatar_full_clip and
-    # render_avatar_split_clip in one real-ffmpeg pass.
+    # Scene id 1 is forced solo (full-screen avatar, no visual) and id 2 is
+    # forced visual-only (background visual + narration, avatar clip
+    # generated below but must be ignored by the render) — exercises
+    # render_avatar_full_clip and the visual-only fallback path in one
+    # real-ffmpeg pass. ("auto" now defaults to split-screen, already
+    # covered by the non-integration layout unit tests below.)
     plan.scenes[0].type = "talking_avatar"
+    plan.scenes[0].avatar_layout = "solo"
     plan.scenes[1].type = "talking_avatar"
+    plan.scenes[1].avatar_layout = "visual"
 
     for scene in plan.scenes:
         img = paths.images / f"scene_{scene.id:03d}.png"
@@ -305,6 +386,20 @@ def test_render_integration(paths: ProjectPaths, monkeypatch):
         assert Path(scene.assets.subtitle.path).exists()
 
     final = render_video(plan, paths)
+
+    # Scene 2's own clip must be full-width (1920) — proof the visual-only
+    # override actually took the plain image+voice path instead of the
+    # split-screen hstack (960+960) it would have used before the override,
+    # even though an avatar_clip asset exists for it.
+    clip_2 = paths.output / "clip_002.mp4"
+    assert clip_2.exists()
+    width_probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width", "-of", "csv=p=0", str(clip_2)],
+        check=True, capture_output=True, text=True,
+    )
+    assert int(width_probe.stdout.strip()) == 1920
+
     assert final.exists()
     # Two 1-second scenes, each padded with a trailing SCENE_GAP_SEC pause,
     # hard-cut concatenated → a bit over 2s, never less (no crossfade shrink).

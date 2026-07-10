@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
-import re
 import shutil
 from pathlib import Path
 
 from renderflow.pipeline import facecheck
-from renderflow.pipeline.script import scene_is_avatar_solo
+from renderflow.pipeline.script import (
+    scene_is_avatar_solo,
+    scene_is_visual_only,
+    topic_from_title,
+)
 from renderflow.pipeline.text_normalize import normalize_for_speech
 from renderflow.providers.base import AvatarProvider, GeneratedAsset, ImageProvider, TTSProvider
 from renderflow.schema import AssetRef, AssetStatus, Scene, ScenePlan
@@ -98,7 +101,9 @@ def generate_images(
             log.info("scene %d image done (%s)", scene.id, out.name)
 
         avatar_ref = scene.assets.avatar_image
-        if scene.type != "talking_avatar" or _skip(avatar_ref):
+        # Visual-only scenes (see scene_is_visual_only) never show the
+        # avatar at all — skip the portrait too, not just the background.
+        if scene.type != "talking_avatar" or scene_is_visual_only(scene) or _skip(avatar_ref):
             continue
         _start(avatar_ref)
         save_plan(plan, paths)
@@ -180,7 +185,7 @@ def generate_subtitles(plan: ScenePlan, paths: ProjectPaths) -> None:
             continue
         audio_path = (
             scene.assets.avatar_clip.path
-            if scene.type == "talking_avatar"
+            if scene.type == "talking_avatar" and not scene_is_visual_only(scene)
             else scene.assets.voice.path
         )
         if not audio_path:
@@ -200,7 +205,9 @@ def generate_avatar_clips(
 ) -> None:
     """One failed scene must not stop the rest of the batch (see generate_images)."""
     for scene in plan.scenes:
-        if scene.type != "talking_avatar":
+        # Visual-only scenes (see scene_is_visual_only) never show the
+        # avatar, so no lip-synced clip is needed for them at all.
+        if scene.type != "talking_avatar" or scene_is_visual_only(scene):
             continue
 
         ref = scene.assets.avatar_clip
@@ -311,33 +318,10 @@ def _thumbnail_reaction_prompt(plan: ScenePlan) -> str:
     )
 
 
-# Clickbait-template and stop words stripped from titles to find the topic.
-# Feeding the full title into the image model makes it render the title as
-# (garbled) text in the picture — learned the hard way.
-_TITLE_FILLER = frozenset(
-    """
-    the a an of in on for to and or is are was were it its it's this that
-    how why what when who which nobody everybody everyone anyone they you
-    your i we truth about tells tell told know knew known should would
-    could want wants dont don't wont won't really actually quietly hidden
-    untold story secret cost costing money wrong right before after too
-    late changes changed everything nothing looked into found
-    """.split()
-)
-
-
-def _topic_from_title(title: str) -> str:
-    words = [
-        w for w in re.findall(r"[A-Za-z0-9'-]+", title)
-        if w.lower() not in _TITLE_FILLER
-    ]
-    return " ".join(words) or title
-
-
 def _thumbnail_prompt(plan: ScenePlan) -> str:
     # Topic-literal on purpose: the host portrait is composited on the left
     # afterwards (render_thumbnail), so the subject sits right, no people.
-    topic = _topic_from_title(plan.title)
+    topic = topic_from_title(plan.title)
     return (
         f"Viral YouTube thumbnail background: a dramatic photograph of "
         f"{topic}. One instantly recognizable {topic} scene, huge in the "

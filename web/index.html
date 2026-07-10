@@ -139,9 +139,9 @@ function durationLabel(sec) {
 function esc(s) {
   return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-function downloadFilename(title) {
+function downloadFilename(title, ext) {
   const safe = (title || 'renderflow-video').trim().replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim();
-  return (safe || 'renderflow-video') + '.mp4';
+  return (safe || 'renderflow-video') + '.' + (ext || 'mp4');
 }
 
 /* ── state ───────────────────────────────────────────────────────────── */
@@ -693,16 +693,25 @@ function detailScreenHtml() {
     tabBody = revenueTabHtml(p);
   } else if (state.detailTab === 'pipeline') {
     const dlThumb = p.thumbnailUrl || (p.scenes.find(s => s.thumb) || {}).thumb;
-    const videoCard = p.videoUrl ? ('' +
+    // Shown once either the final video or the generated project thumbnail
+    // exists — the thumbnail is often ready well before the render (it's
+    // generated during asset gen, and the project now pauses before
+    // rendering by default), so its download link must not be gated behind
+    // p.videoUrl the way the MP4 one is.
+    const downloadThumbBtn = p.thumbnailUrl
+      ? '<a href="' + esc(p.thumbnailUrl) + '" download="' + esc(downloadFilename(p.title, 'jpg')) + '" style="background:transparent;border:1px solid #33333a;color:#c8c8cc;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;text-decoration:none;flex-shrink:0">Download thumbnail</a>'
+      : '';
+    const videoCard = (p.videoUrl || p.thumbnailUrl) ? ('' +
       '<div style="background:#161618;border:1px solid #26262a;border-radius:14px;padding:22px;margin-bottom:26px;display:flex;gap:22px;align-items:center;flex-wrap:wrap">' +
         '<div style="width:220px;height:124px;flex-shrink:0;border-radius:10px;' + thumbBg(dlThumb) + ';display:flex;align-items:center;justify-content:center">' +
           (dlThumb ? '' : '<span style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:#4c4c52">NO THUMBNAIL</span>') +
         '</div>' +
         '<div style="flex:1;min-width:220px">' +
-          '<div style="font-size:14px;font-weight:600;margin-bottom:4px">Final render ready</div>' +
-          '<div style="font-size:12.5px;color:#8a8a91">' + mmss(p.estDurationSec) + ' · 1080p · MP4</div>' +
+          '<div style="font-size:14px;font-weight:600;margin-bottom:4px">' + (p.videoUrl ? 'Final render ready' : 'Thumbnail ready') + '</div>' +
+          '<div style="font-size:12.5px;color:#8a8a91">' + (p.videoUrl ? (mmss(p.estDurationSec) + ' · 1080p · MP4') : '1280×720 · JPG') + '</div>' +
         '</div>' +
-        '<a href="' + esc(p.videoUrl) + '" download="' + esc(downloadFilename(p.title)) + '" style="background:#FF0000;color:#ffffff;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;text-decoration:none;flex-shrink:0">Download MP4</a>' +
+        (p.videoUrl ? '<a href="' + esc(p.videoUrl) + '" download="' + esc(downloadFilename(p.title)) + '" style="background:#FF0000;color:#ffffff;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;text-decoration:none;flex-shrink:0">Download MP4</a>' : '') +
+        downloadThumbBtn +
       '</div>') : '';
 
     const stages = p.stages.map((stage, i) => {
@@ -743,7 +752,7 @@ function detailScreenHtml() {
         '<div style="height:104px;position:relative;' + thumbBg(sc.thumb) + ';display:flex;align-items:center;justify-content:center">' +
           (sc.thumb ? '' : '<span style="font-family:\'JetBrains Mono\',monospace;font-size:10.5px;color:#4c4c52">SCENE ' + pad2(sc.number) + '</span>') +
           '<div style="position:absolute;top:8px;right:8px;font-family:\'JetBrains Mono\',monospace;font-size:10.5px;color:#c8c8cc;background:rgba(0,0,0,0.55);padding:2px 6px;border-radius:5px">' + mmss(sc.durationSec) + '</div>' +
-          (sc.type === 'talking_avatar' ? '<div style="position:absolute;top:8px;left:8px;font-size:10.5px;color:#c8c8cc;background:rgba(0,0,0,0.55);padding:2px 6px;border-radius:5px">🧑 ' + (sc.effectiveLayout === 'solo' ? 'solo' : 'split') + (sc.avatarLayout !== 'auto' ? ' ✦' : '') + '</div>' : '') +
+          (sc.type === 'talking_avatar' ? '<div style="position:absolute;top:8px;left:8px;font-size:10.5px;color:#c8c8cc;background:rgba(0,0,0,0.55);padding:2px 6px;border-radius:5px">' + (sc.effectiveLayout === 'solo' ? '🧑 solo' : sc.effectiveLayout === 'visual' ? '🖼 visual' : '🧑 split') + (sc.avatarLayout !== 'auto' ? ' ✦' : '') + '</div>' : '') +
         '</div>' +
         '<div style="padding:12px 14px 14px 14px">' +
           '<div style="font-size:12.5px;color:#c8c8cc;line-height:1.4;margin-bottom:11px;height:34px;overflow:hidden;text-wrap:pretty">' + esc(sc.narration) + '</div>' +
@@ -889,9 +898,12 @@ function scenePanelHtml() {
   const layoutSection = sc.type !== 'talking_avatar' ? '' : ('' +
     '<div style="font-size:11px;color:#7a7a81;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Avatar layout</div>' +
     '<div style="display:flex;gap:6px;margin-bottom:8px">' +
-      [['auto', 'Auto'], ['solo', 'Solo — full screen'], ['split', 'Split — + visual']].map(([opt, label]) => {
+      [['solo', 'Solo avatar'], ['split', 'Avatar + visual'], ['visual', 'Visual only']].map(([opt, label]) => {
         const isQueuedChoice = queuedLayout && queuedLayout.layout === opt;
-        const active = (queuedLayout ? queuedLayout.layout : sc.avatarLayout) === opt;
+        // Compare against the resolved layout, not the raw override — a
+        // scene left on "auto" has no matching button otherwise, since
+        // "auto" itself is never one of the three choices shown here.
+        const active = (queuedLayout ? queuedLayout.layout : sc.effectiveLayout) === opt;
         const bg = isQueuedChoice ? '#3a3a3f' : active ? '#FF0000' : '#1c1c1f';
         const border = isQueuedChoice ? '#3a3a3f' : active ? '#FF0000' : '#26262a';
         const style = 'flex:1;text-align:center;padding:7px 4px;border-radius:7px;font-size:11px;font-weight:600;cursor:pointer;background:' + bg + ';color:' + (active ? '#ffffff' : '#9a9aa1') + ';border:1px solid ' + border;
@@ -902,14 +914,14 @@ function scenePanelHtml() {
       (queuedLayout
         ? 'Queued — will switch to "' + queuedLayout.layout + '" once the current run finishes (click it again to cancel)'
         : sc.avatarLayout === 'auto'
-        ? 'Auto is currently rendering ' + (sc.effectiveLayout === 'solo' ? 'solo (host full-screen, no visual)' : 'split-screen (host + this scene\'s visual)')
-        : 'Forced to "' + sc.avatarLayout + '" for this scene — won\'t follow the automatic cycle') +
+        ? 'Defaulting to avatar + visual — pick a layout above to override just this scene'
+        : 'Forced to "' + sc.avatarLayout + '" for this scene') +
     '</div>');
   return '' +
   '<div data-act="closePanel" style="position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:20"></div>' +
   '<div id="rf-panel" style="position:fixed;top:0;right:0;bottom:0;width:420px;max-width:92vw;background:#131315;border-left:1px solid #26262a;z-index:21;padding:26px;overflow-y:auto' + (panelJustOpened ? ';animation:rf-slidein 0.22s ease-out' : '') + '">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">' +
-      '<div style="font-size:15px;font-weight:600">Scene ' + pad2(sc.number) + (sc.type === 'talking_avatar' ? ' · host on camera' : '') + '</div>' +
+      '<div style="font-size:15px;font-weight:600">Scene ' + pad2(sc.number) + (sc.type === 'talking_avatar' ? (sc.effectiveLayout === 'visual' ? ' · visual only' : ' · host on camera') : '') + '</div>' +
       '<div data-act="closePanel" style="cursor:pointer;color:#8a8a91;font-size:18px;line-height:1">✕</div>' +
     '</div>' +
     '<div style="height:150px;border-radius:10px;' + thumbBg(sc.thumb) + ';display:flex;align-items:center;justify-content:center;margin-bottom:20px">' +

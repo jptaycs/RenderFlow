@@ -28,16 +28,17 @@ def test_scene_assets_includes_image_for_narration_scenes():
 
 
 def test_scene_assets_includes_image_for_split_avatar_scenes():
-    # id 2 is split-layout (scene_is_avatar_solo cycles 1, 4, 7, ...)
+    # "auto" always means split-screen now — every talking-avatar scene
+    # gets a background image unless manually overridden to "solo".
     assets = _scene_assets(_scene(2, "talking_avatar"))
     assert assets["image"] == AssetStatus.PENDING.value
     assert assets["avatar"] == AssetStatus.PENDING.value
 
 
 def test_scene_assets_omits_image_for_solo_avatar_scenes():
-    # id 1 is solo-layout — it never gets a background image, so the chip
-    # must not appear at all (it used to show a permanently-"pending" chip).
-    assets = _scene_assets(_scene(1, "talking_avatar"))
+    # Solo is opt-in — it never gets a background image, so the chip must
+    # not appear at all (it used to show a permanently-"pending" chip).
+    assets = _scene_assets(_scene(1, "talking_avatar", avatar_layout="solo"))
     assert "image" not in assets
     assert assets == {
         "voice": AssetStatus.PENDING.value,
@@ -46,17 +47,26 @@ def test_scene_assets_omits_image_for_solo_avatar_scenes():
 
 
 def test_scene_assets_respects_manual_solo_override():
-    # id 2 would be split under the default cycle — forcing "solo" must
-    # drop the image chip just like a naturally-solo scene would.
+    # "auto" would be split by default — forcing "solo" must drop the image
+    # chip.
     assets = _scene_assets(_scene(2, "talking_avatar", avatar_layout="solo"))
     assert "image" not in assets
 
 
 def test_scene_assets_respects_manual_split_override():
-    # id 1 would be solo under the default cycle — forcing "split" must
-    # bring the image chip back.
+    # Explicit "split" behaves the same as the "auto" default.
     assets = _scene_assets(_scene(1, "talking_avatar", avatar_layout="split"))
     assert "image" in assets
+
+
+def test_scene_assets_omits_avatar_for_visual_only_scenes():
+    # Visual-only shows the background image (like split) but never an
+    # avatar chip — no lip-synced clip is ever generated for it.
+    assets = _scene_assets(_scene(1, "talking_avatar", avatar_layout="visual"))
+    assert assets == {
+        "image": AssetStatus.PENDING.value,
+        "voice": AssetStatus.PENDING.value,
+    }
 
 
 def test_file_url_includes_cache_busting_mtime(tmp_path, monkeypatch):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Literal
 
 from pydantic import ValidationError
 
@@ -14,7 +15,7 @@ log = logging.getLogger("renderflow.pipeline.script")
 
 SECONDS_PER_SCENE = 5
 LOCAL_AVATAR = AvatarSpec(
-    name="David Lester",
+    name="John Doe",
     description=(
         "Middle-aged male documentary host, plain dark shirt, calm serious "
         "expression, seated in a modest workshop, cinematic portrait lighting"
@@ -146,11 +147,23 @@ def split_script(
     return plan, result
 
 
-def split_script_local(script_text: str, style: str) -> tuple[ScenePlan, LLMResult]:
-    """Split a client-provided script into scenes without any external LLM call."""
+def split_script_local(
+    script_text: str, style: str, topic_hint: str | None = None
+) -> tuple[ScenePlan, LLMResult]:
+    """Split a client-provided script into scenes without any external LLM call.
+
+    `topic_hint` is the video's real title when the caller already has one
+    (e.g. api.py always passes the user's clickbait title via --title) — it
+    drives the topic anchor baked into every scene's image_prompt (see
+    _local_image_prompt), which matters here because that override is
+    applied to plan.title only *after* this function returns (make_video.py),
+    so without it every image prompt would be anchored to the inferred
+    8-word title instead of the actual one.
+    """
     cleaned = _strip_script_markup(script_text)
     chunks = _chunk_sentences(_sentences(cleaned))
     title = _infer_title(cleaned)
+    topic = topic_from_title(topic_hint or title)
     motions = ("zoom_in", "pan_right", "zoom_out", "pan_left")
     scenes = [
         Scene(
@@ -158,7 +171,7 @@ def split_script_local(script_text: str, style: str) -> tuple[ScenePlan, LLMResu
             type="talking_avatar" if _uses_local_avatar(index) else "narration",
             duration_estimate_sec=max(2.0, len(chunk.split()) / 2.5),
             narration=chunk,
-            image_prompt=_local_image_prompt(chunk, style),
+            image_prompt=_local_image_prompt(chunk, style, topic),
             negative_prompt=(
                 "human face, face, portrait, person looking at camera, "
                 "lone face close-up, single face filling the frame, isolated "
@@ -191,24 +204,43 @@ def _uses_local_avatar(scene_index: int) -> bool:
     return True
 
 
-def scene_is_avatar_solo(scene: Scene) -> bool:
-    """Solo full-screen avatar vs. split-screen (avatar left + that scene's
-    own visual right).
+def effective_avatar_layout(scene: Scene) -> Literal["solo", "split", "visual"]:
+    """Resolve a scene's `avatar_layout` override (or the "auto" default) to
+    one of three concrete rendering modes:
 
-    A per-scene `avatar_layout` override ("solo"/"split") wins outright —
-    it's a deliberate user choice, made from the dashboard when the
-    generated visual isn't wanted for that beat. The default, "auto", falls
-    back to a repeating cycle of 3 (1 solo, then 2 split; scene ids start
-    at 1 and increment by 1, so id 1, 4, 7, ... are solo) — most projects
-    never need to touch the override at all. Every caller (render.py: which
-    layout to draw; assets.py: skip generating an unused background image
-    for solo scenes) derives its answer from this single function.
+    - "solo": full-screen avatar, no background visual.
+    - "split": avatar left, that scene's own background visual right.
+    - "visual": background visual only, no avatar shown at all — narration
+      plays over the image/parallax visual exactly like a plain
+      `type="narration"` scene, even though this scene's `type` is still
+      "talking_avatar" (so any avatar assets it happens to already have are
+      simply unused, not deleted — same "harmless leftover" philosophy as
+      switching solo<->split).
+
+    A per-scene override wins outright — it's a deliberate user choice, made
+    from the dashboard when the generated visual (or the avatar itself)
+    isn't wanted for that beat. The default, "auto", is always "split":
+    every scene gets its own generated visual next to the host, and the
+    other two modes are opt-in per scene rather than an automatic cycle
+    (changed 2026-07 — the old 1-in-3 auto-solo cycle picked scenes for the
+    user before they had a chance to see what visual would have been
+    generated). Every caller (render.py: which layout to draw; assets.py:
+    skip generating assets a given layout will never use) derives its
+    answer from this single function.
     """
-    if scene.avatar_layout == "solo":
-        return True
-    if scene.avatar_layout == "split":
-        return False
-    return (scene.id - 1) % 3 == 0
+    if scene.avatar_layout in ("solo", "split", "visual"):
+        return scene.avatar_layout  # type: ignore[return-value]
+    return "split"
+
+
+def scene_is_avatar_solo(scene: Scene) -> bool:
+    """Solo full-screen avatar layout — see effective_avatar_layout."""
+    return effective_avatar_layout(scene) == "solo"
+
+
+def scene_is_visual_only(scene: Scene) -> bool:
+    """Visual-only layout (no avatar shown) — see effective_avatar_layout."""
+    return effective_avatar_layout(scene) == "visual"
 
 
 def _strip_script_markup(script_text: str) -> str:
@@ -289,7 +321,31 @@ def _infer_title(script_text: str) -> str:
     return title[:80]
 
 
-def _local_image_prompt(narration: str, style: str) -> str:
+# Clickbait-template and stop words stripped from titles to find the topic
+# noun (e.g. "ants", "solar panels", "mosquitoes"). Feeding the full title
+# into the image model makes it render the title as (garbled) text in the
+# picture — learned the hard way. Shared with assets.py's thumbnail prompt.
+_TITLE_FILLER = frozenset(
+    """
+    the a an of in on for to and or is are was were it its it's this that
+    how why what when who which nobody everybody everyone anyone they you
+    your i we truth about tells tell told know knew known should would
+    could want wants dont don't wont won't really actually quietly hidden
+    untold story secret cost costing money wrong right before after too
+    late changes changed everything nothing looked into found
+    """.split()
+)
+
+
+def topic_from_title(title: str) -> str:
+    words = [
+        w for w in re.findall(r"[A-Za-z0-9'-]+", title)
+        if w.lower() not in _TITLE_FILLER
+    ]
+    return " ".join(words) or title
+
+
+def _local_image_prompt(narration: str, style: str, topic: str) -> str:
     excerpt = narration
     if len(excerpt) > 180:
         excerpt = excerpt[:177].rsplit(" ", 1)[0] + "..."
@@ -304,17 +360,30 @@ def _local_image_prompt(narration: str, style: str) -> str:
     # 59-scene render: ~30% of scenes fell back to a face-forward shot even
     # with the "never a lone face close-up" wording — client feedback was to
     # avoid a visible face altogether, not just avoid it being a close-up.
+    #
+    # `topic` (the video's main subject, e.g. "ants"/"solar panels", derived
+    # from the title via topic_from_title) is repeated on both sides of the
+    # excerpt for the same reason: many mid-script sentences refer back to
+    # the subject with pronouns ("it", "they", "the whole nest") rather than
+    # naming it, so the excerpt alone often gives the image model nothing
+    # concrete to draw and it falls back to a generic stock photo of an
+    # unrelated person instead of the actual topic. Learned 2026-07: a
+    # mosquito-bite script produced scenes of a random person's arm/kitchen
+    # instead of anything mosquito-related on the sentences that never said
+    # the word "mosquito".
     return (
-        "Wide or medium documentary b-roll photograph — absolutely no "
-        "visible human face, never a portrait, never a person looking at "
-        "the camera. If people appear, show them from behind, in "
-        "silhouette, at a distance, or cropped to hands/objects only — "
-        f"never a face. Show the concrete setting, objects, tools, or "
-        f"action of this moment: {excerpt} "
-        f"Realistic {style} photograph, shot on 35mm film, natural lighting, "
-        "shallow depth of field, documentary composition, era-accurate "
-        "details, realistic surface textures, muted natural colors, "
-        "no visible text."
+        f"Wide or medium documentary b-roll photograph about {topic} — "
+        "absolutely no visible human face, never a portrait, never a "
+        "person looking at the camera. If people appear, show them from "
+        "behind, in silhouette, at a distance, or cropped to hands/objects "
+        f"only — never a face. The photo must clearly visually relate to "
+        f"{topic}: show its concrete setting, objects, tools, or the "
+        f"specific action described here: {excerpt} Keep {topic} "
+        "recognizably present in the frame even if this line doesn't name "
+        f"it directly. Realistic {style} photograph, shot on 35mm film, "
+        "natural lighting, shallow depth of field, documentary composition, "
+        "era-accurate details, realistic surface textures, muted natural "
+        "colors, no visible text."
     )
 
 

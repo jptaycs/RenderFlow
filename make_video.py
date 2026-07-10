@@ -27,6 +27,7 @@ from renderflow.pipeline.render import render_thumbnail, render_video
 from renderflow.pipeline.script import (
     generate_script,
     scene_is_avatar_solo,
+    scene_is_visual_only,
     script_markdown,
     split_script,
     split_script_local,
@@ -46,7 +47,11 @@ def _incomplete_scenes(plan: ScenePlan) -> list[int]:
     """
     missing = []
     for scene in plan.scenes:
-        needs_avatar = scene.type == "talking_avatar"
+        # Visual-only scenes (see scene_is_visual_only) never get an avatar
+        # clip — they need only voice + background image, same as a plain
+        # narration scene.
+        visual_only = scene.type == "talking_avatar" and scene_is_visual_only(scene)
+        needs_avatar = scene.type == "talking_avatar" and not visual_only
         solo = needs_avatar and scene_is_avatar_solo(scene)
         ok = bool(scene.assets.voice.path) and (solo or bool(scene.assets.image.path))
         if needs_avatar:
@@ -114,7 +119,9 @@ def main() -> int:
                 f"[1/4] Locally splitting client script "
                 f"{args.script_file} into scenes"
             )
-            plan, script_result = split_script_local(script_text, args.style)
+            plan, script_result = split_script_local(
+                script_text, args.style, topic_hint=args.title
+            )
         script_cost = script_result.cost or 0.0
     else:
         llm = build_llm(settings)
