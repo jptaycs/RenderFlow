@@ -575,6 +575,24 @@ def regenerate_scene(slug: str, scene_id: int) -> dict[str, str]:
     return {"slug": slug}
 
 
+@app.post("/api/projects/{slug}/thumbnail/regenerate")
+def regenerate_thumbnail(slug: str) -> dict[str, str]:
+    """Regenerate only the clickbait thumbnail (background + reaction face).
+
+    Unlike scene regenerate, nothing is reset here — the spawned run's
+    --thumbnail-only mode resets the thumbnail asset itself, so there's a
+    single writer of the plan. The final render stays valid and
+    downloadable: the run re-stamps final.mp4's freshness (see
+    make_video._regenerate_thumbnail), and the old thumbnail.jpg is only
+    removed after the new images generate successfully, so a failed
+    regenerate keeps the previous thumbnail instead of leaving none."""
+    paths = _existing_project(slug)
+    if _run_active(slug):
+        raise HTTPException(409, "run already in progress")
+    _spawn(slug, ["--scenes-file", str(paths.scenes_json), "--thumbnail-only"])
+    return {"slug": slug}
+
+
 class SceneLayoutUpdate(BaseModel):
     layout: str  # "auto" | "solo" | "split" | "visual"
 

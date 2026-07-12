@@ -249,18 +249,25 @@ def generate_avatar_clips(
 
 
 def generate_thumbnail(
-    plan: ScenePlan, provider: ImageProvider, paths: ProjectPaths
+    plan: ScenePlan,
+    provider: ImageProvider,
+    paths: ProjectPaths,
+    reaction_provider: ImageProvider | None = None,
 ) -> None:
     """Generate the clickbait thumbnail: topic background + host reaction face.
 
     Both images are generated under the same `plan.thumbnail` asset (one
     retry unit — thumbnails are cheap and non-critical, no need for finer
-    per-image tracking). True identity-preserving image editing of the real
-    avatar photo (Pollinations' `kontext` image-to-image mode) needs the
-    source photo hosted at a public URL, which a local file isn't — so the
-    reaction face is a fresh AI portrait matching the host's description,
-    not a pixel-edit of the actual avatar photo.
+    per-image tracking), but may come from *different providers*: the
+    background wants AI generation (dramatic saturated clickbait
+    composition stock search rarely has), while the reaction face can be a
+    real stock photo (`reaction_provider`, defaults to `provider`). True
+    identity-preserving image editing of the real avatar photo
+    (Pollinations' `kontext` image-to-image mode) needs the source photo
+    hosted at a public URL, which a local file isn't — so the reaction
+    face is a fresh portrait, not a pixel-edit of the actual avatar photo.
     """
+    reaction_provider = reaction_provider or provider
     ref = plan.thumbnail
     if _skip(ref):
         return
@@ -276,7 +283,7 @@ def generate_thumbnail(
         )
         # The reaction face is a deliberate exception — it's supposed to
         # have a face — so it's a plain generate() call, never wrapped.
-        reaction_asset = provider.generate(
+        reaction_asset = reaction_provider.generate(
             _thumbnail_reaction_prompt(plan),
             "text, words, letters, watermark, logo, cartoon, illustration, "
             "3d render, CGI, low quality, blurry, multiple people, deformed "
@@ -291,7 +298,11 @@ def generate_thumbnail(
     reaction_out = paths.output / "thumbnail_reaction.png"
     reaction_out.write_bytes(reaction_asset.data)
     ref.path = str(bg_out)
-    ref.provider = bg_asset.provider
+    ref.provider = (
+        bg_asset.provider
+        if reaction_asset.provider == bg_asset.provider
+        else f"{bg_asset.provider}+{reaction_asset.provider}"
+    )
     ref.cost = (bg_asset.cost or 0.0) + (reaction_asset.cost or 0.0)
     ref.advance(AssetStatus.COMPLETED)
     save_plan(plan, paths)

@@ -13,6 +13,12 @@ from dotenv import load_dotenv
 class Settings:
     llm_provider: str
     image_provider: str
+    # Thumbnail images may come from different providers than scene images
+    # ("" = same as image_provider): the clickbait background wants AI
+    # generation (stock search rarely has the dramatic saturated look),
+    # while the reaction face can be a real stock photo.
+    thumbnail_bg_provider: str
+    thumbnail_reaction_provider: str
     tts_provider: str
     avatar_provider: str
     llm_model: str
@@ -31,6 +37,10 @@ class Settings:
         return cls(
             llm_provider=os.getenv("RENDERFLOW_LLM_PROVIDER", "claude"),
             image_provider=os.getenv("RENDERFLOW_IMAGE_PROVIDER", "flux-replicate"),
+            thumbnail_bg_provider=os.getenv("RENDERFLOW_THUMBNAIL_BG_PROVIDER", ""),
+            thumbnail_reaction_provider=os.getenv(
+                "RENDERFLOW_THUMBNAIL_REACTION_PROVIDER", ""
+            ),
             tts_provider=os.getenv("RENDERFLOW_TTS_PROVIDER", "elevenlabs"),
             avatar_provider=os.getenv("RENDERFLOW_AVATAR_PROVIDER", "ffmpeg-still"),
             llm_model=os.getenv("RENDERFLOW_LLM_MODEL", "claude-opus-4-8"),

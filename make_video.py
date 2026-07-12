@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -33,7 +34,8 @@ from renderflow.pipeline.script import (
     split_script_local,
 )
 from renderflow.providers import build_avatar, build_image, build_llm, build_tts
-from renderflow.schema import ScenePlan
+from renderflow.providers.base import ImageProvider
+from renderflow.schema import AssetRef, ScenePlan
 from renderflow.storage import ProjectPaths, save_plan, slugify
 
 
@@ -59,6 +61,69 @@ def _incomplete_scenes(plan: ScenePlan) -> list[int]:
         if not ok:
             missing.append(scene.id)
     return missing
+
+
+def _thumbnail_image_providers(
+    settings: Settings, image: ImageProvider
+) -> tuple[ImageProvider, ImageProvider]:
+    """Resolve the thumbnail's (background, reaction) image providers.
+
+    Each is its own env var ("" = same as the scene image provider) so the
+    background can be AI-generated (dramatic clickbait composition) while
+    the reaction face comes from stock search, independent of what scenes
+    use. Matching names reuse the same instance — provider-internal state
+    (rate-limit throttle, Pexels used-photo dedup) stays shared.
+    """
+    built: dict[str, ImageProvider] = {settings.image_provider: image}
+
+    def resolve(name: str) -> ImageProvider:
+        name = name or settings.image_provider
+        if name not in built:
+            built[name] = build_image(settings, name)
+        return built[name]
+
+    return (
+        resolve(settings.thumbnail_bg_provider),
+        resolve(settings.thumbnail_reaction_provider),
+    )
+
+
+def _regenerate_thumbnail(
+    plan: ScenePlan,
+    paths: ProjectPaths,
+    background: ImageProvider,
+    reaction: ImageProvider,
+    avatar_image: Path | None,
+) -> int:
+    """Regenerate only the project thumbnail, leaving everything else alone.
+
+    The thumbnail isn't part of final.mp4, but generate_thumbnail's
+    save_plan calls bump scenes.json's mtime — which api.py's final_ready
+    staleness check compares against final.mp4. Capture whether the render
+    was fresh before touching anything and re-stamp it after, so a
+    thumbnail-only change never makes a valid render look stale (same
+    lesson as the layout-migration mtime restore in storage.py).
+    """
+    final = paths.output / "final.mp4"
+    final_was_fresh = (
+        final.exists()
+        and final.stat().st_mtime >= paths.scenes_json.stat().st_mtime
+    )
+    # COMPLETED is terminal in the asset state machine — a regenerate is a
+    # fresh asset, not a transition.
+    plan.thumbnail = AssetRef()
+    try:
+        generate_thumbnail(plan, background, paths, reaction_provider=reaction)
+        # Only after generation succeeded: render_thumbnail skips when
+        # thumbnail.jpg exists (resume behavior), so it must go — but a
+        # failed generation above keeps the old thumbnail downloadable.
+        (paths.output / "thumbnail.jpg").unlink(missing_ok=True)
+        render_thumbnail(plan, paths, avatar_image=avatar_image)
+    finally:
+        if final_was_fresh and final.exists():
+            os.utime(final)
+    print(f"\nDone: {paths.output / 'thumbnail.jpg'}")
+    return 0
 
 
 def main() -> int:
@@ -91,7 +156,18 @@ def main() -> int:
             "video; run again without this flag (or hit Resume) to render"
         ),
     )
+    parser.add_argument(
+        "--thumbnail-only",
+        action="store_true",
+        help=(
+            "regenerate only the project thumbnail (background + reaction "
+            "face) and stop — scenes and the final render are untouched; "
+            "requires --scenes-file"
+        ),
+    )
     args = parser.parse_args()
+    if args.thumbnail_only and not args.scenes_file:
+        parser.error("--thumbnail-only requires --scenes-file")
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
@@ -133,6 +209,12 @@ def main() -> int:
         plan.title = args.title
 
     paths = ProjectPaths.create(settings.projects_dir, args.slug or slugify(plan.title))
+    if args.thumbnail_only:
+        # Before save_plan — the freshness capture inside must see
+        # scenes.json's pre-run mtime.
+        print("Regenerating project thumbnail")
+        thumb_bg, thumb_reaction = _thumbnail_image_providers(settings, image)
+        return _regenerate_thumbnail(plan, paths, thumb_bg, thumb_reaction, avatar_image)
     save_plan(plan, paths)
     (paths.script / "script.md").write_text(script_markdown(plan))
     print(f"      {len(plan.scenes)} scenes → {paths.scenes_json}")
@@ -163,7 +245,8 @@ def main() -> int:
     print("      Generating scene captions")
     generate_subtitles(plan, paths)
 
-    generate_thumbnail(plan, image, paths)
+    thumb_bg, thumb_reaction = _thumbnail_image_providers(settings, image)
+    generate_thumbnail(plan, thumb_bg, paths, reaction_provider=thumb_reaction)
     render_thumbnail(plan, paths, avatar_image=avatar_image)
 
     missing = _incomplete_scenes(plan)

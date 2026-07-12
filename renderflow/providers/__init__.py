@@ -19,16 +19,23 @@ def build_llm(settings: Settings) -> LLMProvider:
     raise ValueError(f"unknown LLM provider: {settings.llm_provider}")
 
 
-def build_image(settings: Settings) -> ImageProvider:
-    if settings.image_provider == "flux-replicate":
+def build_image(settings: Settings, name: str | None = None) -> ImageProvider:
+    """Build an image provider — `name` overrides the configured default
+    (used for the thumbnail's per-image provider split)."""
+    name = name or settings.image_provider
+    if name == "flux-replicate":
         from renderflow.providers.image.flux_replicate import FluxReplicate
 
         return FluxReplicate()
-    if settings.image_provider == "pollinations":
+    if name == "pollinations":
         from renderflow.providers.image.pollinations import PollinationsImage
 
         return PollinationsImage()
-    raise ValueError(f"unknown image provider: {settings.image_provider}")
+    if name == "pexels":
+        from renderflow.providers.image.pexels import PexelsImage
+
+        return PexelsImage()
+    raise ValueError(f"unknown image provider: {name}")
 
 
 def build_tts(settings: Settings) -> TTSProvider:

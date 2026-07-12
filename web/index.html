@@ -234,11 +234,16 @@ function drainActionQueues() {
     const project = state.projects.find(p => p.slug === slug);
     if (!project || project.running) continue;
     const action = queue.shift();
-    markPendingAutoResume(slug);
+    // Thumbnail regeneration never invalidates final.mp4, so it must not
+    // arm auto-resume — on a project the user paused mid-edit, that would
+    // fire a full render they didn't ask for.
+    if (action.type !== 'thumbnail') markPendingAutoResume(slug);
     if (action.type === 'regenerate') {
       post('/api/projects/' + encodeURIComponent(slug) + '/scenes/' + action.sceneId + '/regenerate');
     } else if (action.type === 'layout') {
       post('/api/projects/' + encodeURIComponent(slug) + '/scenes/' + action.sceneId + '/layout', { layout: action.layout });
+    } else if (action.type === 'thumbnail') {
+      post('/api/projects/' + encodeURIComponent(slug) + '/thumbnail/regenerate');
     }
     break;
   }
@@ -701,6 +706,12 @@ function detailScreenHtml() {
     const downloadThumbBtn = p.thumbnailUrl
       ? '<a href="' + esc(p.thumbnailUrl) + '" download="' + esc(downloadFilename(p.title, 'jpg')) + '" style="background:transparent;border:1px solid #33333a;color:#c8c8cc;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;text-decoration:none;flex-shrink:0">Download thumbnail</a>'
       : '';
+    // Regenerate the clickbait thumbnail without touching scenes or the
+    // final render — queued like scene actions if a run is active.
+    const thumbQueued = (state.actionQueues[p.slug] || []).find(a => a.type === 'thumbnail');
+    const regenThumbBtn =
+      '<div data-act="regenerateThumbnail" data-arg="' + esc(p.slug) + '" style="background:transparent;border:1px solid ' + (thumbQueued ? '#7a5c1e' : '#33333a') + ';color:' + (thumbQueued ? '#eab308' : '#c8c8cc') + ';font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;flex-shrink:0">' +
+      (thumbQueued ? '⏳ Thumbnail queued' : '↻ New thumbnail') + '</div>';
     const videoCard = (p.videoUrl || p.thumbnailUrl) ? ('' +
       '<div style="background:#161618;border:1px solid #26262a;border-radius:14px;padding:22px;margin-bottom:26px;display:flex;gap:22px;align-items:center;flex-wrap:wrap">' +
         '<div style="width:220px;height:124px;flex-shrink:0;border-radius:10px;' + thumbBg(dlThumb) + ';display:flex;align-items:center;justify-content:center">' +
@@ -712,6 +723,7 @@ function detailScreenHtml() {
         '</div>' +
         (p.videoUrl ? '<a href="' + esc(p.videoUrl) + '" download="' + esc(downloadFilename(p.title)) + '" style="background:#FF0000;color:#ffffff;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;text-decoration:none;flex-shrink:0">Download MP4</a>' : '') +
         downloadThumbBtn +
+        regenThumbBtn +
       '</div>') : '';
 
     const stages = p.stages.map((stage, i) => {
@@ -1206,6 +1218,21 @@ const actions = {
     state.selectedSceneId = null;
     markPendingAutoResume(slug);
     post('/api/projects/' + encodeURIComponent(slug) + '/scenes/' + id + '/regenerate');
+  },
+  regenerateThumbnail(slug) {
+    const project = findProject(slug);
+    if (cancelQueuedAction(slug, null, 'thumbnail')) { // clicking again cancels
+      render();
+      return;
+    }
+    if (project && project.running) {
+      (state.actionQueues[slug] || (state.actionQueues[slug] = [])).push({ type: 'thumbnail', sceneId: null });
+      render();
+      return;
+    }
+    // No markPendingAutoResume: a thumbnail-only run leaves final.mp4
+    // valid (see api.py::regenerate_thumbnail) — nothing needs re-rendering.
+    post('/api/projects/' + encodeURIComponent(slug) + '/thumbnail/regenerate');
   },
   setSceneLayout(rawArg) {
     const [rawId, layout] = rawArg.split(':');

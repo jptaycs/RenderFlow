@@ -591,6 +591,40 @@ def test_generate_thumbnail_is_tracked_and_resumable(paths: ProjectPaths):
     assert plan.thumbnail.path == first_path
 
 
+def test_generate_thumbnail_split_providers(paths: ProjectPaths):
+    """Background and reaction face can come from different providers —
+    e.g. AI-generated clickbait background + stock-photo reaction face."""
+    from dataclasses import replace
+
+    from renderflow.pipeline.assets import generate_thumbnail
+    from renderflow.providers.base import GeneratedAsset
+
+    class NamedStub(StubImage):
+        def __init__(self, name: str, data: bytes) -> None:
+            self.name = name
+            self._data = data
+
+        def generate(self, prompt, negative_prompt=None, **params):
+            asset = StubImage.generate(self, prompt, negative_prompt, **params)
+            return replace(asset, data=self._data, provider=self.name)
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    save_plan(plan, paths)
+    generate_thumbnail(
+        plan,
+        NamedStub("ai-gen", b"bg-image"),
+        paths,
+        reaction_provider=NamedStub("stock", b"reaction-image"),
+    )
+
+    assert plan.thumbnail.status is AssetStatus.COMPLETED
+    assert Path(plan.thumbnail.path).read_bytes() == b"bg-image"
+    assert (paths.output / "thumbnail_reaction.png").read_bytes() == b"reaction-image"
+    # Cost tracking must still answer "what did this cost" across both.
+    assert plan.thumbnail.cost == pytest.approx(0.006)
+    assert plan.thumbnail.provider == "ai-gen+stock"
+
+
 def test_thumbnail_reaction_prompt_strips_calm_expression_wording():
     from renderflow.pipeline.assets import _thumbnail_reaction_prompt
     from renderflow.pipeline.script import LOCAL_AVATAR
