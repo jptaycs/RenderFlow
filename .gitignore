@@ -11,3 +11,4 @@ projects/
 dist/
 .kokoro/
 .cv2_models/
+.dashboard.log
