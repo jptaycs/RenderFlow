@@ -1,0 +1,16 @@
+[Unit]
+Description=RenderFlow dashboard API (uvicorn on 127.0.0.1:8321, behind Caddy)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=renderflow
+Group=renderflow
+WorkingDirectory=/opt/renderflow
+ExecStart=/opt/renderflow/.venv/bin/python -m renderflow.api
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

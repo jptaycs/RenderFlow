@@ -62,6 +62,18 @@ class AvatarProvider(Protocol):
 
 
 @runtime_checkable
+class VideoProvider(Protocol):
+    """Stock-video search (B-roll) — returns a downloaded clip, not
+    generation (the no-AI-video-generation cost rule stands)."""
+
+    name: str
+
+    def find_clip(
+        self, prompt: str, min_duration_sec: float, **params: Any
+    ) -> GeneratedAsset: ...
+
+
+@runtime_checkable
 class LLMProvider(Protocol):
     name: str
 

@@ -19,6 +19,7 @@ from pathlib import Path
 from renderflow.config import Settings
 from renderflow.pipeline.assets import (
     generate_avatar_clips,
+    generate_broll,
     generate_images,
     generate_subtitles,
     generate_thumbnail,
@@ -33,7 +34,13 @@ from renderflow.pipeline.script import (
     split_script,
     split_script_local,
 )
-from renderflow.providers import build_avatar, build_image, build_llm, build_tts
+from renderflow.providers import (
+    build_avatar,
+    build_broll,
+    build_image,
+    build_llm,
+    build_tts,
+)
 from renderflow.providers.base import ImageProvider
 from renderflow.schema import AssetRef, ScenePlan
 from renderflow.storage import ProjectPaths, save_plan, slugify
@@ -157,6 +164,17 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--projects-dir",
+        type=Path,
+        help=(
+            "override the projects root for this run (used by the worker to "
+            "point at per-user directories). Must be a CLI flag, not an env "
+            "var: Settings.load() runs load_dotenv(override=True), which "
+            "clobbers any RENDERFLOW_PROJECTS_DIR inherited from the parent "
+            "process with the .env value"
+        ),
+    )
+    parser.add_argument(
         "--thumbnail-only",
         action="store_true",
         help=(
@@ -208,7 +226,8 @@ def main() -> int:
     if args.title:
         plan.title = args.title
 
-    paths = ProjectPaths.create(settings.projects_dir, args.slug or slugify(plan.title))
+    projects_dir = args.projects_dir or settings.projects_dir
+    paths = ProjectPaths.create(projects_dir, args.slug or slugify(plan.title))
     if args.thumbnail_only:
         # Before save_plan — the freshness capture inside must see
         # scenes.json's pre-run mtime.
@@ -221,6 +240,13 @@ def main() -> int:
 
     print(f"[2/4] Generating {len(plan.scenes)} images ({image.name})")
     generate_images(plan, image, paths, avatar_image=avatar_image)
+
+    broll = build_broll(settings)
+    if broll is not None:
+        # Optional stock-video B-roll for full-frame scenes — failures fall
+        # back to the still image and never block the render.
+        print(f"      Fetching stock B-roll ({broll.name})")
+        generate_broll(plan, broll, paths)
 
     print(f"[3/4] Generating {len(plan.scenes)} voice clips ({tts.name})")
     tts_params = {}

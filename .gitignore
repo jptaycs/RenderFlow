@@ -12,3 +12,6 @@ dist/
 .kokoro/
 .cv2_models/
 .dashboard.log
+# user-supplied background music (licensing — never commit audio)
+music/*
+!music/README.md

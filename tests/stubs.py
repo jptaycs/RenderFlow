@@ -51,6 +51,28 @@ class StubTTS:
         )
 
 
+class StubVideo:
+    name = "stub-video"
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[str] = []
+
+    def find_clip(
+        self, prompt: str, min_duration_sec: float, **params: Any
+    ) -> GeneratedAsset:
+        self.calls.append(prompt)
+        if self.fail:
+            raise ValueError("stub video failure")
+        return GeneratedAsset(
+            data=b"fake-broll-mp4",
+            provider=self.name,
+            params={"prompt": prompt, "min_duration": min_duration_sec},
+            cost=0.0,
+            meta={"videographer": "Stub", "video_url": "https://example.com/v/1"},
+        )
+
+
 class StubAvatar:
     name = "stub-avatar"
 

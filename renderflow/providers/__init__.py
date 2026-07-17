@@ -8,6 +8,7 @@ from renderflow.providers.base import (
     ImageProvider,
     LLMProvider,
     TTSProvider,
+    VideoProvider,
 )
 
 
@@ -52,6 +53,20 @@ def build_tts(settings: Settings) -> TTSProvider:
 
         return KokoroTTS()
     raise ValueError(f"unknown TTS provider: {settings.tts_provider}")
+
+
+def build_broll(settings: Settings) -> VideoProvider | None:
+    """Stock-video B-roll provider, or None when disabled (the default).
+
+    B-roll is optional end to end: None simply means every scene renders
+    from its still image, exactly as before the feature existed."""
+    if not settings.broll_provider:
+        return None
+    if settings.broll_provider == "pexels-video":
+        from renderflow.providers.video.pexels_video import PexelsVideo
+
+        return PexelsVideo()
+    raise ValueError(f"unknown b-roll provider: {settings.broll_provider}")
 
 
 def build_avatar(settings: Settings) -> AvatarProvider:

@@ -1,0 +1,19 @@
+[Unit]
+Description=RenderFlow Celery worker (runs make_video.py pipeline jobs)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=renderflow
+Group=renderflow
+WorkingDirectory=/opt/renderflow
+ExecStart=/opt/renderflow/.venv/bin/celery -A renderflow.tasks worker --concurrency=1 --loglevel=info
+Restart=always
+RestartSec=3
+# A render can take minutes; give the pipeline subprocess time to be
+# cleaned up by the task's cancellation handling before SIGKILL.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

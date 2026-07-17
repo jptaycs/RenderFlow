@@ -334,7 +334,20 @@ def test_render_integration(paths: ProjectPaths, monkeypatch):
     pytest.importorskip("PIL")
     from renderflow.pipeline.render import probe_duration, render_video
 
-    # Keep the integration test hermetic: zoompan needs no depth model.
+    # Keep the integration test hermetic: zoompan needs no depth model, no
+    # intro/outro cards (their durations would swamp the scene-timing
+    # asserts below — cards have their own integration test), and an empty
+    # music dir (the repo-level music/ may hold user tracks). Settings.load
+    # is patched wholesale — render.py calls it mid-render, and its
+    # load_dotenv(override=True) would otherwise clobber the RENDERFLOW_MOTION
+    # env monkeypatch with the .env value partway through the render.
+    from renderflow.config import Settings
+    from tests.conftest import make_settings
+
+    settings = make_settings(
+        intro_outro=False, music_dir=paths.root / "no-music", transition="fade"
+    )
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
     monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
     plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
     # Scene id 1 is forced solo (full-screen avatar, no visual) and id 2 is
@@ -735,3 +748,68 @@ def test_local_split_script_ignores_block_comments():
     assert "Keep this narration." in narration
     assert "Resume here." in narration
     assert "Do not narrate this section." not in narration
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_render_with_music_and_cards_integration(paths: ProjectPaths, monkeypatch):
+    """Music bed + intro/outro cards: the final video gains the card
+    durations, persists its chosen track, and still muxes video+audio."""
+    pytest.importorskip("PIL")
+    from renderflow.config import Settings
+    from renderflow.pipeline.render import (
+        INTRO_SEC,
+        OUTRO_SEC,
+        SCENE_GAP_SEC,
+        probe_duration,
+        render_video,
+    )
+    from tests.conftest import make_settings
+
+    music_dir = paths.root / "music"
+    music_dir.mkdir()
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=200",
+         "-t", "3", str(music_dir / "ambient.wav")],
+        check=True, capture_output=True,
+    )
+    settings = make_settings(
+        intro_outro=True,
+        music_dir=music_dir,
+        transition="fade",
+        channel_name="Test Channel",
+    )
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+    monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    plan.scenes = plan.scenes[:1]
+    scene = plan.scenes[0]
+    scene.type = "narration"
+    img = paths.images / "scene_001.png"
+    audio = paths.voice / "scene_001.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=steelblue:s=640x360",
+         "-frames:v", "1", str(img)],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440",
+         "-t", "1", str(audio)],
+        check=True, capture_output=True,
+    )
+    for ref, path in ((scene.assets.image, img), (scene.assets.voice, audio)):
+        ref.advance(AssetStatus.RUNNING)
+        ref.path = str(path)
+        ref.advance(AssetStatus.COMPLETED)
+    save_plan(plan, paths)
+
+    final = render_video(plan, paths)
+
+    assert plan.music_track == "ambient.wav"  # chosen and persisted
+    assert load_plan(paths).music_track == "ambient.wav"
+    total = probe_duration(final)
+    expected = 1.0 + SCENE_GAP_SEC + INTRO_SEC + OUTRO_SEC
+    assert total == pytest.approx(expected, abs=1.2)
+    # Re-render keeps the same track (no re-roll).
+    render_video(plan, paths)
+    assert plan.music_track == "ambient.wav"

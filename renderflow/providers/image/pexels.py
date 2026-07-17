@@ -19,13 +19,25 @@ from __future__ import annotations
 import logging
 import os
 import random
-import re
 import time
 from typing import Any
 
 import httpx
 
 from renderflow.providers.base import GeneratedAsset
+
+# Query extraction shared with the stock-video adapter
+# (providers/video/pexels_video.py) — regexes tracking the prompt builders
+# live in pexels_query so both adapters stay in sync.
+from renderflow.providers.pexels_query import (
+    FACEY_ALT_RE as _FACEY_ALT_RE,
+)
+from renderflow.providers.pexels_query import (
+    candidate_queries as _candidate_queries,
+)
+from renderflow.providers.pexels_query import (
+    search_query as _search_query,
+)
 from renderflow.retry import retryable
 
 log = logging.getLogger("renderflow.providers.pexels")
@@ -36,66 +48,6 @@ PER_PAGE = 30
 # drifting into the low-relevance tail of the result list.
 TOP_POOL = 10
 MIN_INTERVAL = 0.5
-
-# Matches the prompt builders in pipeline/script.py and pipeline/assets.py.
-_SCENE_TOPIC_RE = re.compile(r"photograph about (.+?) —")
-_SCENE_EXCERPT_RE = re.compile(r"described here:\s*(.+?)\s+Keep ")
-_THUMBNAIL_TOPIC_RE = re.compile(r"dramatic photograph of\s*(.+?)[.,]")
-# api.py::_vary_prompt appends this on manual regenerate — search junk.
-_VARIATION_MARKER = " Try this take: "
-
-_STOPWORDS = frozenset(
-    """a an the and or but of in on at to for with from by about into over
-    under is are was were be been being it its this that these those his her
-    their there here as if then than so not no never only even still very
-    while when where which who whom what how all any each every some most
-    more much they them he she we you i had has have will would could should
-    photograph photo image picture shot wide medium documentary b-roll
-    realistic cinematic dramatic lighting composition frame text words
-    letters typography face faces people person camera portrait visible
-    absolutely never recognizably present directly""".split()
-)
-
-# Stock search returns plenty of face-forward shots; scene backgrounds
-# must avoid them (see assets._generate_face_free). Photos whose alt text
-# looks face-y go to the back of the candidate list — facecheck.py still
-# has the final say on the actual pixels.
-_FACEY_ALT_RE = re.compile(r"\b(face|portrait|selfie|headshot|smiling)\b", re.IGNORECASE)
-
-
-def _content_words(text: str, limit: int) -> list[str]:
-    words = []
-    for raw in re.findall(r"[A-Za-z][A-Za-z'-]+", text):
-        word = raw.lower()
-        if word in _STOPWORDS or word in words:
-            continue
-        words.append(word)
-        if len(words) >= limit:
-            break
-    return words
-
-
-def _search_query(prompt: str) -> str:
-    """Reduce a pipeline image prompt to a short stock-search query."""
-    base = prompt.split(_VARIATION_MARKER)[0]
-    topic_match = _SCENE_TOPIC_RE.search(base) or _THUMBNAIL_TOPIC_RE.search(base)
-    if topic_match:
-        topic_words = _content_words(topic_match.group(1), 3)
-        excerpt = _SCENE_EXCERPT_RE.search(base)
-        extra = _content_words(excerpt.group(1), 6) if excerpt else []
-        words = topic_words + [w for w in extra if w not in topic_words]
-        return " ".join(words[:6])
-    return " ".join(_content_words(base, 6))
-
-
-def _candidate_queries(query: str) -> list[str]:
-    """The query, then progressively shorter fallbacks for empty results."""
-    words = query.split()
-    candidates = []
-    while words:
-        candidates.append(" ".join(words))
-        words = words[:-1] if len(words) > 2 else []
-    return candidates or [query]
 
 
 class PexelsImage:

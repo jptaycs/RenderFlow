@@ -28,9 +28,15 @@ CHUNK_WORDS = 4
 MARGIN_BOTTOM = 90
 
 _FONT_CANDIDATES = [
+    # macOS (dev machine)
     "/System/Library/Fonts/Supplemental/Arial Black.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     "/System/Library/Fonts/Supplemental/Arial.ttf",
+    # Linux (production server) — without these, every caption falls back
+    # to PIL's tiny bitmap default and is unreadable at 1080p.
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ]
 
 

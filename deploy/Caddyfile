@@ -1,0 +1,15 @@
+# Installed to /etc/caddy/Caddyfile by deploy/setup_server.sh, which
+# replaces __DOMAIN__ with your domain. Caddy fetches and renews the TLS
+# certificate automatically once the domain's A record points here.
+__DOMAIN__ {
+	reverse_proxy 127.0.0.1:8321
+	encode gzip
+
+	# Rendered MP4s can be large; don't buffer whole responses.
+	header {
+		# Clickjacking / MIME-sniffing hardening for the dashboard.
+		X-Frame-Options DENY
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}

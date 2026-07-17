@@ -1,0 +1,7 @@
+[Unit]
+Description=RenderFlow daily backup (pg_dump + projects tar)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash /opt/renderflow/deploy/backup.sh

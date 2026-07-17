@@ -1,33 +1,38 @@
-"""Local dashboard API: read project state, launch pipeline runs, serve files.
+"""Dashboard API: auth, per-user project state, job queue, file serving.
 
 The pipeline itself always runs as a `make_video.py` subprocess — never
-inside a request handler. This is the dev, single-machine stand-in for the
-Week-2 worker queue; endpoints are shaped so a Celery/Redis backend can
-replace the subprocess layer without changing the frontend.
+inside a request handler. Runs are queued as Job rows and executed by the
+Celery worker (renderflow/tasks.py); this process only enqueues, cancels,
+and reads state. Every project belongs to a User row; all endpoints are
+scoped to the signed-in owner.
 
 Run:  .venv/bin/python -m renderflow.api   (serves http://127.0.0.1:8321)
+Needs docker compose up -d (Postgres + Redis) and the Celery worker —
+see CLAUDE.md Commands.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import random
 import shutil
-import signal
-import subprocess
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
+from renderflow import db
+from renderflow.auth import current_user
+from renderflow.auth import router as auth_router
+from renderflow.billing import consume_credit, entitlement
+from renderflow.billing import router as billing_router
 from renderflow.config import Settings
+from renderflow.db import Job, Project, User, get_db
 from renderflow.pipeline.script import (
     effective_avatar_layout,
     scene_is_avatar_solo,
@@ -42,115 +47,38 @@ from renderflow.storage import (
     save_plan,
     slugify,
 )
+from renderflow.tasks import cancel_job, run_pipeline
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = REPO_ROOT / "web"
 
 app = FastAPI(title="RenderFlow")
-
-# slug -> {"proc": Popen, "started": float}; dev-only, lost on restart
-# (statuses then fall back to what scenes.json says on disk).
-_runs: dict[str, dict[str, Any]] = {}
+app.include_router(auth_router)
+app.include_router(billing_router)
 
 
 def _projects_dir() -> Path:
     return Settings.load().projects_dir
 
 
-def _pid_is_pipeline(pid: int) -> bool:
-    proc = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True
-    )
-    return proc.returncode == 0 and "make_video.py" in proc.stdout
+def _active_job(session: Session, project: Project) -> Job | None:
+    return db.active_job(session, project.id)
 
 
-def _run_active(slug: str) -> dict[str, Any] | None:
-    run = _runs.get(slug)
-    if run and run["proc"].poll() is None:
-        return run
-    # Fall back to the pid file so runs survive an API restart: the
-    # subprocess keeps working either way, and the UI must keep seeing it.
-    pid_file = _projects_dir() / slug / "logs" / "run.pid"
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-        except ValueError:
-            return None
-        if _pid_is_pipeline(pid):
-            return {"proc": None, "started": pid_file.stat().st_mtime, "pid": pid}
-    return None
+def _enqueue(session: Session, project: Project, kind: str, argv: list[str]) -> Job:
+    """Queue a pipeline run for the Celery worker.
 
-
-def _spawn(slug: str, args: list[str]) -> None:
-    paths = ProjectPaths.create(_projects_dir(), slug)
-    log_file = (paths.logs / "run.log").open("a")
-    log_file.write(f"\n=== {datetime.now().isoformat()} {' '.join(args)} ===\n")
-    log_file.flush()
-    proc = subprocess.Popen(
-        [sys.executable, str(REPO_ROOT / "make_video.py"), *args, "--slug", slug],
-        cwd=REPO_ROOT,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        # New session (own process group) so _kill_run can signal the whole
-        # tree at once — make_video.py shells out to real subprocesses of
-        # its own (wav2lip's inference.py, ffmpeg); killing only the direct
-        # child left those running to completion as orphans (found live
-        # 2026-07 testing cancel: a wav2lip inference.py kept burning CPU
-        # for a minute after "cancel" had already returned).
-        start_new_session=True,
-    )
-    (paths.logs / "run.pid").write_text(str(proc.pid))
-    _runs[slug] = {"proc": proc, "started": time.time()}
-
-
-def _kill_run(slug: str) -> bool:
-    """Stop an active run and its whole subprocess tree, if any.
-
-    make_video.py is spawned in its own process group (_spawn,
-    start_new_session=True) so a single os.killpg reaches the pipeline's own
-    subprocess children too (wav2lip's inference.py, ffmpeg) — killing only
-    the direct child left those running to completion as orphans (found
-    live 2026-07 testing cancel: a wav2lip inference.py kept burning CPU for
-    a minute after "cancel" had already returned). Falls back to signaling
-    just the pid for a run spawned before this change, which predates the
-    process group and so has none to target.
-
-    Whatever asset was mid-generation is left in RUNNING state on disk —
-    that's already handled without any extra bookkeeping here: `_start`
-    (pipeline/assets.py) treats an orphaned RUNNING asset exactly like one
-    left behind by a crash, routing it through FAILED -> RETRYING the next
-    time a run starts on this project.
+    The Job row must be committed *before* .delay() — the worker can pick
+    the message up faster than this request finishes, and an uncommitted
+    job id would look like a stale delivery and be dropped.
     """
-    run = _run_active(slug)
-    if not run:
-        return False
-    pid = run["proc"].pid if run.get("proc") is not None else run["pid"]
-
-    def _signal(sig: int) -> None:
-        try:
-            os.killpg(pid, sig)
-        except ProcessLookupError:
-            try:
-                os.kill(pid, sig)
-            except ProcessLookupError:
-                pass
-
-    _signal(signal.SIGTERM)
-    for _ in range(20):
-        if not _pid_is_pipeline(pid):
-            break
-        time.sleep(0.25)
-    else:
-        _signal(signal.SIGKILL)
-    proc = run.get("proc")
-    if proc is not None:
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-    _runs.pop(slug, None)
-    (_projects_dir() / slug / "logs" / "run.pid").unlink(missing_ok=True)
-    return True
+    job = Job(project_id=project.id, kind=kind, argv=argv)
+    session.add(job)
+    session.commit()
+    result = run_pipeline.delay(job.id)
+    job.celery_task_id = result.id
+    session.commit()
+    return job
 
 
 # ---------------------------------------------------------------------------
@@ -172,8 +100,8 @@ def _scene_assets(scene: Scene) -> dict[str, str]:
     return assets
 
 
-def _file_url(slug: str, path: str | Path | None) -> str | None:
-    """Map an absolute asset path to its /files URL (projects dir only).
+def _file_url(paths: ProjectPaths, slug: str, path: str | Path | None) -> str | None:
+    """Map an absolute asset path to its /files URL (project dir only).
 
     Appends the file's mtime as a cache-busting query param. Scene/thumbnail/
     video filenames are deterministic (scene_002.png, thumbnail.jpg,
@@ -185,7 +113,7 @@ def _file_url(slug: str, path: str | Path | None) -> str | None:
         return None
     file_path = Path(path)
     try:
-        rel = file_path.resolve().relative_to(_projects_dir().resolve() / slug)
+        rel = file_path.resolve().relative_to(paths.root.resolve())
     except ValueError:
         return None
     try:
@@ -195,13 +123,13 @@ def _file_url(slug: str, path: str | Path | None) -> str | None:
     return f"/files/{slug}/{rel.as_posix()}?v={version}"
 
 
-def _scene_thumb(slug: str, scene: Scene) -> str | None:
+def _scene_thumb(paths: ProjectPaths, slug: str, scene: Scene) -> str | None:
     if scene.assets.image.status is AssetStatus.COMPLETED:
-        return _file_url(slug, scene.assets.image.path)
+        return _file_url(paths, slug, scene.assets.image.path)
     # Solo-layout scenes have no background image — preview the avatar
     # portrait instead of leaving the card blank.
     if scene.assets.avatar_image.status is AssetStatus.COMPLETED:
-        return _file_url(slug, scene.assets.avatar_image.path)
+        return _file_url(paths, slug, scene.assets.avatar_image.path)
     return None
 
 
@@ -246,14 +174,20 @@ def _load_performance_view(paths: ProjectPaths, final_ready: bool, final: Path) 
     return perf
 
 
-def _project_view(slug: str, plan: ScenePlan, paths: ProjectPaths) -> dict[str, Any]:
+def _project_view(
+    project: Project, plan: ScenePlan, paths: ProjectPaths, job: Job | None
+) -> dict[str, Any]:
+    slug = project.slug
     refs = [ref for scene in plan.scenes for ref in _refs(scene)]
     total = len(refs)
     done = sum(1 for r in refs if r.status is AssetStatus.COMPLETED)
     any_failed = any(r.status is AssetStatus.FAILED for r in refs)
     all_done = total > 0 and done == total
     final = paths.output / "final.mp4"
-    run = _run_active(slug)
+    # "Run active" = a queued or running Job row (the worker queue replaced
+    # the old in-process pid tracking; job rows survive API restarts by
+    # nature, which the run.pid file used to be needed for).
+    run = job
 
     # A final.mp4 left over from an earlier run must not count: the render is
     # done only if every asset is completed AND the video is newer than the
@@ -312,12 +246,14 @@ def _project_view(slug: str, plan: ScenePlan, paths: ProjectPaths) -> dict[str, 
             "provider": s.assets.image.provider or "—",
             "cost": sum(r.cost or 0.0 for r in _refs(s)),
             "assets": _scene_assets(s),
-            "thumb": _scene_thumb(slug, s),
+            "thumb": _scene_thumb(paths, slug, s),
             "avatarLayout": s.avatar_layout if s.type == "talking_avatar" else None,
             "effectiveLayout": (
                 effective_avatar_layout(s)
                 if s.type == "talking_avatar" else None
             ),
+            "brollMode": s.broll_mode,
+            "hasBroll": s.assets.broll.status is AssetStatus.COMPLETED,
         }
         for s in plan.scenes
     ]
@@ -354,10 +290,12 @@ def _project_view(slug: str, plan: ScenePlan, paths: ProjectPaths) -> dict[str, 
         ).strftime("%b %-d"),
         "stages": stages,
         "scenes": scenes,
-        "videoUrl": _file_url(slug, paths.output / "final.mp4") if final_ready else None,
-        "thumbnailUrl": _file_url(slug, paths.output / "thumbnail.jpg")
+        "videoUrl": _file_url(paths, slug, paths.output / "final.mp4")
+        if final_ready else None,
+        "thumbnailUrl": _file_url(paths, slug, paths.output / "thumbnail.jpg")
         if (paths.output / "thumbnail.jpg").exists() else None,
         "running": bool(run),
+        "runStartedAt": (run.started_at or run.created_at) if run else None,
         "views": perf.views,
         "watchTimeMinutes": perf.watch_time_minutes,
         "revenueUsd": perf.revenue_usd,
@@ -372,8 +310,9 @@ def _jobs_view(projects: list[dict[str, Any]]) -> list[dict[str, Any]]:
     order = {"running": 0, "retrying": 1, "failed": 2, "pending": 3, "completed": 4}
     jobs: list[dict[str, Any]] = []
     for project in projects:
-        run = _run_active(project["slug"])
-        elapsed = int(time.time() - run["started"]) if run else 0
+        run = project["running"]
+        started = project.get("runStartedAt")
+        elapsed = int(time.time() - started) if run and started else 0
         for scene in project["scenes"]:
             for kind, status in scene["assets"].items():
                 if status == "completed" and not run:
@@ -406,22 +345,83 @@ def _jobs_view(projects: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _placeholder_view(session: Session, project: Project) -> dict[str, Any]:
+    """View for a project whose create-job hasn't written scenes.json yet.
+
+    Pre-queue, such a directory was simply skipped by the dashboard scan;
+    now the Project row exists the instant the user clicks Create, so it
+    must render as a card (otherwise a failed create-job would leave an
+    invisible project squatting on its slug forever). Same key set as
+    _project_view so the frontend never sees missing fields.
+    """
+    latest = (
+        session.query(Job)
+        .filter(Job.project_id == project.id)
+        .order_by(Job.created_at.desc())
+        .first()
+    )
+    running = latest is not None and latest.status in db.ACTIVE_JOB_STATUSES
+    if running:
+        status = "Generating"
+    elif latest is not None and latest.status == "failed":
+        status = "Failed"
+    else:
+        status = "Draft"
+    return {
+        "slug": project.slug,
+        "title": project.title,
+        "style": "",
+        "status": status,
+        "progress": 0,
+        "cost": 0.0,
+        "costByCategory": {"Images": 0.0, "Voice": 0.0, "Avatar": 0.0},
+        "estDurationSec": 0,
+        "createdLabel": datetime.fromtimestamp(project.created_at).strftime("%b %-d"),
+        "stages": [
+            {"name": "Script", "status": "active" if running else "pending"},
+            {"name": "Scenes", "status": "pending"},
+            {"name": "Assets", "status": "pending"},
+            {"name": "Render", "status": "pending"},
+        ],
+        "scenes": [],
+        "videoUrl": None,
+        "thumbnailUrl": None,
+        "running": running,
+        "runStartedAt": (latest.started_at or latest.created_at) if running else None,
+        "views": None,
+        "watchTimeMinutes": None,
+        "revenueUsd": None,
+        "notes": "",
+        "profit": None,
+        "productionTimeSec": None,
+        "createdAt": project.created_at,
+    }
+
+
 @app.get("/api/state")
-def get_state() -> dict[str, Any]:
+def get_state(
+    user: User = Depends(current_user), session: Session = Depends(get_db)
+) -> dict[str, Any]:
     projects: list[dict[str, Any]] = []
-    projects_dir = _projects_dir()
-    if projects_dir.exists():
-        for entry in sorted(projects_dir.iterdir()):
-            paths = ProjectPaths(root=entry)
-            if not paths.scenes_json.exists():
-                continue
-            try:
-                plan = load_plan(paths)
-            except (ValueError, json.JSONDecodeError):
-                continue  # mid-write or hand-edited; next poll picks it up
-            projects.append(_project_view(entry.name, plan, paths))
+    rows = session.query(Project).filter(Project.owner_id == user.id).all()
+    for row in rows:
+        paths = ProjectPaths(root=Path(row.dir_path))
+        if not paths.scenes_json.exists():
+            projects.append(_placeholder_view(session, row))
+            continue
+        try:
+            plan = load_plan(paths)
+        except (ValueError, json.JSONDecodeError):
+            continue  # mid-write or hand-edited; next poll picks it up
+        projects.append(_project_view(row, plan, paths, _active_job(session, row)))
     projects.sort(key=lambda p: (not p["running"], p["title"].lower()))
-    return {"projects": projects, "jobs": _jobs_view(projects)}
+    return {
+        "projects": projects,
+        "jobs": _jobs_view(projects),
+        # Polled with the rest of state so the sidebar's credits/plan line
+        # is always current (e.g. drops right after a create).
+        "billing": entitlement(session, user),
+    }
 
 
 class NewProject(BaseModel):
@@ -431,19 +431,57 @@ class NewProject(BaseModel):
 
 
 @app.post("/api/projects", status_code=201)
-def create_project(body: NewProject) -> dict[str, str]:
+def create_project(
+    body: NewProject,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, str]:
     title = " ".join(body.title.split())
     script = body.script.strip()
     if not title:
         raise HTTPException(422, "title must not be empty")
     if not script:
         raise HTTPException(422, "script must not be empty")
+
+    # Paywall: trial credits first, then an active subscription's monthly
+    # allowance; admins unlimited. 402 tells the frontend to open pricing.
+    ent = entitlement(session, user)
+    if ent["kind"] == "blocked":
+        raise HTTPException(
+            402, "your free trial is used up — subscribe to keep creating videos"
+        )
+    if ent["kind"] == "subscription" and ent["remaining"] == 0:
+        raise HTTPException(
+            402,
+            f"monthly limit reached on the {ent['plan']} plan — "
+            "upgrade or wait for the new month",
+        )
+
     slug = slugify(title)
-    if _run_active(slug):
-        raise HTTPException(409, f"project {slug!r} already has a run in progress")
-    if (ProjectPaths(root=_projects_dir() / slug)).scenes_json.exists():
+    existing = (
+        session.query(Project)
+        .filter(Project.owner_id == user.id, Project.slug == slug)
+        .first()
+    )
+    if existing:
         raise HTTPException(409, f"a project titled {title!r} already exists")
-    paths = ProjectPaths.create(_projects_dir(), slug)
+    # Per-user namespace: new projects never collide with (or leak) other
+    # users' slugs. Adopted legacy projects keep their old flat location via
+    # dir_path — this layout only applies to new ones.
+    paths = ProjectPaths.create(_projects_dir() / f"u{user.id}", slug)
+    project = Project(
+        owner_id=user.id,
+        slug=slug,
+        title=title,
+        dir_path=str(paths.root.resolve()),
+        created_at=time.time(),
+    )
+    session.add(project)
+    session.flush()
+    # One video = one trial credit while unsubscribed (subscription usage is
+    # derived from the project count; nothing to write for it). Same
+    # transaction as the project row — a failed create can't burn a credit.
+    consume_credit(session, user)
     source = paths.script / "source.txt"
     source.write_text(script)
     save_performance(ProjectPerformance(created_at=time.time()), paths)
@@ -454,48 +492,78 @@ def create_project(body: NewProject) -> dict[str, str]:
     # immediately with whatever the first generation happened to produce.
     # The dashboard's existing "Resume run" button (shown for Paused
     # projects) does the render pass whenever they're ready.
-    _spawn(
-        slug,
+    _enqueue(
+        session,
+        project,
+        "create",
         ["--script-file", str(source), "--style", body.style, "--title", title, "--skip-render"],
     )
     return {"slug": slug}
 
 
-def _existing_project(slug: str) -> ProjectPaths:
-    """Resolve a slug to its project dir, rejecting traversal and unknowns."""
-    if slug != slugify(slug):
+def _owned_project(session: Session, user: User, slug: str) -> Project:
+    """Resolve a slug to the signed-in user's project row.
+
+    404 (not 403) for other users' projects — same response as a
+    nonexistent slug, so nothing leaks about what other accounts have."""
+    project = (
+        session.query(Project)
+        .filter(Project.owner_id == user.id, Project.slug == slug)
+        .first()
+    )
+    if project is None:
         raise HTTPException(404, f"no project {slug!r}")
-    paths = ProjectPaths(root=_projects_dir() / slug)
-    if not paths.scenes_json.exists():
-        raise HTTPException(404, f"no project {slug!r}")
-    return paths
+    return project
+
+
+def _project_paths(project: Project) -> ProjectPaths:
+    return ProjectPaths(root=Path(project.dir_path))
 
 
 @app.delete("/api/projects/{slug}")
-def delete_project(slug: str) -> dict[str, str]:
-    paths = _existing_project(slug)
+def delete_project(
+    slug: str,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, str]:
+    project = _owned_project(session, user, slug)
     # Stop an active run before removing its files out from under it, rather
     # than blocking the delete — the client asked to be able to delete a
     # project while it's still generating, not just after.
-    _kill_run(slug)
-    shutil.rmtree(paths.root)
+    job = _active_job(session, project)
+    if job:
+        cancel_job(session, job)
+    session.query(Job).filter(Job.project_id == project.id).delete()
+    session.delete(project)
+    shutil.rmtree(project.dir_path, ignore_errors=True)
     return {"deleted": slug}
 
 
 @app.post("/api/projects/{slug}/cancel")
-def cancel_project(slug: str) -> dict[str, str]:
-    _existing_project(slug)
-    if not _kill_run(slug):
+def cancel_project(
+    slug: str,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, str]:
+    project = _owned_project(session, user, slug)
+    job = _active_job(session, project)
+    if job is None:
         raise HTTPException(409, "no run in progress")
+    cancel_job(session, job)
     return {"slug": slug}
 
 
 @app.post("/api/projects/{slug}/resume")
-def resume_project(slug: str) -> dict[str, str]:
-    paths = _existing_project(slug)
-    if _run_active(slug):
+def resume_project(
+    slug: str,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, str]:
+    project = _owned_project(session, user, slug)
+    if _active_job(session, project):
         raise HTTPException(409, "run already in progress")
-    _spawn(slug, ["--scenes-file", str(paths.scenes_json)])
+    paths = _project_paths(project)
+    _enqueue(session, project, "resume", ["--scenes-file", str(paths.scenes_json)])
     return {"slug": slug}
 
 
@@ -507,13 +575,18 @@ class PerformanceUpdate(BaseModel):
 
 
 @app.post("/api/projects/{slug}/performance")
-def set_performance(slug: str, body: PerformanceUpdate) -> dict[str, str]:
+def set_performance(
+    slug: str,
+    body: PerformanceUpdate,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, str]:
     """Manual YouTube performance entry — there is no YouTube API integration,
     the dashboard's Revenue form always submits the full set of fields at
     once, so this is a full replace of the user-entered fields (not a partial
     merge) — that's what lets clearing a field back to blank actually stick.
     created_at/completed_at are untouched; the pipeline owns those."""
-    paths = _existing_project(slug)
+    paths = _project_paths(_owned_project(session, user, slug))
     perf = load_performance(paths)
     perf.views = body.views
     perf.watch_time_minutes = body.watchTimeMinutes
@@ -548,10 +621,16 @@ def _vary_prompt(prompt: str) -> str:
 
 
 @app.post("/api/projects/{slug}/scenes/{scene_id}/regenerate")
-def regenerate_scene(slug: str, scene_id: int) -> dict[str, str]:
-    paths = _existing_project(slug)
-    if _run_active(slug):
+def regenerate_scene(
+    slug: str,
+    scene_id: int,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, str]:
+    project = _owned_project(session, user, slug)
+    if _active_job(session, project):
         raise HTTPException(409, "run already in progress")
+    paths = _project_paths(project)
     plan = load_plan(paths)
     scene = next((s for s in plan.scenes if s.id == scene_id), None)
     if scene is None:
@@ -571,12 +650,21 @@ def regenerate_scene(slug: str, scene_id: int) -> dict[str, str]:
     # for the next regenerate. The dashboard's "Resume run" (already shown
     # once a project has no fresh final.mp4) does the one render pass once
     # the user is done regenerating whatever scenes they wanted to fix.
-    _spawn(slug, ["--scenes-file", str(paths.scenes_json), "--skip-render"])
+    _enqueue(
+        session,
+        project,
+        "regenerate",
+        ["--scenes-file", str(paths.scenes_json), "--skip-render"],
+    )
     return {"slug": slug}
 
 
 @app.post("/api/projects/{slug}/thumbnail/regenerate")
-def regenerate_thumbnail(slug: str) -> dict[str, str]:
+def regenerate_thumbnail(
+    slug: str,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, str]:
     """Regenerate only the clickbait thumbnail (background + reaction face).
 
     Unlike scene regenerate, nothing is reset here — the spawned run's
@@ -586,10 +674,66 @@ def regenerate_thumbnail(slug: str) -> dict[str, str]:
     make_video._regenerate_thumbnail), and the old thumbnail.jpg is only
     removed after the new images generate successfully, so a failed
     regenerate keeps the previous thumbnail instead of leaving none."""
-    paths = _existing_project(slug)
-    if _run_active(slug):
+    project = _owned_project(session, user, slug)
+    if _active_job(session, project):
         raise HTTPException(409, "run already in progress")
-    _spawn(slug, ["--scenes-file", str(paths.scenes_json), "--thumbnail-only"])
+    paths = _project_paths(project)
+    _enqueue(
+        session,
+        project,
+        "thumbnail",
+        ["--scenes-file", str(paths.scenes_json), "--thumbnail-only"],
+    )
+    return {"slug": slug}
+
+
+class SceneBrollUpdate(BaseModel):
+    mode: str  # "auto" | "off"
+
+
+@app.post("/api/projects/{slug}/scenes/{scene_id}/broll")
+def set_scene_broll(
+    slug: str,
+    scene_id: int,
+    body: SceneBrollUpdate,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, str]:
+    """Per-scene stock-video override: "auto" uses a fetched B-roll clip for
+    full-frame scenes when available, "off" forces the still image (e.g. the
+    stock clip doesn't fit the narration). Mirrors set_scene_layout: the
+    final render is invalidated, and a generation run is queued only when
+    turning auto on with no clip fetched yet."""
+    if body.mode not in ("auto", "off"):
+        raise HTTPException(422, "mode must be 'auto' or 'off'")
+    project = _owned_project(session, user, slug)
+    if _active_job(session, project):
+        raise HTTPException(409, "run already in progress")
+    paths = _project_paths(project)
+    plan = load_plan(paths)
+    scene = next((s for s in plan.scenes if s.id == scene_id), None)
+    if scene is None:
+        raise HTTPException(404, f"no scene {scene_id} in {slug!r}")
+
+    scene.broll_mode = body.mode
+    eligible = scene.type == "narration" or (
+        scene.type == "talking_avatar" and scene_is_visual_only(scene)
+    )
+    needs_generation = (
+        body.mode == "auto"
+        and eligible
+        and bool(Settings.load().broll_provider)
+        and scene.assets.broll.status != AssetStatus.COMPLETED
+    )
+    (paths.output / "final.mp4").unlink(missing_ok=True)
+    save_plan(plan, paths)
+    if needs_generation:
+        _enqueue(
+            session,
+            project,
+            "layout",
+            ["--scenes-file", str(paths.scenes_json), "--skip-render"],
+        )
     return {"slug": slug}
 
 
@@ -598,7 +742,13 @@ class SceneLayoutUpdate(BaseModel):
 
 
 @app.post("/api/projects/{slug}/scenes/{scene_id}/layout")
-def set_scene_layout(slug: str, scene_id: int, body: SceneLayoutUpdate) -> dict[str, str]:
+def set_scene_layout(
+    slug: str,
+    scene_id: int,
+    body: SceneLayoutUpdate,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, str]:
     """Override the avatar layout for one scene: full-screen solo avatar,
     avatar + background visual split-screen, or visual-only (background
     visual with narration audio, no avatar shown at all) — e.g. the user
@@ -609,9 +759,10 @@ def set_scene_layout(slug: str, scene_id: int, body: SceneLayoutUpdate) -> dict[
     means split-screen."""
     if body.layout not in ("auto", "solo", "split", "visual"):
         raise HTTPException(422, "layout must be 'auto', 'solo', 'split', or 'visual'")
-    paths = _existing_project(slug)
-    if _run_active(slug):
+    project = _owned_project(session, user, slug)
+    if _active_job(session, project):
         raise HTTPException(409, "run already in progress")
+    paths = _project_paths(project)
     plan = load_plan(paths)
     scene = next((s for s in plan.scenes if s.id == scene_id), None)
     if scene is None:
@@ -638,8 +789,36 @@ def set_scene_layout(slug: str, scene_id: int, body: SceneLayoutUpdate) -> dict[
     (paths.output / "final.mp4").unlink(missing_ok=True)
     save_plan(plan, paths)
     if needs_generation:
-        _spawn(slug, ["--scenes-file", str(paths.scenes_json), "--skip-render"])
+        _enqueue(
+            session,
+            project,
+            "layout",
+            ["--scenes-file", str(paths.scenes_json), "--skip-render"],
+        )
     return {"slug": slug}
+
+
+@app.get("/files/{slug}/{file_path:path}")
+def serve_file(
+    slug: str,
+    file_path: str,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> FileResponse:
+    """Serve project assets (scene thumbs, thumbnail.jpg, final.mp4).
+
+    Replaces the old unauthenticated StaticFiles mount: files are only
+    served to the project's owner, and only from inside that project's own
+    directory (traversal rejected). The ?v=<mtime> cache-buster on asset
+    URLs keeps working — query params are ignored here just as StaticFiles
+    ignored them. Browsers send the session cookie on same-origin <img>/<a>
+    requests automatically."""
+    project = _owned_project(session, user, slug)
+    root = Path(project.dir_path).resolve()
+    target = (root / file_path).resolve()
+    if not target.is_relative_to(root) or not target.is_file():
+        raise HTTPException(404, "not found")
+    return FileResponse(target)
 
 
 @app.get("/")
@@ -653,13 +832,40 @@ def logo() -> FileResponse:
 
 
 @app.on_event("startup")
-def mount_files() -> None:
-    projects_dir = _projects_dir()
-    projects_dir.mkdir(parents=True, exist_ok=True)
-    app.mount("/files", StaticFiles(directory=projects_dir), name="files")
+def startup() -> None:
+    settings = Settings.load()
+    if not settings.secret_key:
+        raise RuntimeError(
+            "RENDERFLOW_SECRET_KEY is not set — generate one with "
+            "`python -c 'import secrets; print(secrets.token_hex(32))'` "
+            "and add it to .env"
+        )
+    if settings.env == "production":
+        # The dev conveniences are auth/paywall bypasses — a production
+        # instance must be impossible to start with them configured.
+        if settings.dev_login_email or settings.dev_login_password:
+            raise RuntimeError(
+                "RENDERFLOW_DEV_LOGIN_EMAIL/_PASSWORD must not be set in "
+                "production — remove them from .env"
+            )
+        if settings.dev_checkout:
+            raise RuntimeError(
+                "RENDERFLOW_DEV_CHECKOUT must not be set in production — "
+                "it activates subscriptions without payment"
+            )
+        if "renderflow:renderflow@" in settings.database_url:
+            raise RuntimeError(
+                "the database is still using the default dev password — set "
+                "RENDERFLOW_PG_PASSWORD and RENDERFLOW_DATABASE_URL in .env"
+            )
+    db.init_db()
+    _projects_dir().mkdir(parents=True, exist_ok=True)
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8321)
+    # Localhost-only bind: in production Caddy is the sole public listener
+    # and proxies here; proxy_headers makes uvicorn trust its
+    # X-Forwarded-For/Proto so request scheme and client IPs are right.
+    uvicorn.run(app, host="127.0.0.1", port=8321, proxy_headers=True)

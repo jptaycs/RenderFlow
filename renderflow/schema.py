@@ -72,6 +72,10 @@ SceneType = Literal["narration", "talking_avatar"]
 # since they're a choice, not derived.
 AvatarLayout = Literal["auto", "solo", "split", "visual"]
 
+# Per-scene stock-video B-roll override: "auto" uses a stock clip when one
+# was found (and the provider is enabled), "off" forces the still image.
+BrollMode = Literal["auto", "off"]
+
 
 class Motion(BaseModel):
     effect: MotionEffect = "zoom_in"
@@ -84,6 +88,11 @@ class SceneAssets(BaseModel):
     voice: AssetRef = Field(default_factory=AssetRef)
     avatar_clip: AssetRef = Field(default_factory=AssetRef)
     subtitle: SubtitleRef = Field(default_factory=SubtitleRef)
+    # Optional stock-video B-roll clip for full-frame scenes. OPTIONAL by
+    # design: a failed/absent broll falls back to the still image — it must
+    # never count toward scene completeness (api._refs,
+    # make_video._incomplete_scenes deliberately exclude it).
+    broll: AssetRef = Field(default_factory=AssetRef)
 
 
 class AvatarSpec(BaseModel):
@@ -104,6 +113,7 @@ class Scene(BaseModel):
     negative_prompt: str | None = None
     avatar: AvatarSpec | None = None
     avatar_layout: AvatarLayout = "auto"
+    broll_mode: BrollMode = "auto"
     motion: Motion = Field(default_factory=Motion)
     assets: SceneAssets = Field(default_factory=SceneAssets)
 
@@ -115,6 +125,10 @@ class ScenePlan(BaseModel):
     scenes: list[Scene]
     # Project-level clickbait thumbnail image (generated after scene assets).
     thumbnail: AssetRef = Field(default_factory=AssetRef)
+    # Background-music track filename (relative to RENDERFLOW_MUSIC_DIR),
+    # chosen randomly at first render and persisted so re-renders keep the
+    # same track. None = not chosen yet or music disabled.
+    music_track: str | None = None
 
     def total_asset_cost(self) -> float:
         total = 0.0
@@ -125,6 +139,7 @@ class ScenePlan(BaseModel):
                 scene.assets.avatar_image,
                 scene.assets.voice,
                 scene.assets.avatar_clip,
+                scene.assets.broll,
             ]
         for ref in refs:
             if ref.cost is not None:

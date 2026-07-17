@@ -17,8 +17,18 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
-# For the local dashboard (renderflow/api.py + web/)
-web = ["fastapi>=0.111", "uvicorn>=0.30"]
+# For the multi-user dashboard: API server, auth, Postgres models, and the
+# Celery worker (renderflow/{api,auth,db,tasks}.py + web/). Datastores come
+# from docker-compose.yml.
+web = [
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "celery[redis]>=5.4",
+    "bcrypt>=4.0",
+    "itsdangerous>=2.0",
+]
 # For the kokoro local TTS provider (see scripts/setup_kokoro.py)
 kokoro = ["kokoro-onnx>=0.4", "soundfile>=0.12"]
 # For depth-parallax scene motion (renderflow/pipeline/parallax.py)

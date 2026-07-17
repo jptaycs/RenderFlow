@@ -13,7 +13,13 @@ from renderflow.pipeline.script import (
     topic_from_title,
 )
 from renderflow.pipeline.text_normalize import normalize_for_speech
-from renderflow.providers.base import AvatarProvider, GeneratedAsset, ImageProvider, TTSProvider
+from renderflow.providers.base import (
+    AvatarProvider,
+    GeneratedAsset,
+    ImageProvider,
+    TTSProvider,
+    VideoProvider,
+)
 from renderflow.schema import AssetRef, AssetStatus, Scene, ScenePlan
 from renderflow.storage import ProjectPaths, save_plan
 
@@ -132,6 +138,50 @@ def generate_images(
         avatar_ref.advance(AssetStatus.COMPLETED)
         save_plan(plan, paths)
         log.info("scene %d avatar image done (%s)", scene.id, avatar_out.name)
+
+
+def generate_broll(
+    plan: ScenePlan,
+    provider: VideoProvider,
+    paths: ProjectPaths,
+) -> None:
+    """Optional stock-video B-roll for scenes rendered full-frame from a
+    still (plain narration scenes, and visual-only avatar scenes).
+
+    OPTIONAL by design: a failure is logged and marked FAILED but never
+    blocks the render — render.py falls back to the still image, and
+    completeness checks (api._refs, make_video._incomplete_scenes)
+    deliberately ignore this asset. Same per-scene continue-on-failure
+    pattern as generate_images.
+    """
+    for scene in plan.scenes:
+        eligible = scene.type == "narration" or (
+            scene.type == "talking_avatar" and scene_is_visual_only(scene)
+        )
+        if not eligible or scene.broll_mode != "auto":
+            continue
+        ref = scene.assets.broll
+        if _skip(ref):
+            continue
+        _start(ref)
+        save_plan(plan, paths)
+        try:
+            asset = provider.find_clip(
+                scene.image_prompt, min_duration_sec=scene.duration_estimate_sec
+            )
+        except Exception:
+            log.warning("scene %d b-roll failed, continuing", scene.id, exc_info=True)
+            ref.advance(AssetStatus.FAILED)
+            save_plan(plan, paths)
+            continue
+        out = paths.broll / f"scene_{scene.id:03d}.mp4"
+        out.write_bytes(asset.data)
+        ref.path = str(out)
+        ref.provider = asset.provider
+        ref.cost = asset.cost
+        ref.advance(AssetStatus.COMPLETED)
+        save_plan(plan, paths)
+        log.info("scene %d b-roll done (%s)", scene.id, out.name)
 
 
 def generate_voice(

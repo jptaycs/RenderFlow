@@ -9,13 +9,15 @@ from __future__ import annotations
 import logging
 import math
 import os
+import random
 import subprocess
 from pathlib import Path
 
+from renderflow.config import Settings
 from renderflow.pipeline import parallax
 from renderflow.pipeline.script import scene_is_avatar_solo, scene_is_visual_only
 from renderflow.schema import AssetStatus, Scene, ScenePlan
-from renderflow.storage import ProjectPaths
+from renderflow.storage import ProjectPaths, save_plan
 
 log = logging.getLogger("renderflow.pipeline.render")
 
@@ -36,6 +38,17 @@ CAPTION_MARGIN = 34
 # xfade/acrossfade transition did exactly this and made every scene boundary
 # sound like overlapping speech.
 SCENE_GAP_SEC = 0.3
+# Video-only dip-through-black at scene boundaries, tucked inside the
+# SCENE_GAP pause where the frame is already held still. The audio stream
+# is NEVER faded or crossfaded (see the SCENE_GAP_SEC note above) — a true
+# xfade would also shorten the video timeline relative to the concat'd
+# audio, the same drift-bug class as the 25fps avatar clips.
+FADE_IN_SEC = 0.15
+FADE_OUT_SEC = 0.22
+# Intro/outro title cards (silent; the music bed plays over them).
+INTRO_SEC = 2.8
+OUTRO_SEC = 3.5
+_MUSIC_EXTS = (".mp3", ".wav", ".m4a", ".flac", ".ogg")
 
 
 class RenderError(RuntimeError):
@@ -145,6 +158,22 @@ def _caption_filter_chain(
     return label, extra_inputs, ";".join(filters)
 
 
+def _apply_fade(filter_complex: str, label: str, duration: float) -> tuple[str, str]:
+    """Append the dip-to-black video fades to a clip's filter graph.
+
+    Returns (filter_complex, final_video_label). No-op when
+    RENDERFLOW_TRANSITION=none. Video only — audio is never touched.
+    """
+    if Settings.load().transition != "fade":
+        return filter_complex, label
+    fade_out_start = max(duration - FADE_OUT_SEC, 0.0)
+    filter_complex += (
+        f";[{label}]fade=t=in:st=0:d={FADE_IN_SEC},"
+        f"fade=t=out:st={fade_out_start:.3f}:d={FADE_OUT_SEC}[vfade]"
+    )
+    return filter_complex, "vfade"
+
+
 def render_scene_clip(scene: Scene, out: Path) -> Path:
     # Visual-only (see scene_is_visual_only) always falls through to the
     # plain image+voice path below, even if an avatar clip happens to
@@ -162,8 +191,7 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
             scene, Path(scene.assets.avatar_clip.path), Path(scene.assets.image.path), out
         )
 
-    assert scene.assets.image.path and scene.assets.voice.path
-    image = Path(scene.assets.image.path)
+    assert scene.assets.voice.path
     audio = Path(scene.assets.voice.path)
     # Render the visual (and hold the audio silent) for the full narration
     # plus a trailing pause — see SCENE_GAP_SEC.
@@ -172,12 +200,29 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
 
     chunks = _subtitle_chunks(scene)
 
+    # Stock-video B-roll takes precedence over the still when this scene has
+    # a completed clip and isn't overridden to "off" — its own soundtrack is
+    # always dropped (narration only). Any failure/absence falls through to
+    # the still+motion path below; broll is optional by design.
+    broll = scene.assets.broll
+    if (
+        scene.broll_mode == "auto"
+        and broll.status is AssetStatus.COMPLETED
+        and broll.path
+        and Path(broll.path).exists()
+    ):
+        return _render_broll_clip(scene, Path(broll.path), audio, duration, chunks, out)
+
+    assert scene.assets.image.path
+    image = Path(scene.assets.image.path)
+
     visual = _parallax_visual(scene, WIDTH, HEIGHT, duration, out)
     if visual is not None:
         cap_label, cap_inputs, cap_filter = _caption_filter_chain("v0", chunks, 2)
         filter_complex = f"[0:v]fps={FPS},format=yuv420p[v0]"
         if cap_filter:
             filter_complex += ";" + cap_filter
+        filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
         _run(
             [
                 "ffmpeg", "-y",
@@ -185,7 +230,7 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
                 "-i", str(audio),
                 *cap_inputs,
                 "-filter_complex", filter_complex,
-                "-map", f"[{cap_label}]", "-map", "1:a",
+                "-map", f"[{final_label}]", "-map", "1:a",
                 "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
                 "-af", audio_filter,
                 "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
@@ -201,6 +246,7 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
     filter_complex = f"[0:v]{_zoompan_expr(scene, frames)}[base]"
     if cap_filter:
         filter_complex += ";" + cap_filter
+    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
     _run(
         [
             "ffmpeg", "-y",
@@ -208,9 +254,50 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
             "-i", str(audio),
             *cap_inputs,
             "-filter_complex", filter_complex,
-            "-map", f"[{cap_label}]", "-map", "1:a",
+            "-map", f"[{final_label}]", "-map", "1:a",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
             "-af", audio_filter,
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-t", f"{duration:.3f}",
+            str(out),
+        ]
+    )
+    return out
+
+
+def _render_broll_clip(
+    scene: Scene,
+    video: Path,
+    audio: Path,
+    duration: float,
+    chunks: list[dict],
+    out: Path,
+) -> Path:
+    """Full-frame scene from a stock video clip instead of still+motion.
+
+    The stock clip's own audio is never mapped — narration only. A clip
+    shorter than the scene loops; a longer one is trimmed by -t.
+    """
+    loop_args = ["-stream_loop", "-1"] if probe_duration(video) < duration else []
+    cap_label, cap_inputs, cap_filter = _caption_filter_chain("v0", chunks, 2)
+    filter_complex = (
+        f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={WIDTH}:{HEIGHT},fps={FPS},format=yuv420p[v0]"
+    )
+    if cap_filter:
+        filter_complex += ";" + cap_filter
+    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
+    _run(
+        [
+            "ffmpeg", "-y",
+            *loop_args,
+            "-i", str(video),
+            "-i", str(audio),
+            *cap_inputs,
+            "-filter_complex", filter_complex,
+            "-map", f"[{final_label}]", "-map", "1:a",
+            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur={SCENE_GAP_SEC:.3f}",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-t", f"{duration:.3f}",
             str(out),
@@ -232,13 +319,14 @@ def render_avatar_full_clip(scene: Scene, avatar_clip: Path, out: Path) -> Path:
     cap_label, cap_inputs, cap_filter = _caption_filter_chain("vbase", chunks, 1)
     if cap_filter:
         filter_complex += ";" + cap_filter
+    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
     _run(
         [
             "ffmpeg", "-y",
             "-i", str(avatar_clip),
             *cap_inputs,
             "-filter_complex", filter_complex,
-            "-map", f"[{cap_label}]", "-map", "0:a",
+            "-map", f"[{final_label}]", "-map", "0:a",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
             "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur={SCENE_GAP_SEC:.3f}",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
@@ -282,6 +370,7 @@ def render_avatar_split_clip(
     cap_label, cap_inputs, cap_filter = _caption_filter_chain("vbase", chunks, 2)
     if cap_filter:
         filter_complex += ";" + cap_filter
+    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
     _run(
         [
             "ffmpeg", "-y",
@@ -289,7 +378,7 @@ def render_avatar_split_clip(
             *right_input,
             *cap_inputs,
             "-filter_complex", filter_complex,
-            "-map", f"[{cap_label}]", "-map", "0:a",
+            "-map", f"[{final_label}]", "-map", "0:a",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
             "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur={SCENE_GAP_SEC:.3f}",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
@@ -373,6 +462,83 @@ def _overlay_host_badge(thumb: Path, portrait_path: Path) -> None:
     base.save(thumb, quality=90)
 
 
+def _pick_music_track(plan: ScenePlan, paths: ProjectPaths) -> Path | None:
+    """The project's background track, chosen once and persisted.
+
+    Random pick from RENDERFLOW_MUSIC_DIR on the first render; stored in
+    plan.music_track so re-renders (and single-scene fix-ups) keep the same
+    music. Missing dir / no tracks / vanished file all degrade to no music.
+    """
+    music_dir = Settings.load().music_dir
+    if plan.music_track:
+        existing = music_dir / plan.music_track
+        if existing.exists():
+            return existing
+        log.warning("music track %s no longer exists — picking a new one", existing)
+    if not music_dir.is_dir():
+        log.info("no music dir at %s — rendering without background music", music_dir)
+        return None
+    tracks = sorted(
+        p for p in music_dir.iterdir() if p.suffix.lower() in _MUSIC_EXTS
+    )
+    if not tracks:
+        log.info("music dir %s is empty — rendering without background music", music_dir)
+        return None
+    track = random.choice(tracks)
+    plan.music_track = track.name
+    save_plan(plan, paths)
+    return track
+
+
+def _render_card_clip(png: Path, duration: float, out: Path) -> Path:
+    """A title card as a scene-shaped clip: slow zoom, silent stereo audio
+    (the music bed plays over it in the final mix), faded in/out."""
+    frames = math.ceil(duration * FPS)
+    filter_complex = (
+        f"[0:v]scale={PRESCALE_W}:{PRESCALE_H},"
+        f"zoompan=z='1+0.04*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS},format=yuv420p[card]"
+    )
+    filter_complex, final_label = _apply_fade(filter_complex, "card", duration)
+    _run(
+        [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", str(png),
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-filter_complex", filter_complex,
+            "-map", f"[{final_label}]", "-map", "1:a",
+            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-t", f"{duration:.3f}",
+            str(out),
+        ]
+    )
+    return out
+
+
+def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], list[Path]]:
+    """(intro clips, outro clips) — empty when RENDERFLOW_INTRO_OUTRO is off
+    or the cards fail to build (branding must never block a render)."""
+    settings = Settings.load()
+    if not settings.intro_outro:
+        return [], []
+    from renderflow.pipeline import branding
+
+    try:
+        intro_png = branding.build_intro_card(
+            plan.title, settings.channel_name, paths.output / "intro_card.png"
+        )
+        outro_png = branding.build_outro_card(
+            settings.channel_name, paths.output / "outro_card.png"
+        )
+        intro = _render_card_clip(intro_png, INTRO_SEC, paths.output / "intro.mp4")
+        outro = _render_card_clip(outro_png, OUTRO_SEC, paths.output / "outro.mp4")
+        return [intro], [outro]
+    except Exception as exc:  # pillow/font hiccup — skip cards, keep the video
+        log.warning("intro/outro cards skipped: %s", exc)
+        return [], []
+
+
 def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
     clips: list[Path] = []
     for scene in plan.scenes:
@@ -380,17 +546,48 @@ def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
         log.info("rendering scene %d", scene.id)
         clips.append(render_scene_clip(scene, clip))
 
+    intro_clips, outro_clips = _branding_clips(plan, paths)
+    clips = intro_clips + clips + outro_clips
+
     final = paths.output / "final.mp4"
     concat_inputs = [arg for clip in clips for arg in ("-i", str(clip))]
     # Plain hard-cut concat — each clip already carries its own trailing
     # pause (SCENE_GAP_SEC), so cuts read cleanly without an audio crossfade.
     concat_streams = "".join(f"[{i}:v][{i}:a]" for i in range(len(clips)))
+    filter_complex = f"{concat_streams}concat=n={len(clips)}:v=1:a=1[v][a]"
+    audio_map = "[a]"
+
+    # Background music: looped under the whole video at low volume,
+    # side-chain ducked by the narration so it dips whenever the host
+    # speaks, faded out over the last seconds (the outro card).
+    music = _pick_music_track(plan, paths)
+    music_inputs: list[str] = []
+    if music is not None:
+        settings = Settings.load()
+        total = sum(probe_duration(c) for c in clips)
+        fade_start = max(total - 2.0, 0.0)
+        music_index = len(clips)
+        music_inputs = ["-stream_loop", "-1", "-i", str(music)]
+        # [a] feeds both the ducker (as the sidechain signal) and the final
+        # mix — ffmpeg filter labels are single-use, hence the asplit.
+        filter_complex += (
+            ";[a]asplit=2[nar_sc][nar_mix]"
+            f";[{music_index}:a]volume={settings.music_volume:.3f}[music]"
+            ";[music][nar_sc]sidechaincompress="
+            "threshold=0.03:ratio=8:attack=150:release=600[ducked]"
+            ";[nar_mix][ducked]amix=inputs=2:duration=first:normalize=0,"
+            f"afade=t=out:st={fade_start:.3f}:d=2.0[aout]"
+        )
+        audio_map = "[aout]"
+        log.info("music bed: %s (volume %.2f, ducked)", music.name, settings.music_volume)
+
     _run(
         [
             "ffmpeg", "-y",
             *concat_inputs,
-            "-filter_complex", f"{concat_streams}concat=n={len(clips)}:v=1:a=1[v][a]",
-            "-map", "[v]", "-map", "[a]",
+            *music_inputs,
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", audio_map,
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart",

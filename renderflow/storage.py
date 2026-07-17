@@ -28,6 +28,7 @@ class ProjectPaths:
         for sub in (
             "script",
             "images",
+            "broll",
             "voice",
             "avatar",
             "subtitles",
@@ -44,6 +45,10 @@ class ProjectPaths:
     @property
     def images(self) -> Path:
         return self.root / "images"
+
+    @property
+    def broll(self) -> Path:
+        return self.root / "broll"
 
     @property
     def voice(self) -> Path:
