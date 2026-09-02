@@ -16,9 +16,21 @@ import os
 import sys
 from pathlib import Path
 
+# Console/log output here uses plain Unicode (→, ✦, …) without a thought to
+# terminal encoding — fine on a UTF-8 default (macOS/Linux), but crashes
+# with UnicodeEncodeError on Windows' legacy console codepage (verified
+# live 2026-09: a real dashboard-spawned run died on the very first
+# "N scenes → path" print). Reconfiguring stdout/stderr to UTF-8 up front
+# fixes it regardless of whether this runs interactively or with stdout
+# redirected to a log file (the dashboard's Celery task does exactly that).
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from renderflow.config import Settings
 from renderflow.pipeline.assets import (
     generate_avatar_clips,
+    generate_branding_audio,
     generate_broll,
     generate_images,
     generate_subtitles,
@@ -244,9 +256,13 @@ def main() -> int:
     broll = build_broll(settings)
     if broll is not None:
         # Optional stock-video B-roll for full-frame scenes — failures fall
-        # back to the still image and never block the render.
-        print(f"      Fetching stock B-roll ({broll.name})")
-        generate_broll(plan, broll, paths)
+        # back to the still image and never block the render. labs69 is
+        # real generation (not a stock search), so Claude rewrites each
+        # scene's static-photo prompt into a motion-aware one first — see
+        # pipeline/script.py::rewrite_video_prompt for why that matters.
+        broll_llm = build_llm(settings) if broll.name == "labs69" else None
+        print(f"      Fetching {'AI-generated' if broll_llm else 'stock'} B-roll ({broll.name})")
+        generate_broll(plan, broll, paths, llm=broll_llm)
 
     print(f"[3/4] Generating {len(plan.scenes)} voice clips ({tts.name})")
     tts_params = {}
@@ -259,6 +275,12 @@ def main() -> int:
         tts_params["sentence_pause_sec"] = settings.tts_sentence_pause
     generate_voice(plan, tts, settings.tts_voice, paths, **tts_params)
 
+    if settings.intro_outro:
+        print("      Narrating intro/outro cards")
+        generate_branding_audio(
+            plan, tts, settings.tts_voice, settings.channel_name, paths, **tts_params
+        )
+
     avatar_scene_count = sum(scene.type == "talking_avatar" for scene in plan.scenes)
     if avatar_scene_count:
         avatar = build_avatar(settings)
@@ -268,8 +290,9 @@ def main() -> int:
     else:
         render_step = "[4/4]"
 
-    print("      Generating scene captions")
-    generate_subtitles(plan, paths)
+    if settings.subtitles_enabled:
+        print("      Generating scene captions")
+        generate_subtitles(plan, paths)
 
     thumb_bg, thumb_reaction = _thumbnail_image_providers(settings, image)
     generate_thumbnail(plan, thumb_bg, paths, reaction_provider=thumb_reaction)

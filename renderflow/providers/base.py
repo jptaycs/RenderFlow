@@ -63,13 +63,21 @@ class AvatarProvider(Protocol):
 
 @runtime_checkable
 class VideoProvider(Protocol):
-    """Stock-video search (B-roll) — returns a downloaded clip, not
-    generation (the no-AI-video-generation cost rule stands)."""
+    """B-roll clip source. Historically stock-video search only (the
+    no-AI-video-generation cost rule); labs69_video.py is a deliberate,
+    user-requested exception that generates the clip instead of searching
+    for one — see that module's docstring. `negative_prompt` is optional
+    because search-based implementations (pexels_video.py) have no use
+    for it and accept it only via **params."""
 
     name: str
 
     def find_clip(
-        self, prompt: str, min_duration_sec: float, **params: Any
+        self,
+        prompt: str,
+        min_duration_sec: float,
+        negative_prompt: str | None = None,
+        **params: Any,
     ) -> GeneratedAsset: ...
 
 

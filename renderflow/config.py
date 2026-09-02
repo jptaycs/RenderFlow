@@ -63,6 +63,15 @@ class Settings:
     # when set.
     intro_outro: bool = True
     channel_name: str = ""
+    # Burned-in captions: on by default. Off is a legitimate style choice
+    # (e.g. real AI-generated video footage from labs69 already looks like
+    # produced B-roll and can read as cluttered with captions on top) —
+    # skips assets.generate_subtitles() entirely, so _subtitle_chunks()
+    # (render.py) just sees an empty/PENDING ref and renders with no
+    # overlay. Nothing else treats subtitles as required for completeness
+    # (make_video._incomplete_scenes, api._scene_assets) — no migration or
+    # UI change needed for existing projects either way.
+    subtitles_enabled: bool = True
     # When both are set, the login page shows a one-click "Developer login"
     # button that prefills these credentials and submits them through the
     # normal password-checked login — there is no bypass endpoint. Local
@@ -74,6 +83,17 @@ class Settings:
     # Stripe/Paddle plugs in later; leave unset on a deployed instance —
     # without it the endpoint returns 503 "payments not configured".
     dev_checkout: bool = False
+    # LOCAL DEV/TEST ONLY: makes tasks.py run Celery in "eager" mode
+    # (task_always_eager) so `run_pipeline.delay(job.id)` executes
+    # synchronously in the calling process instead of publishing to Redis
+    # for a separate worker — lets the dashboard run with no Redis and no
+    # `celery worker` process at all. The pipeline itself still runs as a
+    # real `make_video.py` subprocess either way (see tasks.py), so this
+    # only changes *dispatch*, not where the heavy work happens — but it
+    # does mean the HTTP request blocks until that subprocess exits, which
+    # is fine for a one-off manual test and wrong for anything else. Never
+    # set this in production (refused at startup, see api.startup).
+    celery_eager: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -110,6 +130,8 @@ class Settings:
             dev_login_password=os.getenv("RENDERFLOW_DEV_LOGIN_PASSWORD", ""),
             dev_checkout=os.getenv("RENDERFLOW_DEV_CHECKOUT", "").lower()
             in ("1", "true", "yes"),
+            celery_eager=os.getenv("RENDERFLOW_CELERY_EAGER", "").lower()
+            in ("1", "true", "yes"),
             env=os.getenv("RENDERFLOW_ENV", "dev"),
             broll_provider=os.getenv("RENDERFLOW_BROLL_PROVIDER", ""),
             music_dir=Path(os.getenv("RENDERFLOW_MUSIC_DIR", "music")),
@@ -118,4 +140,6 @@ class Settings:
             intro_outro=os.getenv("RENDERFLOW_INTRO_OUTRO", "1").lower()
             in ("1", "true", "yes"),
             channel_name=os.getenv("RENDERFLOW_CHANNEL_NAME", ""),
+            subtitles_enabled=os.getenv("RENDERFLOW_SUBTITLES", "1").lower()
+            in ("1", "true", "yes"),
         )

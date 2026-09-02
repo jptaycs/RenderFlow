@@ -37,6 +37,14 @@ _FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    # Windows — same silent-bitmap-fallback gap as Linux had, just never
+    # caught before because no one had run this on Windows until 2026-09.
+    # Also feeds branding.py's title cards (shared _font loader), so this
+    # was quietly defeating "bigger text" too: PIL's tiny bitmap default
+    # ignores the requested point size entirely.
+    "C:/Windows/Fonts/arialbd.ttf",
+    "C:/Windows/Fonts/seguisb.ttf",
+    "C:/Windows/Fonts/arial.ttf",
 ]
 
 

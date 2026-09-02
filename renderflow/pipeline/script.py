@@ -147,6 +147,56 @@ def split_script(
     return plan, result
 
 
+VIDEO_PROMPT_SYSTEM_PROMPT = """\
+You rewrite a still-photo caption into a prompt for an AI VIDEO generation
+model. The input describes a single static frame; your job is to describe
+motion happening across a few seconds instead — camera movement (slow
+dolly-in, pan, tilt, tracking shot) and/or something changing in the scene
+(water moving, light shifting, an object drifting, steam rising) — while
+keeping the same subject, setting, and framing as the input.
+
+Rules:
+- Keep every constraint from the input in spirit: if it says no visible
+  human face, your rewrite must have no visible human face either — never
+  add one just because a video can show more than a photo could.
+- Describe motion in plain, concrete terms a video model can act on. Two
+  or three sentences, no more.
+- Do not use the words "video", "clip", "AI", or "generate" — just
+  describe what the camera sees and how it moves, like a shot description
+  in a nature-documentary shot list.
+- No on-screen text, captions, or watermarks.
+- Output ONLY the rewritten prompt text — no preamble, no quotes, no
+  explanation.
+"""
+
+
+def rewrite_video_prompt(
+    llm: LLMProvider, narration: str, image_prompt: str
+) -> tuple[str, LLMResult]:
+    """Rewrite a still-photo `image_prompt` into a motion-aware prompt for
+    AI video generation (`providers/video/labs69_video.py`).
+
+    Motivating gap: `labs69_video.py` originally fed the video model the
+    exact same prompt built for a still image — a static-photo caption,
+    not a video-generation prompt — wasting a video model's actual ability
+    to show movement. One short Claude call per scene, spent right before
+    the much more expensive 69labs video call, so it's a small cost for
+    real leverage on the payoff of the bigger spend.
+
+    Raises on any LLM failure — deliberately does not swallow exceptions,
+    so callers (assets.generate_broll) can catch and fall back to the
+    original `image_prompt`; a bad rewrite must never block B-roll, which
+    is optional end to end.
+    """
+    result = llm.complete(
+        VIDEO_PROMPT_SYSTEM_PROMPT,
+        f"Narration for this moment: {narration}\n\n"
+        f"Still-photo prompt to rewrite for video:\n{image_prompt}",
+        max_tokens=300,
+    )
+    return result.text.strip(), result
+
+
 def split_script_local(
     script_text: str, style: str, topic_hint: str | None = None
 ) -> tuple[ScenePlan, LLMResult]:

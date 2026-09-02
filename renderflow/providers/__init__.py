@@ -36,6 +36,10 @@ def build_image(settings: Settings, name: str | None = None) -> ImageProvider:
         from renderflow.providers.image.pexels import PexelsImage
 
         return PexelsImage()
+    if name == "labs69":
+        from renderflow.providers.image.labs69 import Labs69Image
+
+        return Labs69Image()
     raise ValueError(f"unknown image provider: {name}")
 
 
@@ -52,6 +56,10 @@ def build_tts(settings: Settings) -> TTSProvider:
         from renderflow.providers.tts.kokoro_tts import KokoroTTS
 
         return KokoroTTS()
+    if settings.tts_provider == "labs69":
+        from renderflow.providers.tts.labs69_tts import Labs69TTS
+
+        return Labs69TTS()
     raise ValueError(f"unknown TTS provider: {settings.tts_provider}")
 
 
@@ -66,6 +74,10 @@ def build_broll(settings: Settings) -> VideoProvider | None:
         from renderflow.providers.video.pexels_video import PexelsVideo
 
         return PexelsVideo()
+    if settings.broll_provider == "labs69":
+        from renderflow.providers.video.labs69_video import Labs69Video
+
+        return Labs69Video()
     raise ValueError(f"unknown b-roll provider: {settings.broll_provider}")
 
 

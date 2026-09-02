@@ -52,6 +52,10 @@ celery_app.conf.update(
     # boot-time recovery (below) marks orphans failed for an explicit resume.
     task_acks_late=False,
 )
+if _settings.celery_eager:
+    # See Settings.celery_eager's docstring: dev/test-only, no Redis or
+    # `celery worker` process needed. api.startup refuses this in production.
+    celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
 
 
 def pid_is_pipeline(pid: int) -> bool:
@@ -147,7 +151,7 @@ def run_pipeline(job_id: int) -> None:
             str(project_dir.parent),
         ]
         log_path = paths.logs / "run.log"
-        with log_path.open("a") as log_file:
+        with log_path.open("a", encoding="utf-8") as log_file:
             log_file.write(
                 f"\n=== {datetime.now().isoformat()} job {job.id} ({job.kind}) "
                 f"{' '.join(job.argv)} ===\n"
@@ -159,6 +163,16 @@ def run_pipeline(job_id: int) -> None:
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                # make_video.py's console output uses plain Unicode (→, ✦,
+                # …) with no thought to the terminal encoding — fine on a
+                # UTF-8 default (macOS/Linux), but Windows' legacy console
+                # codepage (cp1252 etc.) can't encode those characters, and
+                # a redirected-to-file stdout still uses that same locale
+                # encoding unless overridden. Crashed a real run live
+                # (UnicodeEncodeError on '→') the first time this
+                # dashboard ran on a Windows box. PYTHONIOENCODING forces
+                # UTF-8 for the child regardless of host locale.
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             )
             job.status = "running"
             job.started_at = time.time()

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from renderflow.pipeline import facecheck
 from renderflow.pipeline.script import (
+    rewrite_video_prompt,
     scene_is_avatar_solo,
     scene_is_visual_only,
     topic_from_title,
@@ -17,6 +18,7 @@ from renderflow.providers.base import (
     AvatarProvider,
     GeneratedAsset,
     ImageProvider,
+    LLMProvider,
     TTSProvider,
     VideoProvider,
 )
@@ -144,6 +146,7 @@ def generate_broll(
     plan: ScenePlan,
     provider: VideoProvider,
     paths: ProjectPaths,
+    llm: LLMProvider | None = None,
 ) -> None:
     """Optional stock-video B-roll for scenes rendered full-frame from a
     still (plain narration scenes, and visual-only avatar scenes).
@@ -153,6 +156,14 @@ def generate_broll(
     completeness checks (api._refs, make_video._incomplete_scenes)
     deliberately ignore this asset. Same per-scene continue-on-failure
     pattern as generate_images.
+
+    `llm`, when given (make_video.py only passes one for the `labs69`
+    provider — real generation, not a stock search), rewrites the scene's
+    static-photo `image_prompt` into a motion-aware prompt before handing
+    it to the video model (see script.rewrite_video_prompt). The rewrite
+    is a pure best-effort add-on: any failure (missing API key, rate
+    limit, whatever) just falls back to the original prompt rather than
+    failing the scene — B-roll must stay optional end to end either way.
     """
     for scene in plan.scenes:
         eligible = scene.type == "narration" or (
@@ -165,9 +176,25 @@ def generate_broll(
             continue
         _start(ref)
         save_plan(plan, paths)
+        prompt = scene.image_prompt
+        rewrite_cost = 0.0
+        if llm is not None:
+            try:
+                prompt, rewrite_result = rewrite_video_prompt(
+                    llm, scene.narration, scene.image_prompt
+                )
+                rewrite_cost = rewrite_result.cost or 0.0
+            except Exception:
+                log.warning(
+                    "scene %d video-prompt rewrite failed, using the "
+                    "still-photo prompt as-is",
+                    scene.id, exc_info=True,
+                )
         try:
             asset = provider.find_clip(
-                scene.image_prompt, min_duration_sec=scene.duration_estimate_sec
+                prompt,
+                min_duration_sec=scene.duration_estimate_sec,
+                negative_prompt=scene.negative_prompt,
             )
         except Exception:
             log.warning("scene %d b-roll failed, continuing", scene.id, exc_info=True)
@@ -178,7 +205,11 @@ def generate_broll(
         out.write_bytes(asset.data)
         ref.path = str(out)
         ref.provider = asset.provider
-        ref.cost = asset.cost
+        # asset.cost is None on a credit-based 69labs account (unknown, not
+        # free — see cost_from_status); still record a known rewrite_cost
+        # rather than losing it to that None, but stay None (excluded from
+        # ScenePlan.total_asset_cost) when neither figure is known.
+        ref.cost = None if asset.cost is None and rewrite_cost == 0.0 else (asset.cost or 0.0) + rewrite_cost
         ref.advance(AssetStatus.COMPLETED)
         save_plan(plan, paths)
         log.info("scene %d b-roll done (%s)", scene.id, out.name)
@@ -216,6 +247,56 @@ def generate_voice(
         ref.advance(AssetStatus.COMPLETED)
         save_plan(plan, paths)
         log.info("scene %d voice done (%s)", scene.id, out.name)
+
+
+def _outro_line(channel_name: str) -> str:
+    if channel_name:
+        return f"Thanks for watching! Subscribe to {channel_name} for more trivia like this."
+    return "Thanks for watching! Please subscribe for more trivia like this."
+
+
+def generate_branding_audio(
+    plan: ScenePlan,
+    provider: TTSProvider,
+    voice: str,
+    channel_name: str,
+    paths: ProjectPaths,
+    **tts_params,
+) -> None:
+    """Narrate the intro title card and the outro subscribe card with the
+    same TTS voice as the rest of the video (added 2026-09, client request:
+    the cards previously played silent under the music bed only).
+
+    Optional exactly like b-roll/thumbnail: a synthesis failure is logged
+    and the ref marked FAILED, never raised — render.py's `_branding_clips`
+    treats a non-COMPLETED ref as "no narration for this card" and falls
+    back to its original silent-card behavior, so branding audio can never
+    block a render.
+    """
+    for ref, text, name in (
+        (plan.intro_audio, plan.title, "intro"),
+        (plan.outro_audio, _outro_line(channel_name), "outro"),
+    ):
+        if _skip(ref):
+            continue
+        _start(ref)
+        save_plan(plan, paths)
+        try:
+            asset = provider.synthesize(normalize_for_speech(text), voice, **tts_params)
+        except Exception:
+            log.warning("%s card narration failed, continuing", name, exc_info=True)
+            ref.advance(AssetStatus.FAILED)
+            save_plan(plan, paths)
+            continue
+        ext = asset.meta.get("format", "mp3").split("_")[0]
+        out = paths.voice / f"{name}.{ext}"
+        out.write_bytes(asset.data)
+        ref.path = str(out)
+        ref.provider = asset.provider
+        ref.cost = asset.cost
+        ref.advance(AssetStatus.COMPLETED)
+        save_plan(plan, paths)
+        log.info("%s card narration done (%s)", name, out.name)
 
 
 def generate_subtitles(plan: ScenePlan, paths: ProjectPaths) -> None:

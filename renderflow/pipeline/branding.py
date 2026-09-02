@@ -16,8 +16,9 @@ TEXT = (242, 242, 244)
 MUTED = (154, 154, 161)
 ACCENT = (255, 0, 0)
 
-TITLE_SIZE = 96
-SUBTITLE_SIZE = 44
+# Bumped up from 96/44 (client feedback: "make the texts bigger").
+TITLE_SIZE = 132
+SUBTITLE_SIZE = 58
 MAX_TEXT_WIDTH = int(WIDTH * 0.82)
 
 
@@ -86,7 +87,7 @@ def build_intro_card(title: str, channel_name: str, out: Path) -> Path:
 def build_outro_card(channel_name: str, out: Path) -> Path:
     lines = [
         ("Thanks for watching", TITLE_SIZE, TEXT),
-        ("Subscribe for more", SUBTITLE_SIZE, ACCENT),
+        ("Subscribe for more trivia", SUBTITLE_SIZE, ACCENT),
     ]
     if channel_name:
         lines.append((channel_name.upper(), SUBTITLE_SIZE, MUTED))

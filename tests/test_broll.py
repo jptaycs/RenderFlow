@@ -3,13 +3,35 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
+from renderflow.providers.base import LLMResult
 from renderflow.pipeline.assets import generate_broll
 from renderflow.schema import AssetStatus, AvatarSpec, Scene, ScenePlan
 from renderflow.storage import ProjectPaths
 from tests.stubs import StubVideo
 
 AVATAR = AvatarSpec(name="Host", description="a documentary host")
+
+
+class FakeRewriteLLM:
+    """Minimal LLMProvider fake for the video-prompt-rewrite tests — real
+    StubLLM (tests/stubs.py) always returns a canned scene-plan JSON blob,
+    which isn't a useful "rewritten prompt" string to assert against."""
+
+    name = "fake-rewrite-llm"
+
+    def __init__(self, text: str = "REWRITTEN: camera slowly pans.", cost: float = 0.002, fail: bool = False):
+        self.text = text
+        self.cost = cost
+        self.fail = fail
+        self.calls: list[tuple[str, str]] = []
+
+    def complete(self, system: str, prompt: str, **params: Any) -> LLMResult:
+        self.calls.append((system, prompt))
+        if self.fail:
+            raise RuntimeError("fake LLM failure")
+        return LLMResult(text=self.text, provider=self.name, cost=self.cost)
 
 
 def _plan(*scenes: Scene) -> ScenePlan:
@@ -73,6 +95,42 @@ def test_broll_failure_marks_failed_and_continues(tmp_path: Path):
     assert first.assets.broll.status is AssetStatus.FAILED
     assert second.assets.broll.status is AssetStatus.FAILED
     assert len(failing.calls) == 2
+
+
+def test_broll_rewrites_prompt_for_video_when_llm_given(tmp_path: Path):
+    paths = ProjectPaths.create(tmp_path, "demo")
+    scene = _scene(1)
+    provider = StubVideo()
+    llm = FakeRewriteLLM(text="REWRITTEN: slow dolly-in over the reef.")
+
+    generate_broll(_plan(scene), provider, paths, llm=llm)
+
+    assert provider.calls == ["REWRITTEN: slow dolly-in over the reef."]
+    assert len(llm.calls) == 1
+    # combined cost: the (free) stub video cost + the real rewrite cost.
+    assert scene.assets.broll.cost == 0.002
+
+
+def test_broll_falls_back_to_original_prompt_when_rewrite_fails(tmp_path: Path):
+    paths = ProjectPaths.create(tmp_path, "demo")
+    scene = _scene(1)
+    provider = StubVideo()
+    llm = FakeRewriteLLM(fail=True)
+
+    generate_broll(_plan(scene), provider, paths, llm=llm)  # must not raise
+
+    assert provider.calls == [scene.image_prompt]
+    assert scene.assets.broll.status is AssetStatus.COMPLETED
+
+
+def test_broll_without_llm_uses_original_prompt_unchanged(tmp_path: Path):
+    paths = ProjectPaths.create(tmp_path, "demo")
+    scene = _scene(1)
+    provider = StubVideo()
+
+    generate_broll(_plan(scene), provider, paths)  # llm=None, the default
+
+    assert provider.calls == [scene.image_prompt]
 
 
 def test_registry_returns_none_when_disabled():

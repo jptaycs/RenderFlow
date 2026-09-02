@@ -242,6 +242,59 @@ def test_create_project_enqueues_a_job(client, pipeline_stub, saas_env):
     assert (saas_env.projects_dir / "u1" / slug / "script" / "source.txt").exists()
 
 
+def test_create_project_topic_mode_enqueues_topic_job(client, pipeline_stub, saas_env):
+    register(client, "admin@example.com")
+    res = client.post(
+        "/api/projects",
+        json={"title": "Roman Concrete", "topic": "why ancient Roman concrete self-heals", "lengthMinutes": 5},
+    )
+    assert res.status_code == 201, res.text
+    slug = res.json()["slug"]
+
+    from renderflow import db as rdb
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).one()
+        assert "--topic" in job.argv
+        assert "why ancient Roman concrete self-heals" in job.argv
+        assert "--length" in job.argv
+        assert "5.0" in job.argv
+        assert "--script-file" not in job.argv
+    assert (saas_env.projects_dir / "u1" / slug / "script" / "topic.txt").exists()
+    assert not (saas_env.projects_dir / "u1" / slug / "script" / "source.txt").exists()
+
+
+def test_create_project_rejects_both_script_and_topic(client):
+    register(client, "admin@example.com")
+    res = client.post(
+        "/api/projects",
+        json={"title": "Ambiguous", "script": "text", "topic": "also a topic"},
+    )
+    assert res.status_code == 422
+
+
+def test_create_project_rejects_neither_script_nor_topic(client):
+    register(client, "admin@example.com")
+    res = client.post("/api/projects", json={"title": "Empty"})
+    assert res.status_code == 422
+
+
+def test_create_project_clamps_length_minutes(client, pipeline_stub, saas_env):
+    register(client, "admin@example.com")
+    res = client.post(
+        "/api/projects",
+        json={"title": "Too Long", "topic": "a topic", "lengthMinutes": 999},
+    )
+    assert res.status_code == 201, res.text
+
+    from renderflow import db as rdb
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).one()
+        length_index = job.argv.index("--length") + 1
+        assert float(job.argv[length_index]) == 15.0
+
+
 def test_project_with_active_job_rejects_further_runs(client):
     register(client, "admin@example.com")
     slug = _create_project(client)

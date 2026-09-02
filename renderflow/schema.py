@@ -125,6 +125,13 @@ class ScenePlan(BaseModel):
     scenes: list[Scene]
     # Project-level clickbait thumbnail image (generated after scene assets).
     thumbnail: AssetRef = Field(default_factory=AssetRef)
+    # Narrated intro/outro card audio (added 2026-09) — the same TTS voice
+    # as the rest of the video reads the title (intro) and a "thanks for
+    # watching, subscribe" line (outro). Optional exactly like b-roll: a
+    # PENDING/no-path ref (disabled, or generation failed) just means
+    # render.py's cards stay silent, their original behavior.
+    intro_audio: AssetRef = Field(default_factory=AssetRef)
+    outro_audio: AssetRef = Field(default_factory=AssetRef)
     # Background-music track filename (relative to RENDERFLOW_MUSIC_DIR),
     # chosen randomly at first render and persisted so re-renders keep the
     # same track. None = not chosen yet or music disabled.
@@ -132,7 +139,7 @@ class ScenePlan(BaseModel):
 
     def total_asset_cost(self) -> float:
         total = 0.0
-        refs = [self.thumbnail]
+        refs = [self.thumbnail, self.intro_audio, self.outro_audio]
         for scene in self.scenes:
             refs += [
                 scene.assets.image,

@@ -27,6 +27,13 @@ AVATAR_W = 768
 VISUAL_W = WIDTH - AVATAR_W
 # Upscale before zoompan so sub-pixel motion doesn't jitter.
 PRESCALE_W, PRESCALE_H = 2560, 1440
+# Title cards need a much bigger prescale than photos: zoompan rounds its
+# x/y position to whole pixels every frame, and that rounding error reads
+# as a visible shake on crisp text edges even though it's imperceptible on
+# a photo (client-reported: "the texts... shaky"). 4x the output resolution
+# (vs. photos' ~1.3x) makes each rounding step a quarter-pixel at the final
+# scale — small enough to disappear. Lanczos keeps the upscaled text sharp.
+CARD_PRESCALE_W, CARD_PRESCALE_H = 7680, 4320
 # Gap between the caption image's bottom edge and the frame's bottom edge.
 CAPTION_MARGIN = 34
 # Silent beat appended to the end of every scene clip, so narration never
@@ -490,30 +497,53 @@ def _pick_music_track(plan: ScenePlan, paths: ProjectPaths) -> Path | None:
     return track
 
 
-def _render_card_clip(png: Path, duration: float, out: Path) -> Path:
-    """A title card as a scene-shaped clip: slow zoom, silent stereo audio
-    (the music bed plays over it in the final mix), faded in/out."""
+def _render_card_clip(
+    png: Path, duration: float, out: Path, audio_path: Path | None = None
+) -> Path:
+    """A title card as a scene-shaped clip: slow zoom, faded in/out.
+
+    `audio_path` (added 2026-09), when given, narrates the card with that
+    file instead of the original silent `anullsrc` track — loudness-matched
+    to scene narration so intro/outro don't jump in volume, and it becomes
+    the sidechain key that ducks the music bed under it too (render_video's
+    ducking keys off the final concatenated `[a]`, so this needs no change
+    there). No `audio_path` keeps the exact original silent-card behavior.
+    """
     frames = math.ceil(duration * FPS)
     filter_complex = (
-        f"[0:v]scale={PRESCALE_W}:{PRESCALE_H},"
+        f"[0:v]scale={CARD_PRESCALE_W}:{CARD_PRESCALE_H}:flags=lanczos,"
         f"zoompan=z='1+0.04*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
         f"d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS},format=yuv420p[card]"
     )
     filter_complex, final_label = _apply_fade(filter_complex, "card", duration)
+    if audio_path is not None:
+        audio_input = ["-i", str(audio_path)]
+        audio_filter = ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
+    else:
+        audio_input = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+        audio_filter = []
     _run(
         [
             "ffmpeg", "-y",
             "-loop", "1", "-i", str(png),
-            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            *audio_input,
             "-filter_complex", filter_complex,
             "-map", f"[{final_label}]", "-map", "1:a",
             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+            *audio_filter,
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-t", f"{duration:.3f}",
             str(out),
         ]
     )
     return out
+
+
+def _card_audio(ref, paths: ProjectPaths) -> Path | None:
+    if ref.status is not AssetStatus.COMPLETED or not ref.path:
+        return None
+    path = Path(ref.path)
+    return path if path.exists() else None
 
 
 def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], list[Path]]:
@@ -531,8 +561,20 @@ def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], l
         outro_png = branding.build_outro_card(
             settings.channel_name, paths.output / "outro_card.png"
         )
-        intro = _render_card_clip(intro_png, INTRO_SEC, paths.output / "intro.mp4")
-        outro = _render_card_clip(outro_png, OUTRO_SEC, paths.output / "outro.mp4")
+        # Narration (assets.generate_branding_audio) is optional — a PENDING/
+        # missing ref just means a silent card, exactly like before that
+        # feature existed. When present, the card holds at least as long as
+        # the voiceover (plus a small pad) so it's never cut off mid-line.
+        intro_audio = _card_audio(plan.intro_audio, paths)
+        outro_audio = _card_audio(plan.outro_audio, paths)
+        intro_duration = max(INTRO_SEC, probe_duration(intro_audio) + 0.4) if intro_audio else INTRO_SEC
+        outro_duration = max(OUTRO_SEC, probe_duration(outro_audio) + 0.4) if outro_audio else OUTRO_SEC
+        intro = _render_card_clip(
+            intro_png, intro_duration, paths.output / "intro.mp4", audio_path=intro_audio
+        )
+        outro = _render_card_clip(
+            outro_png, outro_duration, paths.output / "outro.mp4", audio_path=outro_audio
+        )
         return [intro], [outro]
     except Exception as exc:  # pillow/font hiccup — skip cards, keep the video
         log.warning("intro/outro cards skipped: %s", exc)

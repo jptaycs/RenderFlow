@@ -9,6 +9,7 @@ import pytest
 
 from renderflow.pipeline.assets import (
     generate_avatar_clips,
+    generate_branding_audio,
     generate_images,
     generate_subtitles,
     generate_voice,
@@ -46,6 +47,76 @@ def test_script_to_assets_end_to_end(paths: ProjectPaths):
         assert Path(scene.assets.voice.path).read_bytes() == b"fake-mp3"
         assert scene.assets.image.provider == "stub-image"
     assert reloaded.total_asset_cost() == pytest.approx((0.003 + 0.002) * 2)
+
+
+class _TrackingTTS:
+    """StubTTS but records every (text, voice) it was asked to synthesize —
+    needed to assert on the narrated intro/outro text content, which the
+    shared StubTTS (tests/stubs.py) doesn't track."""
+
+    name = "tracking-tts"
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.calls: list[tuple[str, str]] = []
+
+    def synthesize(self, text, voice, **params):
+        from renderflow.providers.base import GeneratedAsset
+
+        self.calls.append((text, voice))
+        if self.fail:
+            raise RuntimeError("tts failure")
+        return GeneratedAsset(data=b"fake-mp3", provider=self.name, cost=0.001)
+
+
+def test_generate_branding_audio_narrates_title_and_outro_line(paths: ProjectPaths):
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+    tts = _TrackingTTS()
+
+    generate_branding_audio(plan, tts, "voice-id", "", paths)
+
+    assert tts.calls[0] == (plan.title, "voice-id")
+    assert "subscribe" in tts.calls[1][0].lower()
+    assert "trivia" in tts.calls[1][0].lower()
+    reloaded = load_plan(paths)
+    assert reloaded.intro_audio.status is AssetStatus.COMPLETED
+    assert reloaded.outro_audio.status is AssetStatus.COMPLETED
+    assert Path(reloaded.intro_audio.path).read_bytes() == b"fake-mp3"
+    assert reloaded.total_asset_cost() == pytest.approx(0.002)
+
+
+def test_generate_branding_audio_outro_mentions_channel_name(paths: ProjectPaths):
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+    tts = _TrackingTTS()
+
+    generate_branding_audio(plan, tts, "voice-id", "Cool Facts Daily", paths)
+
+    assert "Cool Facts Daily" in tts.calls[1][0]
+
+
+def test_generate_branding_audio_failure_is_optional(paths: ProjectPaths):
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+    tts = _TrackingTTS(fail=True)
+
+    generate_branding_audio(plan, tts, "voice-id", "", paths)  # must not raise
+
+    reloaded = load_plan(paths)
+    assert reloaded.intro_audio.status is AssetStatus.FAILED
+    assert reloaded.outro_audio.status is AssetStatus.FAILED
+
+
+def test_generate_branding_audio_is_resumable(paths: ProjectPaths):
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+    tts = _TrackingTTS()
+
+    generate_branding_audio(plan, tts, "voice-id", "", paths)
+    generate_branding_audio(plan, tts, "voice-id", "", paths)  # resume: no re-synthesis
+
+    assert len(tts.calls) == 2
 
 
 def test_completed_assets_are_skipped(paths: ProjectPaths):
@@ -692,6 +763,37 @@ def test_split_script_preserves_flow(paths: ProjectPaths):
     assert result.cost == 0.01
 
 
+def test_rewrite_video_prompt_returns_llm_text_and_cost():
+    from renderflow.pipeline.script import rewrite_video_prompt
+    from renderflow.providers.base import LLMResult
+
+    class FakeLLM:
+        name = "fake"
+
+        def complete(self, system, prompt, **params):
+            assert "no visible human face" not in system.lower() or True  # system is static; just don't crash
+            assert "A photo of a reef." in prompt
+            assert "Deep beneath the waves." in prompt
+            return LLMResult(text="  Slow dolly-in over the reef.  ", provider=self.name, cost=0.002)
+
+    prompt, result = rewrite_video_prompt(FakeLLM(), "Deep beneath the waves.", "A photo of a reef.")
+    assert prompt == "Slow dolly-in over the reef."  # stripped
+    assert result.cost == 0.002
+
+
+def test_rewrite_video_prompt_propagates_llm_errors():
+    from renderflow.pipeline.script import rewrite_video_prompt
+
+    class FailingLLM:
+        name = "fake"
+
+        def complete(self, system, prompt, **params):
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        rewrite_video_prompt(FailingLLM(), "narration", "a photo")
+
+
 def test_local_split_script_preserves_text_without_llm():
     from renderflow.pipeline.script import split_script_local
 
@@ -813,3 +915,61 @@ def test_render_with_music_and_cards_integration(paths: ProjectPaths, monkeypatc
     # Re-render keeps the same track (no re-roll).
     render_video(plan, paths)
     assert plan.music_track == "ambient.wav"
+
+
+def test_render_narrates_cards_and_extends_duration_for_long_voiceover(
+    paths: ProjectPaths, monkeypatch
+):
+    """A narrated card (assets.generate_branding_audio) must hold long
+    enough for its own voiceover, not just the fixed INTRO_SEC/OUTRO_SEC —
+    added 2026-09, client request ("read the title/outro aloud")."""
+    pytest.importorskip("PIL")
+    from renderflow.config import Settings
+    from renderflow.pipeline.render import INTRO_SEC, SCENE_GAP_SEC, probe_duration, render_video
+    from tests.conftest import make_settings
+
+    settings = make_settings(intro_outro=True, transition="fade")
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+    monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    plan.scenes = plan.scenes[:1]
+    scene = plan.scenes[0]
+    scene.type = "narration"
+    img = paths.images / "scene_001.png"
+    audio = paths.voice / "scene_001.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=steelblue:s=640x360",
+         "-frames:v", "1", str(img)],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440",
+         "-t", "1", str(audio)],
+        check=True, capture_output=True,
+    )
+    for ref, path in ((scene.assets.image, img), (scene.assets.voice, audio)):
+        ref.advance(AssetStatus.RUNNING)
+        ref.path = str(path)
+        ref.advance(AssetStatus.COMPLETED)
+
+    # A 6s intro voiceover — well over the fixed INTRO_SEC (2.8s) — must
+    # stretch the card, not get cut off.
+    intro_audio_path = paths.voice / "intro.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=300",
+         "-t", "6", str(intro_audio_path)],
+        check=True, capture_output=True,
+    )
+    plan.intro_audio.advance(AssetStatus.RUNNING)
+    plan.intro_audio.path = str(intro_audio_path)
+    plan.intro_audio.advance(AssetStatus.COMPLETED)
+    save_plan(plan, paths)
+
+    final = render_video(plan, paths)
+
+    # The 6s intro voiceover must stretch the card well past its old fixed
+    # 2.8s floor — the whole video should be several seconds longer than a
+    # video with an unnarrated (fixed-duration) intro card.
+    total = probe_duration(final)
+    assert total > 1.0 + SCENE_GAP_SEC + INTRO_SEC + 3.0

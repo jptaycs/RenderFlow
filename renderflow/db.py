@@ -119,7 +119,14 @@ def configure(engine: Engine) -> None:
 
 def get_engine() -> Engine:
     if _engine is None:
-        configure(create_engine(Settings.load().database_url))
+        url = Settings.load().database_url
+        # A file-based (non-Postgres) DATABASE_URL is a dev/small-deployment
+        # path — FastAPI's threadpool for sync routes, plus eager-mode
+        # Celery, can hand a session's connection across threads, which
+        # sqlite3 refuses by default. Harmless for Postgres, so only set it
+        # for sqlite URLs. Tests bypass this entirely via configure().
+        connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+        configure(create_engine(url, connect_args=connect_args))
     return _engine
 
 

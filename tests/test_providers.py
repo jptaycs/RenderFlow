@@ -86,3 +86,30 @@ def test_claude_cost_calculation():
 
 def test_unknown_model_cost_is_none():
     assert compute_cost("some-future-model", 1000, 1000) is None
+
+
+def test_closed_schema_sets_additional_properties_false_recursively():
+    from renderflow.providers.llm.claude import _closed_schema
+    from renderflow.schema import GeneratedScript
+
+    schema = GeneratedScript.model_json_schema()
+    # AvatarSpec (shared with the real Scene schema) doesn't set extra=
+    # "forbid", so it's missing additionalProperties before the fix —
+    # confirm the fixture actually exercises the bug, not a no-op.
+    assert "additionalProperties" not in schema["$defs"]["AvatarSpec"]
+
+    closed = _closed_schema(schema)
+
+    def assert_all_objects_closed(node):
+        if isinstance(node, dict):
+            if node.get("type") == "object":
+                assert node.get("additionalProperties") is False
+            for value in node.values():
+                assert_all_objects_closed(value)
+        elif isinstance(node, list):
+            for item in node:
+                assert_all_objects_closed(item)
+
+    assert_all_objects_closed(closed)
+    # Original schema (and its nested dicts) must be untouched.
+    assert "additionalProperties" not in schema["$defs"]["AvatarSpec"]

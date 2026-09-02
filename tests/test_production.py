@@ -57,6 +57,14 @@ def test_startup_refuses_production_with_dev_checkout(saas_env, monkeypatch):
         api.startup()
 
 
+def test_startup_refuses_production_with_celery_eager(saas_env, monkeypatch):
+    from renderflow import api
+
+    _patch_settings(monkeypatch, _production_settings(saas_env, celery_eager=True))
+    with pytest.raises(RuntimeError, match="CELERY_EAGER"):
+        api.startup()
+
+
 def test_startup_refuses_production_with_default_db_password(saas_env, monkeypatch):
     from renderflow import api
 

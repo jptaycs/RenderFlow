@@ -57,6 +57,13 @@ app.include_router(auth_router)
 app.include_router(billing_router)
 
 
+def _created_label(dt: datetime) -> str:
+    # "%-d" (no leading zero) is a glibc/macOS strftime extension only —
+    # Windows' C runtime raises ValueError on it. `.day` is a plain int on
+    # every platform, so build the label without relying on the extension.
+    return f"{dt:%b} {dt.day}"
+
+
 def _projects_dir() -> Path:
     return Settings.load().projects_dir
 
@@ -285,9 +292,9 @@ def _project_view(
         "cost": cost,
         "costByCategory": cost_by_category,
         "estDurationSec": est_sec,
-        "createdLabel": datetime.fromtimestamp(
-            paths.scenes_json.stat().st_mtime
-        ).strftime("%b %-d"),
+        "createdLabel": _created_label(
+            datetime.fromtimestamp(paths.scenes_json.stat().st_mtime)
+        ),
         "stages": stages,
         "scenes": scenes,
         "videoUrl": _file_url(paths, slug, paths.output / "final.mp4")
@@ -376,7 +383,7 @@ def _placeholder_view(session: Session, project: Project) -> dict[str, Any]:
         "cost": 0.0,
         "costByCategory": {"Images": 0.0, "Voice": 0.0, "Avatar": 0.0},
         "estDurationSec": 0,
-        "createdLabel": datetime.fromtimestamp(project.created_at).strftime("%b %-d"),
+        "createdLabel": _created_label(datetime.fromtimestamp(project.created_at)),
         "stages": [
             {"name": "Script", "status": "active" if running else "pending"},
             {"name": "Scenes", "status": "pending"},
@@ -426,7 +433,14 @@ def get_state(
 
 class NewProject(BaseModel):
     title: str
-    script: str
+    # Exactly one of these: a client-provided script (split locally into
+    # scenes) or a bare topic (Claude writes the full narration + scene
+    # plan from scratch via pipeline/script.py::generate_script — needs a
+    # live ANTHROPIC_API_KEY). lengthMinutes only applies to topic mode;
+    # script mode's length is however long the pasted script naturally is.
+    script: str | None = None
+    topic: str | None = None
+    lengthMinutes: float = 3.0
     style: str = "documentary"
 
 
@@ -437,11 +451,15 @@ def create_project(
     session: Session = Depends(get_db),
 ) -> dict[str, str]:
     title = " ".join(body.title.split())
-    script = body.script.strip()
+    script = (body.script or "").strip()
+    topic = (body.topic or "").strip()
     if not title:
         raise HTTPException(422, "title must not be empty")
-    if not script:
-        raise HTTPException(422, "script must not be empty")
+    if bool(script) == bool(topic):
+        raise HTTPException(422, "provide exactly one of script or topic")
+    # Generous but bounded — this drives an LLM call and a whole asset
+    # generation batch, not just a config knob.
+    length_minutes = min(max(body.lengthMinutes, 1.0), 15.0)
 
     # Paywall: trial credits first, then an active subscription's monthly
     # allowance; admins unlimited. 402 tells the frontend to open pricing.
@@ -482,9 +500,20 @@ def create_project(
     # derived from the project count; nothing to write for it). Same
     # transaction as the project row — a failed create can't burn a credit.
     consume_credit(session, user)
-    source = paths.script / "source.txt"
-    source.write_text(script)
     save_performance(ProjectPerformance(created_at=time.time()), paths)
+    if topic:
+        # No file needed — --topic is a plain CLI value, unlike
+        # --script-file. Saved alongside script/scenes.json purely for
+        # provenance/debugging (never read back by the pipeline).
+        (paths.script / "topic.txt").write_text(topic)
+        source_args = [
+            "--topic", topic,
+            "--length", str(length_minutes),
+        ]
+    else:
+        source = paths.script / "source.txt"
+        source.write_text(script)
+        source_args = ["--script-file", str(source)]
     # --skip-render: stop after assets so the project lands on "Paused" —
     # the user gets a chance to regenerate scenes or change avatar layouts
     # (now all split-screen by default, see scene_is_avatar_solo) before
@@ -496,7 +525,7 @@ def create_project(
         session,
         project,
         "create",
-        ["--script-file", str(source), "--style", body.style, "--title", title, "--skip-render"],
+        [*source_args, "--style", body.style, "--title", title, "--skip-render"],
     )
     return {"slug": slug}
 
@@ -852,6 +881,11 @@ def startup() -> None:
             raise RuntimeError(
                 "RENDERFLOW_DEV_CHECKOUT must not be set in production — "
                 "it activates subscriptions without payment"
+            )
+        if settings.celery_eager:
+            raise RuntimeError(
+                "RENDERFLOW_CELERY_EAGER must not be set in production — it "
+                "runs the pipeline synchronously inside the request handler"
             )
         if "renderflow:renderflow@" in settings.database_url:
             raise RuntimeError(

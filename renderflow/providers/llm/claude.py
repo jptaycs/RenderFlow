@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 
@@ -11,6 +12,37 @@ from renderflow.providers.base import LLMResult
 from renderflow.retry import retryable
 
 log = logging.getLogger("renderflow.providers.claude")
+
+
+def _closed_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Recursively set `additionalProperties: false` on every object node.
+
+    Anthropic's structured-output `output_config.format` requires this on
+    EVERY object-typed node or the request 400s with "For 'object' type,
+    'additionalProperties' must be explicitly set to false" — hit live
+    2026-09 via GeneratedScript's schema. Pydantic's model_json_schema()
+    only emits it for models with `model_config = ConfigDict(extra=
+    "forbid")`; most of the Generated* models have that, but AvatarSpec
+    (shared with the real, non-generation Scene schema, which has no
+    reason to forbid extra fields) doesn't, and any future nested model
+    could just as easily forget it. Patching the schema dict here — the
+    provider adapter, per the "fix response-shape problems in the
+    adapter" rule — is more robust than chasing this down per-model.
+    """
+    schema = copy.deepcopy(schema)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "object" and "additionalProperties" not in node:
+                node["additionalProperties"] = False
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(schema)
+    return schema
 
 # (input, output) USD per 1M tokens
 MODEL_PRICING: dict[str, tuple[float, float]] = {
@@ -53,7 +85,7 @@ class ClaudeLLM:
         kwargs: dict[str, Any] = {}
         if json_schema is not None:
             kwargs["output_config"] = {
-                "format": {"type": "json_schema", "schema": json_schema}
+                "format": {"type": "json_schema", "schema": _closed_schema(json_schema)}
             }
         response = self.client.messages.create(
             model=self.model,
