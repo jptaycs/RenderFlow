@@ -38,6 +38,7 @@ def make_settings(**overrides) -> Settings:
         thumbnail_reaction_provider="",
         tts_provider="kokoro",
         avatar_provider="ffmpeg-still",
+        local_avatar_enabled=True,
         llm_model="test",
         tts_voice="test",
         tts_length_scale=1.4,

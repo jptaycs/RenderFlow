@@ -855,6 +855,22 @@ def test_local_split_script_preserves_text_without_llm():
     assert plan.scenes[0].avatar is not None
 
 
+def test_local_split_script_avatar_disabled_stays_narration_only():
+    # RENDERFLOW_LOCAL_AVATAR=0 (Settings.local_avatar_enabled=False) — the
+    # script-mode local splitter is the only script path that always forced
+    # an avatar; this restores the plain narration look (image/broll +
+    # voice, no host) that topic-mode generation already produces by
+    # default when the LLM doesn't add one.
+    from renderflow.pipeline.script import split_script_local
+
+    script = "This scene should have no avatar at all when the flag is off."
+
+    plan, _ = split_script_local(script, "documentary", avatar_enabled=False)
+
+    assert all(scene.type == "narration" for scene in plan.scenes)
+    assert all(scene.avatar is None for scene in plan.scenes)
+
+
 def test_local_split_script_paces_five_second_scenes():
     from renderflow.pipeline.script import split_script_local
 

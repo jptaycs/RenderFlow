@@ -32,6 +32,13 @@ class Settings:
     thumbnail_reaction_provider: str
     tts_provider: str
     avatar_provider: str
+    # Whether pipeline/script.py::split_script_local puts every scene on
+    # camera as a talking avatar (default, matches the documented "host
+    # speaks in every scene" behavior) or leaves scenes as plain narration
+    # (image/broll + voice, no host) — the local splitter is the only
+    # script path that always forced an avatar; topic-mode generation lets
+    # Claude decide per scene. Off restores the narration-only look.
+    local_avatar_enabled: bool
     llm_model: str
     tts_voice: str
     tts_length_scale: float
@@ -110,6 +117,8 @@ class Settings:
             ),
             tts_provider=os.getenv("RENDERFLOW_TTS_PROVIDER", "elevenlabs"),
             avatar_provider=os.getenv("RENDERFLOW_AVATAR_PROVIDER", "ffmpeg-still"),
+            local_avatar_enabled=os.getenv("RENDERFLOW_LOCAL_AVATAR", "1").lower()
+            in ("1", "true", "yes"),
             llm_model=os.getenv("RENDERFLOW_LLM_MODEL", "claude-opus-4-8"),
             tts_voice=os.getenv("RENDERFLOW_TTS_VOICE", "21m00Tcm4TlvDq8ikWAM"),
             tts_length_scale=float(os.getenv("RENDERFLOW_TTS_LENGTH_SCALE", "1.4")),

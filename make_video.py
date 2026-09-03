@@ -226,7 +226,8 @@ def main() -> int:
                 f"{args.script_file} into scenes"
             )
             plan, script_result = split_script_local(
-                script_text, args.style, topic_hint=args.title
+                script_text, args.style, topic_hint=args.title,
+                avatar_enabled=settings.local_avatar_enabled,
             )
         script_cost = script_result.cost or 0.0
     else:

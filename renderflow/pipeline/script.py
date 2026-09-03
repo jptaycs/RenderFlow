@@ -264,7 +264,8 @@ def rewrite_video_prompt(
 
 
 def split_script_local(
-    script_text: str, style: str, topic_hint: str | None = None
+    script_text: str, style: str, topic_hint: str | None = None,
+    avatar_enabled: bool = True,
 ) -> tuple[ScenePlan, LLMResult]:
     """Split a client-provided script into scenes without any external LLM call.
 
@@ -275,6 +276,18 @@ def split_script_local(
     applied to plan.title only *after* this function returns (make_video.py),
     so without it every image prompt would be anchored to the inferred
     8-word title instead of the actual one.
+
+    `avatar_enabled` (Settings.local_avatar_enabled, RENDERFLOW_LOCAL_AVATAR,
+    default on) controls whether every scene gets the hardcoded LOCAL_AVATAR
+    persona as a talking_avatar scene, or stays plain narration (image/broll
+    + voice only, no host on camera) — added 2026-09 because this path
+    (script-mode create, e.g. the dashboard's "Random topic" button) was
+    the only one that *always* forced an avatar: topic-mode generation
+    (generate_script) lets Claude decide per scene and defaults to
+    narration, so a script pasted/generated without --llm-split was the
+    odd one out, producing a generic-avatar video that looked nothing like
+    a topic-mode one from the same providers. Off restores that
+    narration-only look end to end with zero other provider changes.
     """
     cleaned = _strip_script_markup(script_text)
     chunks = _chunk_sentences(_sentences(cleaned))
@@ -284,7 +297,7 @@ def split_script_local(
     scenes = [
         Scene(
             id=index,
-            type="talking_avatar" if _uses_local_avatar(index) else "narration",
+            type="talking_avatar" if avatar_enabled and _uses_local_avatar(index) else "narration",
             duration_estimate_sec=max(2.0, len(chunk.split()) / 2.5),
             narration=chunk,
             image_prompt=_local_image_prompt(chunk, style, topic),
@@ -295,7 +308,7 @@ def split_script_local(
                 "cartoon, illustration, painting, 3d render, CGI, plastic skin, "
                 "oversaturated colors, deformed hands, low quality, blurry"
             ),
-            avatar=LOCAL_AVATAR if _uses_local_avatar(index) else None,
+            avatar=LOCAL_AVATAR if avatar_enabled and _uses_local_avatar(index) else None,
             motion=Motion(
                 effect=motions[(index - 1) % len(motions)],
                 intensity=0.08 + (0.01 * ((index - 1) % 4)),
@@ -315,8 +328,9 @@ def split_script_local(
 
 
 def _uses_local_avatar(scene_index: int) -> bool:
-    # The host speaks in every scene — solo or split-screen (see
-    # scene_is_avatar_solo), the presenter is always on camera.
+    # The host speaks in every scene that has one at all — solo or
+    # split-screen (see scene_is_avatar_solo). Whether a scene has one at
+    # all is `avatar_enabled` at the split_script_local call site.
     return True
 
 
