@@ -504,6 +504,88 @@ def test_render_integration(paths: ProjectPaths, monkeypatch):
     assert stream_types == {"audio", "video"}
 
 
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_render_shorts_produces_vertical_video_and_thumbnail(paths: ProjectPaths, monkeypatch):
+    """plan.format == "shorts" renders at 1080x1920 (not 1920x1080), skips
+    intro/outro cards (no AI-generated thumbnail path exists for shorts —
+    render_shorts_thumbnail grabs a frame from the final video instead),
+    and a split-screen-eligible talking-avatar scene falls back to
+    full-screen solo (no room for a side-by-side panel in a 9:16 frame)."""
+    pytest.importorskip("PIL")
+    from renderflow.config import Settings
+    from renderflow.pipeline.render import (
+        SHORTS_HEIGHT,
+        SHORTS_WIDTH,
+        probe_duration,
+        render_shorts_thumbnail,
+        render_video,
+    )
+    from tests.conftest import make_settings
+
+    settings = make_settings(
+        intro_outro=False, music_dir=paths.root / "no-music", transition="fade"
+    )
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+    monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    plan.format = "shorts"
+    # Left as "auto" (never overridden to solo) — proves the portrait-frame
+    # fallback in render_scene_clip is unconditional, not dependent on the
+    # scene's own avatar_layout choice.
+    plan.scenes[0].type = "talking_avatar"
+
+    for scene in plan.scenes:
+        img = paths.images / f"scene_{scene.id:03d}.png"
+        audio = paths.voice / f"scene_{scene.id:03d}.mp3"
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=steelblue:s=640x360",
+             "-frames:v", "1", str(img)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440",
+             "-t", "1", str(audio)],
+            check=True, capture_output=True,
+        )
+        for ref, path in ((scene.assets.image, img), (scene.assets.voice, audio)):
+            ref.advance(AssetStatus.RUNNING)
+            ref.path = str(path)
+            ref.advance(AssetStatus.COMPLETED)
+        if scene.type == "talking_avatar":
+            avatar_clip = paths.avatar / f"scene_{scene.id:03d}.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi", "-i", "color=c=darkred:s=640x360",
+                    "-f", "lavfi", "-i", "sine=frequency=220",
+                    "-t", "1", str(avatar_clip),
+                ],
+                check=True, capture_output=True,
+            )
+            scene.assets.avatar_clip.advance(AssetStatus.RUNNING)
+            scene.assets.avatar_clip.path = str(avatar_clip)
+            scene.assets.avatar_clip.advance(AssetStatus.COMPLETED)
+
+    final = render_video(plan, paths)
+    assert final.exists()
+    assert probe_duration(final) == pytest.approx(2.0, abs=1.0)
+
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(final)],
+        check=True, capture_output=True, text=True,
+    )
+    w, h = (int(x) for x in probe.stdout.strip().split(","))
+    assert (w, h) == (SHORTS_WIDTH, SHORTS_HEIGHT)
+
+    assert not (paths.output / "intro.mp4").exists()
+    assert not (paths.output / "outro.mp4").exists()
+
+    thumb = render_shorts_thumbnail(final, paths)
+    assert thumb is not None and thumb.exists()
+    assert thumb == paths.output / "thumbnail.jpg"
+
+
 def test_build_caption_chunks_covers_full_duration_in_order():
     from renderflow.pipeline.subtitles import build_chunks
 

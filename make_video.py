@@ -37,7 +37,7 @@ from renderflow.pipeline.assets import (
     generate_thumbnail,
     generate_voice,
 )
-from renderflow.pipeline.render import render_thumbnail, render_video
+from renderflow.pipeline.render import render_shorts_thumbnail, render_thumbnail, render_video
 from renderflow.pipeline.script import (
     generate_script,
     scene_is_avatar_solo,
@@ -187,6 +187,17 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--format",
+        choices=["landscape", "shorts"],
+        help=(
+            "landscape (default): 1920x1080, full pipeline (cards, "
+            "thumbnail, captions). shorts: 1080x1920 vertical for YouTube "
+            "Shorts — v1 scope skips cards/captions/AI thumbnail (see "
+            "CLAUDE.md); a --scenes-file already carrying a format is left "
+            "alone unless this flag overrides it, same as --title"
+        ),
+    )
+    parser.add_argument(
         "--thumbnail-only",
         action="store_true",
         help=(
@@ -238,6 +249,8 @@ def main() -> int:
 
     if args.title:
         plan.title = args.title
+    if args.format:
+        plan.format = args.format
 
     projects_dir = args.projects_dir or settings.projects_dir
     paths = ProjectPaths.create(projects_dir, args.slug or slugify(plan.title))
@@ -276,7 +289,13 @@ def main() -> int:
         tts_params["sentence_pause_sec"] = settings.tts_sentence_pause
     generate_voice(plan, tts, settings.tts_voice, paths, **tts_params)
 
-    if settings.intro_outro:
+    # Shorts v1 scope skips cards, captions, and the AI clickbait thumbnail
+    # entirely (see render.py's format-gating notes and CLAUDE.md) — no
+    # point spending provider calls generating assets that render_video/
+    # render_shorts_thumbnail will never use.
+    is_shorts = plan.format == "shorts"
+
+    if settings.intro_outro and not is_shorts:
         print("      Narrating intro/outro cards")
         generate_branding_audio(
             plan, tts, settings.tts_voice, settings.channel_name, paths, **tts_params
@@ -291,13 +310,14 @@ def main() -> int:
     else:
         render_step = "[4/4]"
 
-    if settings.subtitles_enabled:
+    if settings.subtitles_enabled and not is_shorts:
         print("      Generating scene captions")
         generate_subtitles(plan, paths)
 
-    thumb_bg, thumb_reaction = _thumbnail_image_providers(settings, image)
-    generate_thumbnail(plan, thumb_bg, paths, reaction_provider=thumb_reaction)
-    render_thumbnail(plan, paths, avatar_image=avatar_image)
+    if not is_shorts:
+        thumb_bg, thumb_reaction = _thumbnail_image_providers(settings, image)
+        generate_thumbnail(plan, thumb_bg, paths, reaction_provider=thumb_reaction)
+        render_thumbnail(plan, paths, avatar_image=avatar_image)
 
     missing = _incomplete_scenes(plan)
     if missing:
@@ -328,6 +348,8 @@ def main() -> int:
 
     print(f"{render_step} Rendering with FFmpeg")
     final = render_video(plan, paths)
+    if is_shorts:
+        render_shorts_thumbnail(final, paths)
 
     print(f"\nDone: {final}")
     print(f"Total cost: ${total:.4f} (script ${script_cost:.4f})")

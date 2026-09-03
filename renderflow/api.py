@@ -20,7 +20,7 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -301,6 +301,7 @@ def _project_view(
         "slug": slug,
         "title": plan.title,
         "style": plan.style,
+        "format": plan.format,
         "status": status,
         "progress": progress,
         "cost": cost,
@@ -401,10 +402,18 @@ def _placeholder_view(session: Session, project: Project) -> dict[str, Any]:
         status = "Failed"
     else:
         status = "Draft"
+    # scenes.json doesn't exist yet, so plan.format isn't available — read
+    # it back from the create job's own argv instead, so the dashboard's
+    # Shorts/Landscape tab filter has something to go on immediately after
+    # Create, not just once assets finish generating.
+    fmt = "landscape"
+    if latest is not None and "--format" in latest.argv:
+        fmt = latest.argv[latest.argv.index("--format") + 1]
     return {
         "slug": project.slug,
         "title": project.title,
         "style": "",
+        "format": fmt,
         "status": status,
         "progress": 0,
         "cost": 0.0,
@@ -524,6 +533,9 @@ class NewProject(BaseModel):
     topic: str | None = None
     lengthMinutes: float = 3.0
     style: str = "documentary"
+    # "landscape" (default) or "shorts" — see schema.VideoFormat and
+    # render.py's format-gating notes for what "shorts" skips (v1 scope).
+    format: Literal["landscape", "shorts"] = "landscape"
 
 
 @app.post("/api/projects", status_code=201)
@@ -540,8 +552,12 @@ def create_project(
     if bool(script) == bool(topic):
         raise HTTPException(422, "provide exactly one of script or topic")
     # Generous but bounded — this drives an LLM call and a whole asset
-    # generation batch, not just a config knob.
-    length_minutes = min(max(body.lengthMinutes, 1.0), 15.0)
+    # generation batch, not just a config knob. Shorts always targets ~1
+    # minute regardless of what was submitted — YouTube Shorts tops out
+    # around 60s-3min, and the whole point is a short, punchy hook.
+    length_minutes = (
+        1.0 if body.format == "shorts" else min(max(body.lengthMinutes, 1.0), 15.0)
+    )
 
     # Paywall: trial credits first, then an active subscription's monthly
     # allowance; admins unlimited. 402 tells the frontend to open pricing.
@@ -607,7 +623,10 @@ def create_project(
         session,
         project,
         "create",
-        [*source_args, "--style", body.style, "--title", title, "--skip-render"],
+        [
+            *source_args, "--style", body.style, "--title", title,
+            "--format", body.format, "--skip-render",
+        ],
     )
     return {"slug": slug}
 

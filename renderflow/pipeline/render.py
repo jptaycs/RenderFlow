@@ -23,6 +23,17 @@ log = logging.getLogger("renderflow.pipeline.render")
 
 FPS = 30
 WIDTH, HEIGHT = 1920, 1080
+# YouTube Shorts (added 2026-09): vertical 9:16. Threaded through the
+# per-scene clip functions below as explicit width/height params (default
+# to WIDTH/HEIGHT, so every existing call site is unaffected) rather than
+# a second module-level WIDTH/HEIGHT pair — see _dims_for. Split-screen
+# avatar (side-by-side) has no room in a 9:16 frame, so any talking-avatar
+# scene renders full-screen solo instead when height > width (see
+# render_scene_clip) — a portrait-orientation check, not a shorts-specific
+# one, so it stays correct for any future non-landscape format. Cards,
+# thumbnail, and captions are skipped for shorts entirely (v1 scope, see
+# make_video.py's format gating) rather than taught to render vertically.
+SHORTS_WIDTH, SHORTS_HEIGHT = 1080, 1920
 AVATAR_W = 768
 VISUAL_W = WIDTH - AVATAR_W
 # Upscale before zoompan so sub-pixel motion doesn't jitter.
@@ -62,6 +73,23 @@ class RenderError(RuntimeError):
     pass
 
 
+def _dims_for(plan: ScenePlan) -> tuple[int, int]:
+    if plan.format == "shorts":
+        return SHORTS_WIDTH, SHORTS_HEIGHT
+    return WIDTH, HEIGHT
+
+
+def _prescale_for(width: int, height: int) -> tuple[int, int]:
+    """Upscale target for zoompan's pre-crop, at whichever dims are active.
+
+    Same ~1.33x factor as the landscape PRESCALE_W/H (2560x1440 over
+    1920x1080) — large enough that zoompan's per-frame pixel-rounding stays
+    sub-pixel-small (the "shaky text" bug class) at any output size.
+    """
+    factor = PRESCALE_W / WIDTH
+    return round(width * factor), round(height * factor)
+
+
 def _run(cmd: list[str]) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -86,7 +114,25 @@ def probe_duration(path: Path) -> float:
     return float(proc.stdout.strip())
 
 
-def _zoompan_expr(scene: Scene, frames: int) -> str:
+# Every filter chain below that ends a clip's video stream appends
+# `setsar=1` as its last step. Discovered adding Shorts (portrait 9:16):
+# scaling a landscape source into a portrait target with
+# force_original_aspect_ratio=increase needs a non-integer scale factor,
+# and ffmpeg compensates by embedding a near-1-but-not-exactly-1 SAR
+# (e.g. 40960:40959) to preserve the exact display aspect ratio — a
+# different filter chain (zoompan's multi-stage scale/crop vs. a plain
+# scale+crop) rounds to a *different* near-1 fraction for the same target
+# size. ffmpeg's concat filter requires every input's SAR to match
+# exactly, so concatenating a zoompan-path clip with a scale+crop-path
+# clip (e.g. one scene rendered avatar-solo, the next plain narration)
+# failed with "Input link parameters do not match the corresponding
+# output link parameters". Landscape (16:9) never hit this because
+# PRESCALE_W/H is an exact integer multiple of WIDTH/HEIGHT, so the scale
+# factor was always a clean whole number with no rounding to compensate
+# for. Forcing setsar=1 on every clip-ending filter chain sidesteps the
+# whole class of near-1 SAR mismatches regardless of the source/target
+# aspect ratio or which filter path produced the clip.
+def _zoompan_expr(scene: Scene, frames: int, width: int = WIDTH, height: int = HEIGHT) -> str:
     i = max(scene.motion.intensity, 0.02)
     center_x = "iw/2-(iw/zoom/2)"
     center_y = "ih/2-(ih/zoom/2)"
@@ -103,10 +149,11 @@ def _zoompan_expr(scene: Scene, frames: int) -> str:
             z = f"{1 + i}"
             x = f"(iw-iw/zoom)*on/{frames}"
             y = center_y
+    prescale_w, prescale_h = _prescale_for(width, height)
     return (
-        f"scale={PRESCALE_W}:{PRESCALE_H}:force_original_aspect_ratio=increase,"
-        f"crop={PRESCALE_W}:{PRESCALE_H},"
-        f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS}"
+        f"scale={prescale_w}:{prescale_h}:force_original_aspect_ratio=increase,"
+        f"crop={prescale_w}:{prescale_h},"
+        f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={width}x{height}:fps={FPS},setsar=1"
     )
 
 
@@ -181,7 +228,9 @@ def _apply_fade(filter_complex: str, label: str, duration: float) -> tuple[str, 
     return filter_complex, "vfade"
 
 
-def render_scene_clip(scene: Scene, out: Path) -> Path:
+def render_scene_clip(
+    scene: Scene, out: Path, width: int = WIDTH, height: int = HEIGHT
+) -> Path:
     # Visual-only (see scene_is_visual_only) always falls through to the
     # plain image+voice path below, even if an avatar clip happens to
     # already exist for this scene (a harmless leftover from before the
@@ -191,8 +240,14 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
         and not scene_is_visual_only(scene)
         and scene.assets.avatar_clip.path
     ):
-        if scene_is_avatar_solo(scene):
-            return render_avatar_full_clip(scene, Path(scene.assets.avatar_clip.path), out)
+        # A portrait frame has no room for the side-by-side split layout —
+        # render full-screen solo instead, regardless of the scene's own
+        # avatar_layout override. height > width, not a shorts-specific
+        # check, so this stays correct for any future non-landscape format.
+        if scene_is_avatar_solo(scene) or height > width:
+            return render_avatar_full_clip(
+                scene, Path(scene.assets.avatar_clip.path), out, width, height
+            )
         assert scene.assets.image.path
         return render_avatar_split_clip(
             scene, Path(scene.assets.avatar_clip.path), Path(scene.assets.image.path), out
@@ -218,15 +273,17 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
         and broll.path
         and Path(broll.path).exists()
     ):
-        return _render_broll_clip(scene, Path(broll.path), audio, duration, chunks, out)
+        return _render_broll_clip(
+            scene, Path(broll.path), audio, duration, chunks, out, width, height
+        )
 
     assert scene.assets.image.path
     image = Path(scene.assets.image.path)
 
-    visual = _parallax_visual(scene, WIDTH, HEIGHT, duration, out)
+    visual = _parallax_visual(scene, width, height, duration, out)
     if visual is not None:
         cap_label, cap_inputs, cap_filter = _caption_filter_chain("v0", chunks, 2)
-        filter_complex = f"[0:v]fps={FPS},format=yuv420p[v0]"
+        filter_complex = f"[0:v]fps={FPS},setsar=1,format=yuv420p[v0]"
         if cap_filter:
             filter_complex += ";" + cap_filter
         filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
@@ -250,7 +307,7 @@ def render_scene_clip(scene: Scene, out: Path) -> Path:
 
     frames = math.ceil(duration * FPS)
     cap_label, cap_inputs, cap_filter = _caption_filter_chain("base", chunks, 2)
-    filter_complex = f"[0:v]{_zoompan_expr(scene, frames)}[base]"
+    filter_complex = f"[0:v]{_zoompan_expr(scene, frames, width, height)}[base]"
     if cap_filter:
         filter_complex += ";" + cap_filter
     filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
@@ -279,6 +336,8 @@ def _render_broll_clip(
     duration: float,
     chunks: list[dict],
     out: Path,
+    width: int = WIDTH,
+    height: int = HEIGHT,
 ) -> Path:
     """Full-frame scene from a stock video clip instead of still+motion.
 
@@ -288,8 +347,8 @@ def _render_broll_clip(
     loop_args = ["-stream_loop", "-1"] if probe_duration(video) < duration else []
     cap_label, cap_inputs, cap_filter = _caption_filter_chain("v0", chunks, 2)
     filter_complex = (
-        f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={WIDTH}:{HEIGHT},fps={FPS},format=yuv420p[v0]"
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},fps={FPS},setsar=1,format=yuv420p[v0]"
     )
     if cap_filter:
         filter_complex += ";" + cap_filter
@@ -313,13 +372,17 @@ def _render_broll_clip(
     return out
 
 
-def render_avatar_full_clip(scene: Scene, avatar_clip: Path, out: Path) -> Path:
+def render_avatar_full_clip(
+    scene: Scene, avatar_clip: Path, out: Path, width: int = WIDTH, height: int = HEIGHT
+) -> Path:
     """Full-screen solo avatar shot — no background visual (see
-    scene_is_avatar_solo)."""
+    scene_is_avatar_solo). Also used for any talking-avatar scene in a
+    portrait render, regardless of its own layout override — see
+    render_scene_clip."""
     duration = probe_duration(avatar_clip) + SCENE_GAP_SEC
     filter_complex = (
-        f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={WIDTH}:{HEIGHT},fps={FPS},"
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},fps={FPS},setsar=1,"
         f"tpad=stop_mode=clone:stop_duration={SCENE_GAP_SEC:.3f},format=yuv420p[vbase]"
     )
     chunks = _subtitle_chunks(scene)
@@ -357,7 +420,7 @@ def render_avatar_split_clip(
     visual = _parallax_visual(scene, VISUAL_W, HEIGHT, duration, out)
     if visual is not None:
         right_input = ["-i", str(visual)]
-        right_filter = f"[1:v]fps={FPS},format=yuv420p[right];"
+        right_filter = f"[1:v]fps={FPS},setsar=1,format=yuv420p[right];"
     else:
         frames = math.ceil(duration * FPS)
         right_zoom = _zoompan_expr(scene, frames).replace(
@@ -368,7 +431,7 @@ def render_avatar_split_clip(
 
     filter_complex = (
         f"[0:v]scale={AVATAR_W}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={AVATAR_W}:{HEIGHT},fps={FPS},"
+        f"crop={AVATAR_W}:{HEIGHT},fps={FPS},setsar=1,"
         f"tpad=stop_mode=clone:stop_duration={SCENE_GAP_SEC:.3f},format=yuv420p[left];"
         + right_filter +
         "[left][right]hstack=inputs=2[vbase]"
@@ -569,7 +632,7 @@ def _render_card_clip(
     filter_complex = (
         f"[0:v]scale={CARD_PRESCALE_W}:{CARD_PRESCALE_H}:flags=lanczos,"
         f"zoompan=z='1+0.04*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-        f"d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS},format=yuv420p[card]"
+        f"d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS},setsar=1,format=yuv420p[card]"
     )
     filter_complex, final_label = _apply_fade(filter_complex, "card", duration)
     if audio_path is not None:
@@ -603,10 +666,13 @@ def _card_audio(ref, paths: ProjectPaths) -> Path | None:
 
 
 def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], list[Path]]:
-    """(intro clips, outro clips) — empty when RENDERFLOW_INTRO_OUTRO is off
-    or the cards fail to build (branding must never block a render)."""
+    """(intro clips, outro clips) — empty when RENDERFLOW_INTRO_OUTRO is off,
+    the format is "shorts" (v1 scope: cards render at landscape WIDTH/HEIGHT
+    only, see _render_card_clip — a proper vertical card is future work, not
+    yet needed since Shorts is meant to be short and hook-first anyway), or
+    the cards fail to build (branding must never block a render)."""
     settings = Settings.load()
-    if not settings.intro_outro:
+    if not settings.intro_outro or plan.format == "shorts":
         return [], []
     from renderflow.pipeline import branding
 
@@ -638,11 +704,12 @@ def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], l
 
 
 def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
+    width, height = _dims_for(plan)
     clips: list[Path] = []
     for scene in plan.scenes:
         clip = paths.output / f"clip_{scene.id:03d}.mp4"
         log.info("rendering scene %d", scene.id)
-        clips.append(render_scene_clip(scene, clip))
+        clips.append(render_scene_clip(scene, clip, width, height))
 
     intro_clips, outro_clips = _branding_clips(plan, paths)
     clips = intro_clips + clips + outro_clips
@@ -694,3 +761,30 @@ def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
     )
     log.info("final video: %s", final)
     return final
+
+
+def render_shorts_thumbnail(final: Path, paths: ProjectPaths) -> Path | None:
+    """Minimal thumbnail for a Shorts project: a single frame grabbed from
+    the rendered video — no AI clickbait background/reaction badge (Shorts
+    skip that whole pipeline, see make_video.py's format gating). Cheap
+    (no provider cost, ~instant) so a Shorts project still shows a preview
+    in the dashboard project list instead of a blank card. Only meaningful
+    once final.mp4 exists — dashboard-created projects default to
+    --skip-render, so a Shorts project shows no thumbnail until the first
+    "Resume run", unlike a landscape project's AI thumbnail (generated
+    during the asset phase, before the render)."""
+    thumb = paths.output / "thumbnail.jpg"
+    if thumb.exists():
+        return thumb
+    if not final.exists():
+        return None
+    _run(
+        [
+            "ffmpeg", "-y",
+            "-ss", "0.5", "-i", str(final),
+            "-frames:v", "1", "-q:v", "3",
+            str(thumb),
+        ]
+    )
+    log.info("shorts thumbnail: %s", thumb)
+    return thumb

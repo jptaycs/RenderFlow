@@ -264,6 +264,43 @@ def test_create_project_topic_mode_enqueues_topic_job(client, pipeline_stub, saa
     assert not (saas_env.projects_dir / "u1" / slug / "script" / "source.txt").exists()
 
 
+def test_create_project_defaults_to_landscape_format(client, pipeline_stub, saas_env):
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+
+    from renderflow import db as rdb
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).one()
+        assert "--format" in job.argv
+        assert job.argv[job.argv.index("--format") + 1] == "landscape"
+
+
+def test_create_project_shorts_format_forces_one_minute(client, pipeline_stub, saas_env):
+    # YouTube Shorts always targets ~1 minute regardless of what the client
+    # submits — the frontend hides the length picker for shorts entirely,
+    # but the backend must not trust that and clamp on its own.
+    register(client, "admin@example.com")
+    res = client.post(
+        "/api/projects",
+        json={
+            "title": "A Quick Fact",
+            "topic": "a short punchy fact",
+            "lengthMinutes": 8,
+            "format": "shorts",
+        },
+    )
+    assert res.status_code == 201, res.text
+
+    from renderflow import db as rdb
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).one()
+        assert job.argv[job.argv.index("--format") + 1] == "shorts"
+        length_index = job.argv.index("--length") + 1
+        assert float(job.argv[length_index]) == 1.0
+
+
 def test_create_project_rejects_both_script_and_topic(client):
     register(client, "admin@example.com")
     res = client.post(
@@ -407,6 +444,24 @@ def test_new_project_appears_as_placeholder_before_scenes_exist(client):
     assert projects[0]["status"] == "Generating"
     assert projects[0]["running"] is True
     assert projects[0]["scenes"] == []
+    assert projects[0]["format"] == "landscape"
+
+
+def test_placeholder_view_reads_format_from_create_job_argv(client, pipeline_stub, saas_env):
+    # scenes.json doesn't exist yet for a placeholder project, so the
+    # Shorts/Landscape tab filter has to read the format back from the
+    # create job's own argv instead of the (not-yet-written) scene plan.
+    register(client, "admin@example.com")
+    res = client.post(
+        "/api/projects",
+        json={"title": "A Quick Fact", "topic": "a short fact", "format": "shorts"},
+    )
+    assert res.status_code == 201, res.text
+    slug = res.json()["slug"]
+
+    projects = client.get("/api/state").json()["projects"]
+    assert projects[0]["slug"] == slug
+    assert projects[0]["format"] == "shorts"
 
 
 def test_projects_are_isolated_between_users(make_client, saas_env):

@@ -76,6 +76,14 @@ AvatarLayout = Literal["auto", "solo", "split", "visual"]
 # was found (and the provider is enabled), "off" forces the still image.
 BrollMode = Literal["auto", "off"]
 
+# Project-level output shape (added 2026-09): "landscape" (1920x1080, the
+# original format — intro/outro cards, thumbnail, captions, full avatar
+# layout support) or "shorts" (1080x1920 vertical for YouTube Shorts,
+# <=60s). Shorts is a deliberately trimmed-down render path for a first
+# pass — see pipeline/render.py's dims threading and the CLAUDE.md note on
+# what it skips (cards, thumbnail, captions, split-screen avatar).
+VideoFormat = Literal["landscape", "shorts"]
+
 
 class Motion(BaseModel):
     effect: MotionEffect = "zoom_in"
@@ -123,6 +131,9 @@ class ScenePlan(BaseModel):
     title: str
     style: str
     scenes: list[Scene]
+    # "landscape" (default, old scenes.json files load fine with no
+    # migration) or "shorts" — see VideoFormat.
+    format: VideoFormat = "landscape"
     # Project-level clickbait thumbnail image (generated after scene assets).
     thumbnail: AssetRef = Field(default_factory=AssetRef)
     # Narrated intro/outro card audio (added 2026-09) — the same TTS voice
