@@ -48,12 +48,24 @@ _FONT_CANDIDATES = [
 ]
 
 
+def _resolve_font_path() -> str | None:
+    """First existing font in `_FONT_CANDIDATES`, or None if none exist.
+
+    Shared with `providers/avatar/ffmpeg_still.py`, which needs a plain
+    path (for ffmpeg's drawtext `fontfile=`), not a PIL font object.
+    """
+    for path in _FONT_CANDIDATES:
+        if Path(path).exists():
+            return path
+    return None
+
+
 def _font(size: int):
     from PIL import ImageFont
 
-    for path in _FONT_CANDIDATES:
-        if Path(path).exists():
-            return ImageFont.truetype(path, size)
+    path = _resolve_font_path()
+    if path:
+        return ImageFont.truetype(path, size)
     log.warning("no bundled bold font found — captions will use PIL's default font")
     return ImageFont.load_default()
 

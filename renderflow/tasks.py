@@ -22,6 +22,7 @@ a pid namespace with the worker anymore.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -38,12 +39,18 @@ from renderflow.config import Settings
 from renderflow.db import Job, Project, init_db, new_session
 from renderflow.storage import ProjectPaths
 
+log = logging.getLogger("renderflow.tasks")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ERROR_TAIL_CHARS = 2000
 # Every job kind runs make_video.py except youtube_publish — added 2026-09
 # alongside renderflow/youtube.py + publish_youtube.py. Same subprocess/
 # logging/cancellation machinery below serves both scripts unmodified.
 SCRIPT_BY_JOB_KIND = {"youtube_publish": "publish_youtube.py"}
+# Auto-retry a failed make_video.py run up to this many attempts before
+# giving up — see the retry loop in run_pipeline for why this is safe.
+MAX_RUN_ATTEMPTS = 10
+RUN_RETRY_DELAY_SEC = 5
 
 _settings = Settings.load()
 celery_app = Celery(
@@ -160,42 +167,72 @@ def run_pipeline(job_id: int) -> None:
             str(project_dir.parent),
         ]
         log_path = paths.logs / "run.log"
-        with log_path.open("a", encoding="utf-8") as log_file:
-            log_file.write(
-                f"\n=== {datetime.now().isoformat()} job {job.id} ({job.kind}) "
-                f"{' '.join(job.argv)} ===\n"
-            )
-            log_file.flush()
-            proc = subprocess.Popen(
-                argv,
-                cwd=REPO_ROOT,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                # make_video.py's console output uses plain Unicode (→, ✦,
-                # …) with no thought to the terminal encoding — fine on a
-                # UTF-8 default (macOS/Linux), but Windows' legacy console
-                # codepage (cp1252 etc.) can't encode those characters, and
-                # a redirected-to-file stdout still uses that same locale
-                # encoding unless overridden. Crashed a real run live
-                # (UnicodeEncodeError on '→') the first time this
-                # dashboard ran on a Windows box. PYTHONIOENCODING forces
-                # UTF-8 for the child regardless of host locale.
-                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-            )
-            job.status = "running"
-            job.started_at = time.time()
-            job.pid = proc.pid
-            session.commit()
-            returncode = proc.wait()
+        # Auto-retry only the resumable pipeline (make_video.py): a failed
+        # asset leaves completed ones in place (schema.AssetRef's state
+        # machine skips them on re-run), so re-invoking after a failure is
+        # safe and just picks up whatever didn't finish. youtube_publish is
+        # a one-shot, human-reviewed action with no such resumability, so
+        # it keeps the original single-attempt behavior. Added 2026-09
+        # after a run failed on 100% of its scenes from a transient local
+        # TLS-interception error (see the truststore fix) that a plain
+        # retry would have recovered from without anyone noticing the
+        # "Failed" status and clicking Resume by hand.
+        max_attempts = MAX_RUN_ATTEMPTS if script == "make_video.py" else 1
+        returncode = 1
+        for attempt in range(1, max_attempts + 1):
+            session.refresh(job)  # the API may have cancelled it between attempts
+            if job.status == "cancelled":
+                return
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(
+                    f"\n=== {datetime.now().isoformat()} job {job.id} ({job.kind}) "
+                    f"attempt {attempt}/{max_attempts} {' '.join(job.argv)} ===\n"
+                )
+                log_file.flush()
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=REPO_ROOT,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    # make_video.py's console output uses plain Unicode (→, ✦,
+                    # …) with no thought to the terminal encoding — fine on a
+                    # UTF-8 default (macOS/Linux), but Windows' legacy console
+                    # codepage (cp1252 etc.) can't encode those characters, and
+                    # a redirected-to-file stdout still uses that same locale
+                    # encoding unless overridden. Crashed a real run live
+                    # (UnicodeEncodeError on '→') the first time this
+                    # dashboard ran on a Windows box. PYTHONIOENCODING forces
+                    # UTF-8 for the child regardless of host locale.
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                )
+                job.status = "running"
+                if attempt == 1:
+                    job.started_at = time.time()
+                job.pid = proc.pid
+                session.commit()
+                returncode = proc.wait()
 
-        session.refresh(job)  # the API may have marked it cancelled mid-run
-        if job.status == "cancelled":
-            return
+            session.refresh(job)  # the API may have marked it cancelled mid-run
+            if job.status == "cancelled":
+                return
+            if returncode == 0:
+                break
+            if attempt < max_attempts:
+                log.warning(
+                    "job %d (%s) attempt %d/%d failed (exit %d), retrying in %ds",
+                    job.id, job.kind, attempt, max_attempts, returncode,
+                    RUN_RETRY_DELAY_SEC,
+                )
+                time.sleep(RUN_RETRY_DELAY_SEC)
+
         job.status = "succeeded" if returncode == 0 else "failed"
         if returncode != 0:
+            attempts_label = (
+                f"{max_attempts} attempts" if max_attempts > 1 else "1 attempt"
+            )
             job.error = (
-                f"{script} exited with code {returncode}\n"
+                f"{script} exited with code {returncode} after {attempts_label}\n"
                 f"{_log_tail(log_path) or '(no log output)'}"
             )
         job.finished_at = time.time()

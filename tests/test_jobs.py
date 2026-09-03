@@ -26,9 +26,9 @@ def _make_project(saas_env, session, slug="demo") -> rdb.Project:
     return project
 
 
-def _make_job(session, project, status="queued", **kwargs) -> rdb.Job:
+def _make_job(session, project, status="queued", kind="resume", **kwargs) -> rdb.Job:
     job = rdb.Job(
-        project_id=project.id, kind="resume", argv=["--scenes-file", "x"], status=status, **kwargs
+        project_id=project.id, kind=kind, argv=["--scenes-file", "x"], status=status, **kwargs
     )
     session.add(job)
     session.commit()
@@ -78,6 +78,10 @@ def test_run_pipeline_success_lifecycle(saas_env, monkeypatch):
 
 
 def test_run_pipeline_failure_records_log_tail(saas_env, monkeypatch):
+    # A make_video.py-kind job (the default "resume" here) auto-retries up
+    # to MAX_RUN_ATTEMPTS — sleep is stubbed out so a 10-attempt failure
+    # doesn't actually wait RUN_RETRY_DELAY_SEC between each one.
+    monkeypatch.setattr(tasks.time, "sleep", lambda seconds: None)
     with rdb.new_session() as session:
         project = _make_project(saas_env, session)
         job = _make_job(session, project)
@@ -87,7 +91,8 @@ def test_run_pipeline_failure_records_log_tail(saas_env, monkeypatch):
     def write_log():
         log.write_text("boom: provider exploded")
 
-    _stub_popen(monkeypatch, returncode=1, on_wait=write_log)
+    calls: list[list[str]] = []
+    _stub_popen(monkeypatch, returncode=1, on_wait=write_log, calls=calls)
     tasks.run_pipeline(job_id)
 
     with rdb.new_session() as session:
@@ -95,6 +100,55 @@ def test_run_pipeline_failure_records_log_tail(saas_env, monkeypatch):
         assert job.status == "failed"
         assert "exited with code 1" in job.error
         assert "provider exploded" in job.error
+        assert f"after {tasks.MAX_RUN_ATTEMPTS} attempts" in job.error
+    assert len(calls) == tasks.MAX_RUN_ATTEMPTS
+
+
+def test_run_pipeline_retries_and_recovers(saas_env, monkeypatch):
+    # The exact scenario that motivated auto-retry: a transient failure
+    # (e.g. the TLS-interception issue that killed 100% of a run's scenes)
+    # should be recovered from automatically, not require a manual Resume.
+    monkeypatch.setattr(tasks.time, "sleep", lambda seconds: None)
+    with rdb.new_session() as session:
+        project = _make_project(saas_env, session)
+        job = _make_job(session, project)
+        job_id = job.id
+
+    returncodes = iter([1, 1, 0])  # fails twice, succeeds on the 3rd attempt
+    calls: list[list[str]] = []
+
+    def popen(argv, **kwargs):
+        calls.append(argv)
+        return FakeProc(returncode=next(returncodes))
+
+    monkeypatch.setattr(tasks.subprocess, "Popen", popen)
+    tasks.run_pipeline(job_id)
+
+    with rdb.new_session() as session:
+        job = session.get(rdb.Job, job_id)
+        assert job.status == "succeeded"
+        assert job.error is None
+    assert len(calls) == 3  # stopped retrying the moment it succeeded
+
+
+def test_run_pipeline_does_not_retry_youtube_publish(saas_env, monkeypatch):
+    # A one-shot, human-reviewed action with no resumability — unlike
+    # make_video.py, retrying it blindly on failure isn't safe.
+    monkeypatch.setattr(tasks.time, "sleep", lambda seconds: None)
+    with rdb.new_session() as session:
+        project = _make_project(saas_env, session)
+        job = _make_job(session, project, kind="youtube_publish")
+        job_id = job.id
+
+    calls: list[list[str]] = []
+    _stub_popen(monkeypatch, returncode=1, calls=calls)
+    tasks.run_pipeline(job_id)
+
+    with rdb.new_session() as session:
+        job = session.get(rdb.Job, job_id)
+        assert job.status == "failed"
+        assert "after 1 attempt" in job.error
+    assert len(calls) == 1
 
 
 def test_run_pipeline_skips_job_cancelled_while_queued(saas_env, monkeypatch):
