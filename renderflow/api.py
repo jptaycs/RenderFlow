@@ -14,6 +14,7 @@ see CLAUDE.md Commands.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import shutil
 import time
@@ -27,6 +28,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from renderflow import db
+from renderflow import youtube as youtube_module
 from renderflow.auth import current_user
 from renderflow.auth import router as auth_router
 from renderflow.billing import consume_credit, entitlement
@@ -35,19 +37,24 @@ from renderflow.config import Settings
 from renderflow.db import Job, Project, User, get_db
 from renderflow.pipeline.script import (
     effective_avatar_layout,
+    generate_topic_idea,
     scene_is_avatar_solo,
     scene_is_visual_only,
 )
+from renderflow.providers import build_llm
 from renderflow.schema import AssetStatus, ProjectPerformance, Scene, ScenePlan
 from renderflow.storage import (
     ProjectPaths,
     load_performance,
     load_plan,
+    load_youtube_publish,
     save_performance,
     save_plan,
     slugify,
 )
 from renderflow.tasks import cancel_job, run_pipeline
+
+log = logging.getLogger("renderflow.api")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = REPO_ROOT / "web"
@@ -199,17 +206,23 @@ def _project_view(
     # A final.mp4 left over from an earlier run must not count: the render is
     # done only if every asset is completed AND the video is newer than the
     # last scene-plan change (scenes.json is rewritten on every asset update).
-    # Also gate on "not run": ffmpeg creates final.mp4 on disk the instant it
-    # starts encoding, with a fresh mtime — a still-active render would
-    # otherwise look "ready" (and downloadable) while the file is mid-write.
+    # Also gate on "not a pipeline run": ffmpeg creates final.mp4 on disk the
+    # instant it starts encoding, with a fresh mtime — a still-active render
+    # would otherwise look "ready" (and downloadable) while the file is
+    # mid-write. A youtube_publish run never touches final.mp4 (it only
+    # reads it), so it must NOT hide the download link while uploading —
+    # only a pipeline run (create/resume/regenerate/thumbnail) counts here.
+    rendering = run is not None and run.kind != "youtube_publish"
     final_ready = (
-        not run
+        not rendering
         and all_done
         and final.exists()
         and final.stat().st_mtime >= paths.scenes_json.stat().st_mtime
     )
 
-    if run:
+    if run and run.kind == "youtube_publish":
+        status = "Publishing"
+    elif run:
         status = "Rendering" if all_done else "Generating"
     elif final_ready:
         status = "Complete"
@@ -282,6 +295,7 @@ def _project_view(
         else None
     )
     profit = perf.revenue_usd - cost if perf.revenue_usd is not None else None
+    youtube = load_youtube_publish(paths)
 
     return {
         "slug": slug,
@@ -310,6 +324,19 @@ def _project_view(
         "profit": profit,
         "productionTimeSec": production_time_sec,
         "createdAt": perf.created_at,
+        "youtube": (
+            {
+                "url": youtube.url,
+                "videoId": youtube.video_id,
+                "privacyStatus": youtube.privacy_status,
+                "publishedAt": youtube.published_at,
+            }
+            if youtube
+            else None
+        ),
+        # final_ready gates the button client-side; youtube.is_connected()
+        # is cheap (a file-exists check) so it's fine to call on every poll.
+        "youtubeConnected": youtube_module.is_connected(),
     }
 
 
@@ -429,6 +456,42 @@ def get_state(
         # is always current (e.g. drops right after a create).
         "billing": entitlement(session, user),
     }
+
+
+class TopicIdea(BaseModel):
+    title: str
+    script: str
+
+
+@app.post("/api/topics/random")
+def random_topic_idea(
+    user: User = Depends(current_user), session: Session = Depends(get_db)
+) -> TopicIdea:
+    """One fresh Claude-generated video idea for the New Video modal's
+    "🎲 Random topic" button — replaces the old client-side static
+    RANDOM_TOPICS bank (see pipeline/script.py::generate_topic_idea), which
+    was a fixed 10-title array that ran out and started repeating well
+    before a real user's project count did.
+
+    Deliberately a plain synchronous call, not a queued Job like project
+    creation: it's one short completion (~100-200 output tokens, a couple
+    seconds), unlike the full --topic script generation that stays inside
+    the worker subprocess (see create_project) because it can take
+    substantially longer and cost more.
+    """
+    existing_titles = [
+        row.title
+        for row in session.query(Project).filter(Project.owner_id == user.id).all()
+    ]
+    try:
+        llm = build_llm(Settings.load())
+        idea, _ = generate_topic_idea(llm, existing_titles)
+    except Exception as exc:  # missing/invalid ANTHROPIC_API_KEY, rate limit, etc.
+        log.warning("random topic idea generation failed: %s", exc)
+        raise HTTPException(
+            503, "topic idea generation is unavailable right now"
+        ) from exc
+    return TopicIdea(title=idea.title, script=idea.script)
 
 
 class NewProject(BaseModel):
@@ -713,6 +776,63 @@ def regenerate_thumbnail(
         "thumbnail",
         ["--scenes-file", str(paths.scenes_json), "--thumbnail-only"],
     )
+    return {"slug": slug}
+
+
+class YouTubePublishRequest(BaseModel):
+    title: str
+    description: str = ""
+    tags: list[str] = []
+    privacyStatus: str = "public"
+    # YouTube's disclosure flag for altered/synthetic content (status.
+    # containsSyntheticMedia) — true by default since every RenderFlow
+    # video is AI-narrated over AI-generated visuals; see renderflow/
+    # youtube.py. The client shows this as a checkbox, not a hidden default.
+    containsSyntheticMedia: bool = True
+
+
+@app.post("/api/projects/{slug}/youtube/publish")
+def publish_to_youtube(
+    slug: str,
+    body: YouTubePublishRequest,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, str]:
+    """Upload the finished final.mp4 (+ thumbnail.jpg) to YouTube via a
+    spawned publish_youtube.py subprocess (job kind "youtube_publish") —
+    never inside this request; a multi-hundred-MB upload can take minutes,
+    same reasoning as never rendering synchronously.
+
+    Requires the one-time OAuth setup (scripts/setup_youtube.py) — 503s
+    rather than queueing a job that can only fail immediately.
+    """
+    if not youtube_module.is_connected():
+        raise HTTPException(
+            503,
+            "YouTube isn't connected yet — run scripts/setup_youtube.py "
+            "once (see CLAUDE.md)",
+        )
+    if body.privacyStatus not in ("public", "unlisted", "private"):
+        raise HTTPException(422, "privacyStatus must be public, unlisted, or private")
+    project = _owned_project(session, user, slug)
+    if _active_job(session, project):
+        raise HTTPException(409, "run already in progress")
+    paths = _project_paths(project)
+    if not (paths.output / "final.mp4").exists():
+        raise HTTPException(422, "render the video before publishing")
+    title = " ".join(body.title.split())
+    if not title:
+        raise HTTPException(422, "title must not be empty")
+
+    argv = [
+        "--title", title,
+        "--description", body.description,
+        "--tags", ",".join(t.strip() for t in body.tags if t.strip()),
+        "--privacy", body.privacyStatus,
+    ]
+    if not body.containsSyntheticMedia:
+        argv.append("--no-synthetic-disclosure")
+    _enqueue(session, project, "youtube_publish", argv)
     return {"slug": slug}
 
 

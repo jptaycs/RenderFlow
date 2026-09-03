@@ -34,6 +34,7 @@ const STATUS_META = {
   Complete:   { bg: 'rgba(34,197,94,0.15)',   color: '#22c55e' },
   Failed:     { bg: 'rgba(239,68,68,0.15)',   color: '#ef4444' },
   Paused:     { bg: 'rgba(245,158,11,0.15)',  color: '#f59e0b' },
+  Publishing: { bg: 'rgba(168,85,247,0.15)',  color: '#a855f7' },
 };
 
 const STAGE_COLORS = { complete: '#22c55e', active: '#FF0000', pending: '#3a3a3f', failed: '#ef4444' };
@@ -170,6 +171,13 @@ const state = {
   plans: null,
   devCheckout: false,
   pricingOpen: false,
+  youtubeModalOpen: false,
+  youtubeModalSlug: null,
+  ytTitle: '',
+  ytDescription: '',
+  ytTags: '',
+  ytPrivacy: 'public',
+  ytSynthetic: true,
   projects: [],
   jobs: [],
   connected: false,
@@ -188,6 +196,10 @@ const state = {
   newLength: 3,
   newStyle: 'documentary',
   busy: false,
+  // True only while the "🎲 Random topic" button's Claude call is in
+  // flight — separate from state.busy so it doesn't gray out the rest of
+  // the New Video modal while waiting.
+  randomTopicLoading: false,
   // slug -> [{type:'regenerate',sceneId} | {type:'layout',sceneId,layout}, ...]
   // — actions queued because only one run can be active per project at a
   // time. A single unified queue (not one per action type) so regenerate
@@ -917,6 +929,14 @@ function detailScreenHtml() {
     const regenThumbBtn =
       '<div data-act="regenerateThumbnail" data-arg="' + esc(p.slug) + '" style="background:transparent;border:1px solid ' + (thumbQueued ? '#7a5c1e' : '#33333a') + ';color:' + (thumbQueued ? '#eab308' : '#c8c8cc') + ';font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;flex-shrink:0">' +
       (thumbQueued ? '⏳ Thumbnail queued' : '↻ New thumbnail') + '</div>';
+    // Once published, show a link instead of the button — re-publishing
+    // would create a second, duplicate video on YouTube, not update the
+    // first (the API has no "update this upload" concept here).
+    const ytBtn = p.youtube
+      ? '<a href="' + esc(p.youtube.url) + '" target="_blank" rel="noopener" style="background:transparent;border:1px solid #22c55e;color:#22c55e;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;text-decoration:none;flex-shrink:0">✓ View on YouTube</a>'
+      : p.videoUrl
+      ? '<div data-act="openYoutubeModal" data-arg="' + esc(p.slug) + '" style="background:transparent;border:1px solid #33333a;color:#c8c8cc;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;flex-shrink:0">▶ Publish to YouTube</div>'
+      : '';
     const videoCard = (p.videoUrl || p.thumbnailUrl) ? ('' +
       '<div style="background:#161618;border:1px solid #26262a;border-radius:14px;padding:22px;margin-bottom:26px;display:flex;gap:22px;align-items:center;flex-wrap:wrap">' +
         '<div style="width:220px;height:124px;flex-shrink:0;border-radius:10px;' + thumbBg(dlThumb) + ';display:flex;align-items:center;justify-content:center">' +
@@ -929,6 +949,7 @@ function detailScreenHtml() {
         (p.videoUrl ? '<a href="' + esc(p.videoUrl) + '" download="' + esc(downloadFilename(p.title)) + '" style="background:#FF0000;color:#ffffff;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;text-decoration:none;flex-shrink:0">Download MP4</a>' : '') +
         downloadThumbBtn +
         regenThumbBtn +
+        ytBtn +
       '</div>') : '';
 
     const stages = p.stages.map((stage, i) => {
@@ -1226,7 +1247,7 @@ function modalHtml() {
     : (
         '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">' +
           '<span style="font-size:12px;color:#9a9aa1">Script</span>' +
-          '<span data-act="randomTopic" style="font-size:11.5px;color:#FF0000;cursor:pointer;font-weight:500">🎲 Random topic</span>' +
+          '<span' + (state.randomTopicLoading ? '' : ' data-act="randomTopic"') + ' style="font-size:11.5px;color:' + (state.randomTopicLoading ? '#8a8a91' : '#FF0000') + ';cursor:' + (state.randomTopicLoading ? 'default' : 'pointer') + ';font-weight:500">' + (state.randomTopicLoading ? '🎲 Generating…' : '🎲 Random topic (Claude)') + '</span>' +
         '</div>' +
         '<textarea id="rf-script" rows="8" placeholder="Paste the narration script here…" style="width:100%;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:8px;padding:10px 12px;color:#f2f2f4;font-size:13px;line-height:1.5;margin-bottom:16px;font-family:\'Inter\',sans-serif;resize:vertical">' + esc(state.newScript) + '</textarea>'
       );
@@ -1300,6 +1321,43 @@ function pricingModalHtml() {
   '</div>';
 }
 
+function youtubeModalHtml() {
+  if (!state.youtubeModalOpen) return '';
+  const canSubmit = state.ytTitle.trim().length > 0 && !state.busy;
+  const submitStyle = 'padding:9px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;background:' + (canSubmit ? '#FF0000' : '#3a3a3f') + ';color:' + (canSubmit ? '#ffffff' : '#8a8a91');
+  const privacyOpt = (v, label) => '<option value="' + v + '"' + (v === state.ytPrivacy ? ' selected' : '') + '>' + label + '</option>';
+  return '' +
+  '<div data-act="closeYoutubeModal" data-self-only="1" style="position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:40;display:flex;align-items:center;justify-content:center">' +
+    '<div style="width:560px;max-width:94vw;background:#17171a;border:1px solid #2a2a2e;border-radius:14px;padding:26px;animation:rf-fadein 0.15s ease-out">' +
+      '<div style="font-size:16px;font-weight:600;margin-bottom:4px">Publish to YouTube</div>' +
+      '<div style="font-size:12.5px;color:#8a8a91;margin-bottom:20px">Uploads final.mp4 (+ the project thumbnail) via the YouTube Data API — needs the one-time OAuth setup (scripts/setup_youtube.py) done on this machine first.</div>' +
+      '<div style="font-size:12px;color:#9a9aa1;margin-bottom:6px">Title</div>' +
+      '<input id="rf-yt-title" value="' + esc(state.ytTitle) + '" style="width:100%;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:8px;padding:10px 12px;color:#f2f2f4;font-size:13px;margin-bottom:16px;font-family:\'Inter\',sans-serif">' +
+      '<div style="font-size:12px;color:#9a9aa1;margin-bottom:6px">Description</div>' +
+      '<textarea id="rf-yt-desc" rows="4" placeholder="Optional" style="width:100%;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:8px;padding:10px 12px;color:#f2f2f4;font-size:13px;line-height:1.5;margin-bottom:16px;font-family:\'Inter\',sans-serif;resize:vertical">' + esc(state.ytDescription) + '</textarea>' +
+      '<div style="font-size:12px;color:#9a9aa1;margin-bottom:6px">Tags (comma-separated)</div>' +
+      '<input id="rf-yt-tags" value="' + esc(state.ytTags) + '" placeholder="trivia, facts, documentary" style="width:100%;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:8px;padding:10px 12px;color:#f2f2f4;font-size:13px;margin-bottom:16px;font-family:\'Inter\',sans-serif">' +
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">' +
+        '<div>' +
+          '<div style="font-size:12px;color:#9a9aa1;margin-bottom:6px">Privacy</div>' +
+          '<select id="rf-yt-privacy" style="width:100%;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:8px;padding:10px 12px;color:#f2f2f4;font-size:13px;font-family:\'Inter\',sans-serif">' +
+            privacyOpt('public', 'Public') + privacyOpt('unlisted', 'Unlisted') + privacyOpt('private', 'Private') +
+          '</select>' +
+        '</div>' +
+        '<label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#c8c8cc;cursor:pointer;padding-top:22px">' +
+          '<input id="rf-yt-synthetic" type="checkbox"' + (state.ytSynthetic ? ' checked' : '') + ' style="width:16px;height:16px;accent-color:#FF0000">' +
+          'Contains altered/synthetic content' +
+        '</label>' +
+      '</div>' +
+      '<div style="font-size:11.5px;color:#5a5a60;line-height:1.4;margin-bottom:20px">Leave that checked — every RenderFlow video is AI-narrated over AI-generated visuals, and YouTube requires this disclosure for realistic synthetic media.</div>' +
+      '<div style="display:flex;gap:10px;justify-content:flex-end">' +
+        '<div data-act="closeYoutubeModal" style="padding:9px 16px;border-radius:8px;font-size:13px;color:#c8c8cc;cursor:pointer">Cancel</div>' +
+        '<div data-act="submitYoutubePublish" id="rf-yt-submit" style="' + submitStyle + '">' + (state.busy ? 'Publishing…' : 'Publish') + '</div>' +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+
 /* ── render ──────────────────────────────────────────────────────────── */
 
 const root = document.getElementById('root');
@@ -1340,6 +1398,7 @@ function render() {
       scenePanelHtml() +
       modalHtml() +
       pricingModalHtml() +
+      youtubeModalHtml() +
       resumeAlertHtml() +
     '</div>';
 
@@ -1372,23 +1431,27 @@ function render() {
   if (style) style.addEventListener('change', () => { state.newStyle = style.value; });
   const length = document.getElementById('rf-length');
   if (length) length.addEventListener('change', () => { state.newLength = Number(length.value); });
+
+  const ytTitle = document.getElementById('rf-yt-title');
+  const ytSyncSubmit = () => {
+    const btn = document.getElementById('rf-yt-submit');
+    if (!btn) return;
+    const on = state.ytTitle.trim().length > 0 && !state.busy;
+    btn.style.background = on ? '#FF0000' : '#3a3a3f';
+    btn.style.color = on ? '#ffffff' : '#8a8a91';
+  };
+  if (ytTitle) ytTitle.addEventListener('input', () => { state.ytTitle = ytTitle.value; ytSyncSubmit(); });
+  const ytDesc = document.getElementById('rf-yt-desc');
+  if (ytDesc) ytDesc.addEventListener('input', () => { state.ytDescription = ytDesc.value; });
+  const ytTags = document.getElementById('rf-yt-tags');
+  if (ytTags) ytTags.addEventListener('input', () => { state.ytTags = ytTags.value; });
+  const ytPrivacy = document.getElementById('rf-yt-privacy');
+  if (ytPrivacy) ytPrivacy.addEventListener('change', () => { state.ytPrivacy = ytPrivacy.value; });
+  const ytSynthetic = document.getElementById('rf-yt-synthetic');
+  if (ytSynthetic) ytSynthetic.addEventListener('change', () => { state.ytSynthetic = ytSynthetic.checked; });
 }
 
 /* ── actions ─────────────────────────────────────────────────────────── */
-
-const RANDOM_TOPICS = [
-  { title: 'The Food That Never Rots', script: 'Archaeologists opening Egyptian tombs found jars of honey more than three thousand years old, still perfectly good to eat. Bees turn nectar into a syrup so dense and acidic that no bacteria can survive inside it. Every jar in your kitchen could outlive you, your grandchildren, and the building you live in.' },
-  { title: 'The Tower That Grows Every Summer', script: 'Every summer, the Eiffel Tower quietly grows about fifteen centimeters taller, and nobody in Paris notices. Seven thousand tons of iron expand in the heat, leaning the tip gently away from the sun. When winter returns, the most famous landmark in France shrinks back down, like a creature breathing once a year.' },
-  { title: 'Every Banana You Eat Is a Clone', script: 'Every banana in your supermarket is a genetic clone, grown from cuttings of a single plant discovered in 1834. Your grandparents ate a completely different banana, until a fungus wiped it off the face of the earth in the 1950s. The same disease is now spreading toward the clones we eat today, and there is no backup plan.' },
-  { title: 'The War That Lasted 38 Minutes', script: 'In 1896, the British Empire fought an entire war against Zanzibar before breakfast was over. The sultan’s palace fell in thirty-eight minutes, the shortest war in recorded history. One side suffered a single wounded soldier, while the other lost five hundred men and an empire.' },
-  { title: 'The Town That Danced Itself to Death', script: 'In the summer of 1518, a woman stepped into a street in Strasbourg and began to dance, and she could not stop. Within a month, four hundred people were dancing day and night, their feet bleeding through their shoes. The city hired musicians to keep them moving, hoping they would dance it out, and people began dying of exhaustion.' },
-  { title: 'Rome Built Concrete That Heals Itself', script: 'Roman harbors built two thousand years ago still stand in seawater that destroys modern concrete within decades. Their secret was volcanic ash and burnt lime, which grow new crystals whenever a crack lets water in. Scientists only decoded the recipe in 2023, and engineers are still struggling to match it.' },
-  { title: 'The Shark Born Before America', script: 'Somewhere in the Arctic right now swims a shark that was already alive when the Mayflower set sail. Greenland sharks drift through freezing black water for four hundred years, growing a single centimeter each year. Researchers found one born around 1620, the oldest vertebrate ever discovered on earth.' },
-  { title: 'Australia Lost a War Against Birds', script: 'In 1932, Australia sent soldiers with machine guns to fight twenty thousand emus destroying wheat farms. The birds scattered into small groups, outran the trucks, and shrugged off the bullets. After a month, the army withdrew in defeat, and the emus kept the wheat.' },
-  { title: 'Carrots Were Never Supposed to Be Orange', script: 'For most of history, carrots were purple, white, or yellow, and nobody had ever seen an orange one. Dutch farmers in the 1600s bred the orange carrot, some say to honor their royal House of Orange. Their marketing worked so well that the whole world forgot the original vegetable ever existed.' },
-  { title: 'The Flood That Was Made of Beer', script: 'In 1814, a vat holding a million pints of porter burst inside a London brewery. A fifteen-foot wave of beer smashed through brick walls and flooded an entire neighborhood. Eight people drowned, and the brewery escaped punishment by convincing a court it was an act of God.' },
-];
-let lastRandomTopic = null;
 
 const CLICKBAIT_TEMPLATES = [
   'The Truth About {t} Nobody Tells You',
@@ -1430,9 +1493,36 @@ const actions = {
     // Paywall: out of trial credits and no subscription — show plans, not
     // the create form (the backend would 402 the create anyway).
     if (state.billing && state.billing.kind === 'blocked') { state.pricingOpen = true; render(); return; }
-    state.modalOpen = true; state.newTitle = ''; state.newScript = ''; state.newTopic = ''; state.newLength = 3; state.newGenMode = 'script'; state.newTopicBase = null; clickbaitIndex = 0; render(); const t = document.getElementById('rf-title'); if (t) t.focus();
+    state.modalOpen = true; state.newTitle = ''; state.newScript = ''; state.newTopic = ''; state.newLength = 3; state.newGenMode = 'script'; state.newTopicBase = null; state.randomTopicLoading = false; clickbaitIndex = 0; render(); const t = document.getElementById('rf-title'); if (t) t.focus();
   },
   setGenMode(mode) { state.newGenMode = mode; render(); },
+  openYoutubeModal(slug) {
+    const p = findProject(slug);
+    state.youtubeModalOpen = true;
+    state.youtubeModalSlug = slug;
+    state.ytTitle = (p && p.title) || '';
+    state.ytDescription = '';
+    state.ytTags = '';
+    state.ytPrivacy = 'public';
+    state.ytSynthetic = true;
+    render();
+    const t = document.getElementById('rf-yt-title');
+    if (t) t.focus();
+  },
+  closeYoutubeModal() { state.youtubeModalOpen = false; render(); },
+  submitYoutubePublish() {
+    const slug = state.youtubeModalSlug;
+    const title = state.ytTitle.trim();
+    if (!slug || !title || state.busy) return;
+    state.youtubeModalOpen = false;
+    post('/api/projects/' + encodeURIComponent(slug) + '/youtube/publish', {
+      title,
+      description: state.ytDescription,
+      tags: state.ytTags.split(',').map(t => t.trim()).filter(Boolean),
+      privacyStatus: state.ytPrivacy,
+      containsSyntheticMedia: state.ytSynthetic,
+    });
+  },
   openPricing() { state.pricingOpen = true; render(); },
   closePricing() { state.pricingOpen = false; render(); },
   async checkoutPlan(plan) {
@@ -1459,26 +1549,33 @@ const actions = {
     render();
     refresh();
   },
-  randomTopic() {
-    // Never suggest a title that already has a project — same normalization
-    // spirit as the server's slug-based duplicate check, just a friendlier
-    // pre-filter so the picker doesn't hand back a story you already made.
-    const used = new Set(state.projects.map(p => p.title.trim().toLowerCase()));
-    let available = RANDOM_TOPICS.filter(t => !used.has(t.title.trim().toLowerCase()));
-    if (available.length === 0) {
-      alert('You’ve already made a video for every topic in the random bank. Try tweaking a title yourself, or paste your own script.');
-      return;
+  async randomTopic() {
+    // Asks the backend to have Claude invent a fresh idea (POST
+    // /api/topics/random -> pipeline/script.py::generate_topic_idea) —
+    // replaces the old client-side static RANDOM_TOPICS bank, which was a
+    // fixed 10-title array that ran out (and started repeating) well
+    // before a real user's project count did. state.randomTopicLoading
+    // (not the shared state.busy) so this button alone shows its own
+    // "Generating…" state without disabling the rest of the modal.
+    if (state.randomTopicLoading) return;
+    state.randomTopicLoading = true;
+    render();
+    try {
+      const res = await fetch('/api/topics/random', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        state.newGenMode = 'script';  // comes back as a short ready-to-use script
+        state.newTitle = data.title;
+        state.newScript = data.script;
+        state.newTopicBase = null;
+        clickbaitIndex = 0;
+      } else {
+        alert(data.detail || ('Could not generate a topic idea (' + res.status + ')'));
+      }
+    } catch (err) {
+      alert('Backend not reachable — is the server running?');
     }
-    if (available.length > 1 && lastRandomTopic) {
-      available = available.filter(t => t.title !== lastRandomTopic.title);
-    }
-    const topic = available[Math.floor(Math.random() * available.length)];
-    lastRandomTopic = topic;
-    state.newGenMode = 'script';  // the bank is pre-written scripts, not raw topics
-    state.newTitle = topic.title;
-    state.newScript = topic.script;
-    state.newTopicBase = null;
-    clickbaitIndex = 0;
+    state.randomTopicLoading = false;
     render();
   },
   clickbaitTitle() {

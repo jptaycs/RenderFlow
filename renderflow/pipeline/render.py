@@ -435,6 +435,7 @@ def render_thumbnail(
     badge_source = reaction if reaction.exists() else avatar_image
     if badge_source is not None and badge_source.exists():
         _overlay_host_badge(thumb, badge_source)
+    _overlay_clickbait_text(thumb, plan.title)
     log.info("thumbnail: %s", thumb)
     return thumb
 
@@ -467,6 +468,61 @@ def _overlay_host_badge(thumb: Path, portrait_path: Path) -> None:
     ImageDraw.Draw(face_mask).ellipse((0, 0, dia, dia), fill=255)
     base.paste(portrait, (x, y), face_mask)
     base.save(thumb, quality=90)
+
+
+def _overlay_clickbait_text(thumb: Path, title: str) -> None:
+    """Bold, all-caps title text across the top of the thumbnail — client
+    request 2026-09 ("make it more clickbaiting"). Real Pillow-rendered
+    text, deliberately NOT something asked of the AI image model:
+    _thumbnail_prompt explicitly says "no text, no words, no letters, no
+    typography" because diffusion models reliably render on-screen text as
+    garbled nonsense. Classic yellow-on-black-stroke YouTube treatment,
+    positioned top-of-frame to stay clear of the reaction badge
+    (bottom-left) and the generated subject (composed toward the right).
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        log.warning("PIL missing — thumbnail rendered without title text")
+        return
+    from renderflow.pipeline.branding import _wrap
+    from renderflow.pipeline.subtitles import _font
+
+    base = Image.open(thumb).convert("RGB")
+    draw = ImageDraw.Draw(base)
+    max_width = int(base.width * 0.94)
+    max_height = int(base.height * 0.42)
+    text = title.upper()
+
+    # Shrink from a large starting size until the wrapped block fits the
+    # top ~42% of the frame — a short title stays big and bold, a long one
+    # backs off rather than overflowing or getting truncated mid-word.
+    size = 100
+    font = _font(size)
+    lines = _wrap(draw, text, font, max_width)
+    gap = int(size * 0.16)
+    while size > 40:
+        font = _font(size)
+        lines = _wrap(draw, text, font, max_width)
+        line_height = draw.textbbox((0, 0), "Ag", font=font)[3]
+        gap = int(size * 0.16)
+        block_height = len(lines) * line_height + max(len(lines) - 1, 0) * gap
+        if block_height <= max_height:
+            break
+        size -= 6
+
+    stroke_width = max(int(size * 0.10), 3)
+    y = int(base.height * 0.05)
+    for line in lines:
+        box = draw.textbbox((0, 0), line, font=font)
+        x = (base.width - (box[2] - box[0])) // 2
+        draw.text(
+            (x, y - box[1]), line, font=font,
+            fill=(255, 225, 30), stroke_width=stroke_width, stroke_fill=(0, 0, 0),
+        )
+        y += (box[3] - box[1]) + gap
+
+    base.save(thumb, quality=92)
 
 
 def _pick_music_track(plan: ScenePlan, paths: ProjectPaths) -> Path | None:

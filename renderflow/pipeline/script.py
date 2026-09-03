@@ -9,7 +9,14 @@ from typing import Literal
 from pydantic import ValidationError
 
 from renderflow.providers.base import LLMProvider, LLMResult
-from renderflow.schema import AvatarSpec, GeneratedScript, Motion, Scene, ScenePlan
+from renderflow.schema import (
+    AvatarSpec,
+    GeneratedScript,
+    GeneratedTopicIdea,
+    Motion,
+    Scene,
+    ScenePlan,
+)
 
 log = logging.getLogger("renderflow.pipeline.script")
 
@@ -85,6 +92,62 @@ def generate_script(
     plan = generated.to_plan()
     log.info("generated %d scenes for %r", len(plan.scenes), plan.title)
     return plan, result
+
+
+TOPIC_IDEA_SYSTEM_PROMPT = """\
+You invent fresh, surprising short-documentary video ideas for a YouTube
+trivia channel ("did you know" style true stories — a war that lasted 38
+minutes, a shark older than the United States, that kind of thing).
+
+Rules:
+- Invent exactly ONE idea: a punchy, hooky title (under ~9 words — a
+  specific factual hook, not a generic clickbait template like "The Truth
+  About X") and a short narration script (3-5 sentences, 60-100 words)
+  that reads naturally spoken aloud: no headings, no markdown, no scene
+  numbers, no "Scene 1:" prefixes.
+- The fact must be real, specific, and checkable — no invented statistics
+  or made-up numbers.
+- Open with the hook itself, not a preamble.
+- Never reuse or lightly rephrase a title from the "already used" list.
+"""
+
+
+def build_topic_idea_prompt(existing_titles: list[str]) -> str:
+    if existing_titles:
+        taken = "\n".join(f"- {t}" for t in existing_titles)
+        return (
+            "Invent one new short-documentary video idea. These titles are "
+            f"already used — invent something different:\n{taken}"
+        )
+    return "Invent one new short-documentary video idea."
+
+
+def generate_topic_idea(
+    llm: LLMProvider, existing_titles: list[str]
+) -> tuple[GeneratedTopicIdea, LLMResult]:
+    """One "surprise me" idea for the dashboard's New Video modal.
+
+    Replaces the old client-side static RANDOM_TOPICS bank (web/index.html,
+    kept in git history for prompt calibration — see TOPIC_IDEA_SYSTEM_PROMPT
+    above) with a fresh Claude-generated idea on every click: the fixed
+    10-entry bank ran out (and started repeating) well before a real user's
+    project count did. Small, fast completion (~100-200 output tokens) —
+    unlike full script generation (generate_script), which is deliberately
+    kept out of the request path (see api.py's create_project), this is
+    cheap and quick enough to call directly from a request handler.
+    """
+    result = llm.complete(
+        TOPIC_IDEA_SYSTEM_PROMPT,
+        build_topic_idea_prompt(existing_titles),
+        json_schema=GeneratedTopicIdea.model_json_schema(),
+        max_tokens=500,
+    )
+    try:
+        idea = GeneratedTopicIdea.model_validate_json(result.text)
+    except ValidationError:
+        log.error("LLM returned JSON that does not match the topic-idea schema")
+        raise
+    return idea, result
 
 
 SPLIT_SYSTEM_PROMPT = """\

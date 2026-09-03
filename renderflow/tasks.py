@@ -40,6 +40,10 @@ from renderflow.storage import ProjectPaths
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ERROR_TAIL_CHARS = 2000
+# Every job kind runs make_video.py except youtube_publish — added 2026-09
+# alongside renderflow/youtube.py + publish_youtube.py. Same subprocess/
+# logging/cancellation machinery below serves both scripts unmodified.
+SCRIPT_BY_JOB_KIND = {"youtube_publish": "publish_youtube.py"}
 
 _settings = Settings.load()
 celery_app = Celery(
@@ -62,7 +66,11 @@ def pid_is_pipeline(pid: int) -> bool:
     proc = subprocess.run(
         ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True
     )
-    return proc.returncode == 0 and "make_video.py" in proc.stdout
+    if proc.returncode != 0:
+        return False
+    return "make_video.py" in proc.stdout or any(
+        script in proc.stdout for script in SCRIPT_BY_JOB_KIND.values()
+    )
 
 
 def kill_pipeline_pgid(pid: int) -> None:
@@ -139,9 +147,10 @@ def run_pipeline(job_id: int) -> None:
 
         project_dir = Path(project.dir_path)
         paths = ProjectPaths.create(project_dir.parent, project_dir.name)
+        script = SCRIPT_BY_JOB_KIND.get(job.kind, "make_video.py")
         argv = [
             sys.executable,
-            str(REPO_ROOT / "make_video.py"),
+            str(REPO_ROOT / script),
             *job.argv,
             "--slug",
             project_dir.name,
@@ -186,7 +195,7 @@ def run_pipeline(job_id: int) -> None:
         job.status = "succeeded" if returncode == 0 else "failed"
         if returncode != 0:
             job.error = (
-                f"make_video.py exited with code {returncode}\n"
+                f"{script} exited with code {returncode}\n"
                 f"{_log_tail(log_path) or '(no log output)'}"
             )
         job.finished_at = time.time()

@@ -295,6 +295,72 @@ def test_create_project_clamps_length_minutes(client, pipeline_stub, saas_env):
         assert float(job.argv[length_index]) == 15.0
 
 
+"""POST /api/topics/random: the "🎲 Random topic" button's Claude-backed
+idea generator (replaces the old client-side static RANDOM_TOPICS bank).
+Never touches a live LLM — build_llm/generate_topic_idea are monkeypatched
+at the api module boundary, same spirit as pipeline_stub for run_pipeline."""
+
+from renderflow.providers.base import LLMResult
+from renderflow.schema import GeneratedTopicIdea
+
+
+def test_random_topic_idea_returns_generated_idea(client, monkeypatch):
+    from renderflow import api
+
+    register(client, "admin@example.com")
+
+    def fake_generate_topic_idea(llm, existing_titles):
+        return (
+            GeneratedTopicIdea(title="The Shark Born Before America", script="Some fact."),
+            LLMResult(text="{}", provider="stub", cost=0.001),
+        )
+
+    monkeypatch.setattr(api, "build_llm", lambda settings: object())
+    monkeypatch.setattr(api, "generate_topic_idea", fake_generate_topic_idea)
+
+    res = client.post("/api/topics/random")
+    assert res.status_code == 200, res.text
+    assert res.json() == {"title": "The Shark Born Before America", "script": "Some fact."}
+
+
+def test_random_topic_idea_passes_existing_project_titles(client, pipeline_stub, monkeypatch):
+    from renderflow import api
+
+    register(client, "admin@example.com")
+    _create_project(client, title="Already Made This One")
+
+    captured: dict = {}
+
+    def fake_generate_topic_idea(llm, existing_titles):
+        captured["existing_titles"] = existing_titles
+        return (
+            GeneratedTopicIdea(title="Something New", script="A fresh fact."),
+            LLMResult(text="{}", provider="stub"),
+        )
+
+    monkeypatch.setattr(api, "build_llm", lambda settings: object())
+    monkeypatch.setattr(api, "generate_topic_idea", fake_generate_topic_idea)
+
+    res = client.post("/api/topics/random")
+    assert res.status_code == 200, res.text
+    assert captured["existing_titles"] == ["Already Made This One"]
+
+
+def test_random_topic_idea_failure_returns_503(client, monkeypatch):
+    from renderflow import api
+
+    register(client, "admin@example.com")
+
+    def failing_generate_topic_idea(llm, existing_titles):
+        raise RuntimeError("no ANTHROPIC_API_KEY")
+
+    monkeypatch.setattr(api, "build_llm", lambda settings: object())
+    monkeypatch.setattr(api, "generate_topic_idea", failing_generate_topic_idea)
+
+    res = client.post("/api/topics/random")
+    assert res.status_code == 503
+
+
 def test_project_with_active_job_rejects_further_runs(client):
     register(client, "admin@example.com")
     slug = _create_project(client)
@@ -473,3 +539,112 @@ def test_delete_project_removes_rows_and_files(client, saas_env, monkeypatch):
     with rdb.new_session() as session:
         assert session.query(rdb.Project).count() == 0
         assert session.query(rdb.Job).count() == 0
+
+
+def test_publish_youtube_requires_connection(client, saas_env, monkeypatch):
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+    _finish_create_with_plan(saas_env, slug)
+
+    from renderflow import api
+
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: False)
+    res = client.post(
+        f"/api/projects/{slug}/youtube/publish", json={"title": "A Video"}
+    )
+    assert res.status_code == 503
+    assert "setup_youtube.py" in res.json()["detail"]
+
+
+def test_publish_youtube_requires_rendered_video(client, saas_env, monkeypatch):
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+
+    from renderflow import api
+    from renderflow import db as rdb
+
+    # Mark the create job done, but no final.mp4 (never rendered) — same
+    # "no active job" unblock as _finish_create_with_plan, minus the video.
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).order_by(rdb.Job.id.desc()).first()
+        job.status = "succeeded"
+        session.commit()
+
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    res = client.post(
+        f"/api/projects/{slug}/youtube/publish", json={"title": "A Video"}
+    )
+    assert res.status_code == 422
+    assert "render" in res.json()["detail"].lower()
+
+
+def test_publish_youtube_rejects_invalid_privacy(client, saas_env, monkeypatch):
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+    _finish_create_with_plan(saas_env, slug)
+
+    from renderflow import api
+
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    res = client.post(
+        f"/api/projects/{slug}/youtube/publish",
+        json={"title": "A Video", "privacyStatus": "extremely-public"},
+    )
+    assert res.status_code == 422
+
+
+def test_publish_youtube_enqueues_job(client, pipeline_stub, saas_env, monkeypatch):
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+    _finish_create_with_plan(saas_env, slug)
+
+    from renderflow import api
+    from renderflow import db as rdb
+
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    res = client.post(
+        f"/api/projects/{slug}/youtube/publish",
+        json={
+            "title": "  A Video  ",
+            "description": "desc",
+            "tags": ["trivia", " facts "],
+            "privacyStatus": "unlisted",
+            "containsSyntheticMedia": False,
+        },
+    )
+    assert res.status_code == 200, res.text
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).filter(rdb.Job.kind == "youtube_publish").one()
+        assert job.argv == [
+            "--title", "A Video",
+            "--description", "desc",
+            "--tags", "trivia,facts",
+            "--privacy", "unlisted",
+            "--no-synthetic-disclosure",
+        ]
+
+
+def test_project_view_surfaces_youtube_publish_result(client, saas_env):
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+    paths = _finish_create_with_plan(saas_env, slug)
+
+    from renderflow.schema import YouTubePublish
+    from renderflow.storage import save_youtube_publish
+
+    save_youtube_publish(
+        YouTubePublish(
+            video_id="abc123",
+            url="https://youtu.be/abc123",
+            privacy_status="public",
+            contains_synthetic_media=True,
+            published_at=1234.0,
+        ),
+        paths,
+    )
+
+    projects = client.get("/api/state").json()["projects"]
+    project = next(p for p in projects if p["slug"] == slug)
+    assert project["youtube"]["url"] == "https://youtu.be/abc123"
+    assert project["youtube"]["videoId"] == "abc123"

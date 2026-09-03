@@ -9,7 +9,7 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
-from renderflow.schema import AssetStatus, ProjectPerformance, ScenePlan
+from renderflow.schema import AssetStatus, ProjectPerformance, ScenePlan, YouTubePublish
 
 
 def slugify(text: str) -> str:
@@ -78,6 +78,10 @@ class ProjectPaths:
     def performance_json(self) -> Path:
         return self.root / "performance.json"
 
+    @property
+    def youtube_json(self) -> Path:
+        return self.root / "youtube.json"
+
 
 def save_plan(plan: ScenePlan, paths: ProjectPaths) -> None:
     paths.scenes_json.write_text(plan.model_dump_json(indent=2))
@@ -141,3 +145,17 @@ def load_performance(paths: ProjectPaths) -> ProjectPerformance:
     return ProjectPerformance.model_validate(
         json.loads(paths.performance_json.read_text())
     )
+
+
+def save_youtube_publish(result: YouTubePublish, paths: ProjectPaths) -> None:
+    paths.youtube_json.write_text(result.model_dump_json(indent=2))
+
+
+def load_youtube_publish(paths: ProjectPaths) -> YouTubePublish | None:
+    """None means never published — distinct from performance.json's
+    always-present-with-blanks default, since "not yet published" and
+    "published with unknown stats" are different states the dashboard
+    needs to tell apart (show a Publish button vs. a View on YouTube link)."""
+    if not paths.youtube_json.exists():
+        return None
+    return YouTubePublish.model_validate(json.loads(paths.youtube_json.read_text()))

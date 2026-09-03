@@ -754,6 +754,47 @@ def test_render_thumbnail(paths: ProjectPaths):
     assert thumb.stat().st_mtime_ns == mtime
 
 
+def test_overlay_clickbait_text_adds_visible_text(tmp_path):
+    from PIL import Image
+
+    from renderflow.pipeline.render import _overlay_clickbait_text
+
+    img_path = tmp_path / "thumb.jpg"
+    bg = (10, 10, 10)
+    Image.new("RGB", (1280, 720), bg).save(img_path)
+
+    _overlay_clickbait_text(img_path, "Why Octopuses Have Three Hearts")
+
+    result = Image.open(img_path).convert("RGB")
+    assert result.size == (1280, 720)
+    top_strip = result.crop((0, 0, 1280, 200))
+    changed = any(
+        top_strip.getpixel((x, y)) != bg
+        for x in range(0, 1280, 10)
+        for y in range(0, 200, 10)
+    )
+    assert changed, "expected some pixels in the top strip to differ from the plain background"
+
+
+def test_overlay_clickbait_text_shrinks_long_titles_to_fit(tmp_path):
+    """A long title must back off in size rather than overflow or crash —
+    _wrap has no hard line cap, so this exercises the shrink loop."""
+    from PIL import Image
+
+    from renderflow.pipeline.render import _overlay_clickbait_text
+
+    img_path = tmp_path / "thumb.jpg"
+    Image.new("RGB", (1280, 720), (10, 10, 10)).save(img_path)
+
+    _overlay_clickbait_text(
+        img_path,
+        "The Extraordinarily Long And Overly Detailed Title About A Very Specific Historical Event",
+    )
+
+    result = Image.open(img_path)
+    assert result.size == (1280, 720)  # must not crash or resize the base image
+
+
 def test_split_script_preserves_flow(paths: ProjectPaths):
     from renderflow.pipeline.script import split_script
 

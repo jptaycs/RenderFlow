@@ -46,6 +46,14 @@ wav2lip = [
     "tqdm>=4.66",
     "huggingface_hub>=0.23",
 ]
+# For YouTube publishing (renderflow/youtube.py, scripts/setup_youtube.py) —
+# one-time OAuth via the installed-app flow, not needed unless you're
+# actually uploading.
+youtube = [
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.2",
+    "google-auth-httplib2>=0.2",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

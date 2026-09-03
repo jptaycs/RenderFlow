@@ -158,12 +158,14 @@ class ProjectPerformance(BaseModel):
     """Manually-entered YouTube performance for one project, tracked
     alongside generation cost so the dashboard can report profit.
 
-    RenderFlow has no YouTube API integration — these numbers are typed in
-    by hand (from YouTube Studio) once a video is published, and re-entered
-    whenever the user wants an updated profit picture. created_at/completed_at
-    are the exception: those are set automatically by the pipeline itself
-    (project creation, and the moment final.mp4 first becomes ready) to
-    derive production time without any manual input.
+    views/watch_time/revenue have no API to pull from (that would be the
+    YouTube Analytics API, a separate integration RenderFlow doesn't have)
+    — typed in by hand from YouTube Studio, re-entered whenever the user
+    wants an updated profit picture. created_at/completed_at are the
+    exception: those are set automatically by the pipeline itself (project
+    creation, and the moment final.mp4 first becomes ready) to derive
+    production time without any manual input. See YouTubePublish below for
+    the *publishing* side, which does have real API integration.
     """
 
     views: int | None = None
@@ -173,6 +175,20 @@ class ProjectPerformance(BaseModel):
     created_at: float | None = None
     completed_at: float | None = None
     updated_at: float | None = None
+
+
+class YouTubePublish(BaseModel):
+    """Result of publishing a project's final.mp4 to YouTube (renderflow/
+    youtube.py + publish_youtube.py), persisted at <project>/youtube.json —
+    same file-based pattern as performance.json, not a DB column: it's
+    written by publish_youtube.py, a spawned subprocess, and the pipeline
+    layer never touches the DB directly (see CLAUDE.md)."""
+
+    video_id: str
+    url: str
+    privacy_status: str
+    contains_synthetic_media: bool
+    published_at: float
 
 
 # ---------------------------------------------------------------------------
@@ -227,3 +243,14 @@ class GeneratedScript(BaseModel):
             for s in self.scenes
         ]
         return ScenePlan(title=self.title, style=self.style, scenes=scenes)
+
+
+class GeneratedTopicIdea(BaseModel):
+    """A single fresh video idea from `pipeline/script.py::generate_topic_idea`
+    — the dashboard's "🎲 Random topic" button, replacing the old static
+    RANDOM_TOPICS bank in web/index.html with a live Claude call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+    script: str

@@ -18,3 +18,8 @@ music/*
 
 # Local SQLite dev DB (dashboard smoke-testing without Postgres)
 dev.db
+
+# YouTube OAuth: your Google Cloud OAuth client secret and the resulting
+# refresh token — both are credentials, never commit either.
+.youtube_client_secret.json
+.youtube_token.json
