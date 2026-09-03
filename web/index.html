@@ -1453,6 +1453,16 @@ function render() {
 
 /* ── actions ─────────────────────────────────────────────────────────── */
 
+// Titles already shown by "🎲 Random topic" this modal session, oldest
+// first, capped so the request body doesn't grow unbounded across a long
+// clicking spree. Sent back as excludeTitles on every call — without this,
+// repeated clicks before ever creating a project sent Claude the exact
+// same prompt each time (the DB has no project yet to exclude), and with
+// no memory of its own past answers it kept converging on the same
+// "obvious" fact. Reset whenever the modal (re)opens (see openModal).
+let suggestedTopicTitles = [];
+const MAX_SUGGESTED_TOPICS_TRACKED = 20;
+
 const CLICKBAIT_TEMPLATES = [
   'The Truth About {t} Nobody Tells You',
   '{t}: What You Should Know Before It’s Too Late',
@@ -1493,7 +1503,7 @@ const actions = {
     // Paywall: out of trial credits and no subscription — show plans, not
     // the create form (the backend would 402 the create anyway).
     if (state.billing && state.billing.kind === 'blocked') { state.pricingOpen = true; render(); return; }
-    state.modalOpen = true; state.newTitle = ''; state.newScript = ''; state.newTopic = ''; state.newLength = 3; state.newGenMode = 'script'; state.newTopicBase = null; state.randomTopicLoading = false; clickbaitIndex = 0; render(); const t = document.getElementById('rf-title'); if (t) t.focus();
+    state.modalOpen = true; state.newTitle = ''; state.newScript = ''; state.newTopic = ''; state.newLength = 3; state.newGenMode = 'script'; state.newTopicBase = null; state.randomTopicLoading = false; suggestedTopicTitles = []; clickbaitIndex = 0; render(); const t = document.getElementById('rf-title'); if (t) t.focus();
   },
   setGenMode(mode) { state.newGenMode = mode; render(); },
   openYoutubeModal(slug) {
@@ -1561,7 +1571,11 @@ const actions = {
     state.randomTopicLoading = true;
     render();
     try {
-      const res = await fetch('/api/topics/random', { method: 'POST' });
+      const res = await fetch('/api/topics/random', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ excludeTitles: suggestedTopicTitles }),
+      });
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
         state.newGenMode = 'script';  // comes back as a short ready-to-use script
@@ -1569,6 +1583,8 @@ const actions = {
         state.newScript = data.script;
         state.newTopicBase = null;
         clickbaitIndex = 0;
+        suggestedTopicTitles.push(data.title);
+        if (suggestedTopicTitles.length > MAX_SUGGESTED_TOPICS_TRACKED) suggestedTopicTitles.shift();
       } else {
         alert(data.detail || ('Could not generate a topic idea (' + res.status + ')'));
       }

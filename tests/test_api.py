@@ -346,6 +346,37 @@ def test_random_topic_idea_passes_existing_project_titles(client, pipeline_stub,
     assert captured["existing_titles"] == ["Already Made This One"]
 
 
+def test_random_topic_idea_merges_client_excluded_titles(client, monkeypatch):
+    # Regression: repeated clicks before ever creating a project sent the
+    # exact same prompt every time (DB has nothing to exclude yet), and
+    # Claude — no memory of its own past answers — kept returning the same
+    # idea. The frontend now tracks titles already shown this modal session
+    # and resends them as excludeTitles; the endpoint must fold them into
+    # the prompt's exclusion list alongside any real project titles.
+    from renderflow import api
+
+    register(client, "admin@example.com")
+
+    captured: dict = {}
+
+    def fake_generate_topic_idea(llm, existing_titles):
+        captured["existing_titles"] = existing_titles
+        return (
+            GeneratedTopicIdea(title="Yet Another Idea", script="A fact."),
+            LLMResult(text="{}", provider="stub"),
+        )
+
+    monkeypatch.setattr(api, "build_llm", lambda settings: object())
+    monkeypatch.setattr(api, "generate_topic_idea", fake_generate_topic_idea)
+
+    res = client.post(
+        "/api/topics/random",
+        json={"excludeTitles": ["First Suggested Idea", "Second Suggested Idea"]},
+    )
+    assert res.status_code == 200, res.text
+    assert captured["existing_titles"] == ["First Suggested Idea", "Second Suggested Idea"]
+
+
 def test_random_topic_idea_failure_returns_503(client, monkeypatch):
     from renderflow import api
 

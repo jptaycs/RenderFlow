@@ -463,9 +463,19 @@ class TopicIdea(BaseModel):
     script: str
 
 
+class TopicIdeaRequest(BaseModel):
+    # Titles already shown to the user this modal session (previous
+    # /api/topics/random responses the user hasn't created yet) — see the
+    # excludeTitles docstring note below for why this is required, not just
+    # the DB's project titles.
+    excludeTitles: list[str] = []
+
+
 @app.post("/api/topics/random")
 def random_topic_idea(
-    user: User = Depends(current_user), session: Session = Depends(get_db)
+    body: TopicIdeaRequest = TopicIdeaRequest(),
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
 ) -> TopicIdea:
     """One fresh Claude-generated video idea for the New Video modal's
     "🎲 Random topic" button — replaces the old client-side static
@@ -478,11 +488,20 @@ def random_topic_idea(
     seconds), unlike the full --topic script generation that stays inside
     the worker subprocess (see create_project) because it can take
     substantially longer and cost more.
+
+    `body.excludeTitles` matters because this call is otherwise stateless:
+    the *only* exclusion this endpoint used to send Claude was the DB's
+    actual project titles, so repeated clicks before ever creating a
+    project sent the exact same prompt every time — and with no memory of
+    its own past answers, Claude kept converging on the same "obvious"
+    fact each click (client-reported: "clicking regenerate topic gives
+    the same topic"). The frontend now accumulates every title it's shown
+    in this modal session and resends the growing list here.
     """
     existing_titles = [
         row.title
         for row in session.query(Project).filter(Project.owner_id == user.id).all()
-    ]
+    ] + body.excludeTitles
     try:
         llm = build_llm(Settings.load())
         idea, _ = generate_topic_idea(llm, existing_titles)

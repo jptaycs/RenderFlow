@@ -108,7 +108,10 @@ Rules:
 - The fact must be real, specific, and checkable — no invented statistics
   or made-up numbers.
 - Open with the hook itself, not a preamble.
-- Never reuse or lightly rephrase a title from the "already used" list.
+- Never reuse a fact, story, or subject from the "already used" list below
+  — not even with a different title or wording. Pick a different subject
+  entirely (different era, place, field, and kind of surprise) from every
+  title listed, not just a different sentence about the same fact.
 """
 
 
