@@ -13,6 +13,9 @@ dependencies = [
     # Captions (pipeline/subtitles.py) and thumbnail host badge render every
     # video by default — Pillow is core, not an optional extra.
     "pillow",
+    # Makes httpx (every provider) verify TLS against the OS trust store
+    # instead of the bundled certifi list — see renderflow/__init__.py.
+    "truststore>=0.9",
 ]
 
 [project.optional-dependencies]
