@@ -87,14 +87,23 @@ class ClaudeLLM:
             kwargs["output_config"] = {
                 "format": {"type": "json_schema", "schema": _closed_schema(json_schema)}
             }
-        response = self.client.messages.create(
+        # Streaming, not messages.create(): a long generate_script call
+        # (pipeline/script.py sizes max_tokens per scene count — a 10-12
+        # minute video runs well past the ~16000-token non-streaming
+        # ceiling) risks an HTTP timeout on a plain non-streaming request at
+        # high max_tokens. .stream() + get_final_message() returns the same
+        # Message shape create() does, so every other caller (short
+        # completions like the topic-idea/video-prompt rewrites) is
+        # unaffected — this is strictly safer, not a behavior change for them.
+        with self.client.messages.stream(
             model=self.model,
             max_tokens=max_tokens,
             system=system,
             thinking={"type": "adaptive"},
             messages=[{"role": "user", "content": prompt}],
             **kwargs,
-        )
+        ) as stream:
+            response = stream.get_final_message()
         if response.stop_reason == "max_tokens":
             raise RuntimeError(
                 "Claude response truncated at max_tokens — raise max_tokens or "

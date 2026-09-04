@@ -200,7 +200,15 @@ const state = {
   // narration + scene plan from just newTopic — needs ANTHROPIC_API_KEY).
   newGenMode: 'script',
   newTopic: '',
-  newLength: 3,
+  // Default 10 min (was 3): YouTube's mid-roll ad threshold is a hard
+  // 8:00 cutoff — below it, only pre/post-roll ads are possible, and
+  // mid-rolls roughly double RPM in the same niche. 10 gives comfortable
+  // margin above the cutoff (a video landing a little short of its
+  // target, e.g. from TTS pacing, must still clear 8:00) while fitting
+  // 2-3 natural ad breaks, matching what long-form monetized channels
+  // actually target. Topic mode only — script mode's length is whatever
+  // the pasted/generated script naturally runs.
+  newLength: 10,
   // 'landscape' (1920x1080, default) or 'shorts' (1080x1920 vertical) —
   // set by which "+ New Video"/"+ New Short" button opened the modal
   // (openModal's format arg); the modal shows which one is active but has
@@ -1302,9 +1310,18 @@ function modalHtml() {
         (isShorts
           ? '<div style="font-size:11.5px;color:#5a5a60;margin-bottom:16px">Shorts always target about 1 minute — no length to choose.</div>'
           : (
-              '<div style="font-size:12px;color:#9a9aa1;margin-bottom:6px">Target length</div>' +
+              '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">' +
+                '<span style="font-size:12px;color:#9a9aa1">Target length</span>' +
+                '<span style="font-size:11px;color:#5a5a60">8:00+ unlocks mid-roll ads</span>' +
+              '</div>' +
               '<select id="rf-length" style="width:100%;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:8px;padding:10px 12px;color:#f2f2f4;font-size:13px;font-family:\'Inter\',sans-serif;margin-bottom:16px">' +
-                [2, 3, 5, 8].map((m) => '<option value="' + m + '"' + (m === state.newLength ? ' selected' : '') + '>' + m + ' minutes</option>').join('') +
+                // YouTube's mid-roll ad threshold is a hard 8:00 cutoff — below
+                // it, only pre/post-roll ads run; above it, RPM roughly
+                // doubles in the same niche. 10/12 give margin above that
+                // line (final length can drift a little short of the
+                // target) while fitting 2-3 natural ad breaks, matching what
+                // monetized long-form channels actually target.
+                [2, 3, 5, 8, 10, 12].map((m) => '<option value="' + m + '"' + (m === state.newLength ? ' selected' : '') + '>' + m + ' minutes' + (m >= 8 ? ' · mid-roll ads' : '') + '</option>').join('') +
               '</select>'
             )
         )
@@ -1597,7 +1614,7 @@ const actions = {
     // Paywall: out of trial credits and no subscription — show plans, not
     // the create form (the backend would 402 the create anyway).
     if (state.billing && state.billing.kind === 'blocked') { state.pricingOpen = true; render(); return; }
-    state.modalOpen = true; state.newTitle = ''; state.newScript = ''; state.newTopic = ''; state.newLength = 3; state.newFormat = format === 'shorts' ? 'shorts' : 'landscape'; state.newGenMode = 'script'; state.newTopicBase = null; state.randomTopicLoading = false; suggestedTopicTitles = []; clickbaitIndex = 0; render(); const t = document.getElementById('rf-title'); if (t) t.focus();
+    state.modalOpen = true; state.newTitle = ''; state.newScript = ''; state.newTopic = ''; state.newLength = 10; state.newFormat = format === 'shorts' ? 'shorts' : 'landscape'; state.newGenMode = 'script'; state.newTopicBase = null; state.randomTopicLoading = false; suggestedTopicTitles = []; clickbaitIndex = 0; render(); const t = document.getElementById('rf-title'); if (t) t.focus();
   },
   setGenMode(mode) { state.newGenMode = mode; render(); },
   openYoutubeModal(slug) {

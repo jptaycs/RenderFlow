@@ -15,9 +15,10 @@ from renderflow.pipeline.assets import (
     generate_voice,
 )
 from renderflow.pipeline.script import generate_script
+from renderflow.providers.base import LLMResult
 from renderflow.schema import AssetStatus, Scene
 from renderflow.storage import ProjectPaths, load_plan, save_plan, slugify
-from tests.stubs import StubAvatar, StubImage, StubLLM, StubTTS
+from tests.stubs import CANNED_SCRIPT, StubAvatar, StubImage, StubLLM, StubTTS
 
 
 @pytest.fixture
@@ -47,6 +48,60 @@ def test_script_to_assets_end_to_end(paths: ProjectPaths):
         assert Path(scene.assets.voice.path).read_bytes() == b"fake-mp3"
         assert scene.assets.image.provider == "stub-image"
     assert reloaded.total_asset_cost() == pytest.approx((0.003 + 0.002) * 2)
+
+
+def test_script_max_tokens_scales_with_scene_count():
+    # Regression: a flat 16000-token ceiling (sized for short 2-3 minute
+    # videos) silently truncated any longer generate_script call — the
+    # whole point of the dashboard's 10/12-minute length options would
+    # have shipped broken without this scaling. floor/ceiling and
+    # roughly-linear growth in between.
+    from renderflow.pipeline.script import _script_max_tokens
+
+    assert _script_max_tokens(4) == 16000  # floor: a ~2-minute video
+    assert _script_max_tokens(36) > 16000  # ~3 minutes already exceeds the old flat default
+    tokens_10min = _script_max_tokens(120)
+    tokens_12min = _script_max_tokens(144)
+    assert tokens_10min < tokens_12min  # more scenes -> more budget
+    assert tokens_12min <= 128000  # never exceeds Sonnet 5/Opus 5's output cap
+
+
+class _RecordingLLM:
+    """Records the max_tokens (and other kwargs) each call received, so
+    generate_script/split_script can be checked without a live API call."""
+
+    name = "recording-llm"
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def complete(self, system, prompt, **params):
+        self.calls.append(params)
+        return LLMResult(text=json.dumps(CANNED_SCRIPT), provider=self.name, cost=0.01)
+
+
+def test_generate_script_passes_scaled_max_tokens():
+    from renderflow.pipeline.script import _script_max_tokens, generate_script
+
+    llm = _RecordingLLM()
+    generate_script(llm, "a topic", 12, "documentary")
+
+    assert len(llm.calls) == 1
+    # 12 minutes / 5 sec-per-scene -> target_scenes, same formula the
+    # production code uses.
+    expected_scenes = max(4, round(12 * 60 / 5))
+    assert llm.calls[0]["max_tokens"] == _script_max_tokens(expected_scenes)
+
+
+def test_split_script_passes_scaled_max_tokens():
+    from renderflow.pipeline.script import _script_max_tokens, split_script
+
+    llm = _RecordingLLM()
+    long_script = " ".join(["word"] * 1300)  # ~100 scenes at ~13 words/scene
+    split_script(llm, long_script, "documentary")
+
+    assert len(llm.calls) == 1
+    assert llm.calls[0]["max_tokens"] == _script_max_tokens(100)
 
 
 class _TrackingTTS:

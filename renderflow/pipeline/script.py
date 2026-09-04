@@ -66,12 +66,47 @@ Rules:
 """
 
 
+def _target_scene_count(length_minutes: float) -> int:
+    return max(4, round(length_minutes * 60 / SECONDS_PER_SCENE))
+
+
 def build_user_prompt(topic: str, length_minutes: float, style: str) -> str:
-    target_scenes = max(4, round(length_minutes * 60 / SECONDS_PER_SCENE))
+    target_scenes = _target_scene_count(length_minutes)
     return (
         f"Write a {length_minutes:g}-minute {style} video script about: {topic}\n\n"
         f"Produce about {target_scenes} scenes of roughly {SECONDS_PER_SCENE} "
         f"seconds each."
+    )
+
+
+# Rough per-scene JSON budget once every GeneratedScene field is counted:
+# narration (~10-16 words), a full photographic image_prompt (~60-100 words,
+# by far the biggest field), a negative_prompt list, plus JSON punctuation
+# overhead. Deliberately generous — max_tokens is a ceiling the model is
+# billed against only for what it actually emits, never for headroom, so
+# overshooting costs nothing while undershooting truncates the *entire*
+# response (all scenes lost, not just the last one, since it's one JSON
+# document) — see ClaudeLLM.complete's max_tokens truncation check.
+_TOKENS_PER_SCENE_ESTIMATE = 400
+_SCRIPT_MAX_TOKENS_FLOOR = 16000
+# Sonnet 5 / Opus 5's hard output-token ceiling (128K) — see claude-api skill.
+_SCRIPT_MAX_TOKENS_CEILING = 128000
+
+
+def _script_max_tokens(target_scenes: int) -> int:
+    """Added 2026-09 alongside the dashboard's 10/12-minute length options.
+
+    The prior flat 16000-token default (ClaudeLLM.complete's own default,
+    sized for short 2-3 minute topic videos) would silently truncate any
+    script beyond roughly 35-40 scenes (~3 minutes) — the whole point of
+    raising the length picker's ceiling would have shipped broken without
+    this. A 12-minute video (~144 scenes) needs up to ~60K tokens; this
+    scales with it instead of hardcoding a bigger flat number that would
+    eventually hit the same wall at some other length.
+    """
+    return min(
+        _SCRIPT_MAX_TOKENS_CEILING,
+        max(_SCRIPT_MAX_TOKENS_FLOOR, target_scenes * _TOKENS_PER_SCENE_ESTIMATE + 2000),
     )
 
 
@@ -83,6 +118,7 @@ def generate_script(
         SYSTEM_PROMPT,
         build_user_prompt(topic, length_minutes, style),
         json_schema=GeneratedScript.model_json_schema(),
+        max_tokens=_script_max_tokens(_target_scene_count(length_minutes)),
     )
     try:
         generated = GeneratedScript.model_validate_json(result.text)
@@ -197,10 +233,17 @@ def split_script(
     llm: LLMProvider, script_text: str, style: str
 ) -> tuple[ScenePlan, LLMResult]:
     """Split a client-provided script into scenes without rewriting it."""
+    # Same truncation risk as generate_script, scaled off the pasted
+    # script's own word count instead of a length_minutes target (there
+    # isn't one here — the split preserves whatever length the client
+    # already wrote) — ~13 words/scene is the midpoint of the 10-16
+    # word/scene split target in SPLIT_SYSTEM_PROMPT.
+    estimated_scenes = max(4, round(len(script_text.split()) / 13))
     result = llm.complete(
         SPLIT_SYSTEM_PROMPT,
         f"Split this {style} script into scenes:\n\n{script_text}",
         json_schema=GeneratedScript.model_json_schema(),
+        max_tokens=_script_max_tokens(estimated_scenes),
     )
     try:
         generated = GeneratedScript.model_validate_json(result.text)
