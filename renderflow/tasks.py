@@ -91,6 +91,51 @@ SCRIPT_BY_JOB_KIND = {"youtube_publish": "publish_youtube.py"}
 MAX_RUN_ATTEMPTS = 10
 RUN_RETRY_DELAY_SEC = 5
 
+
+def _resumable_job_argv(job_argv: list[str], scenes_json: Path) -> list[str]:
+    """The argv a *retry* attempt should actually use, so it resumes from
+    whatever the previous attempt already generated instead of starting
+    the whole video over.
+
+    Bug fixed 2026-09, caught live on a real 112-scene project: the retry
+    loop below reused the exact same `job.argv` on every attempt, which is
+    only actually resumable for "resume"/"regenerate"/"thumbnail" jobs —
+    every one of those is *already* built with `--scenes-file` (api.py),
+    so re-running them just reloads the persisted, partially-completed
+    plan and `AssetRef`'s state machine skips whatever's already COMPLETED
+    (per the docstring above this constant). A "create" job is different:
+    it's built with `--script-file`/`--topic` (never `--scenes-file`,
+    since there's no scenes.json yet when it's first enqueued) — and
+    `make_video.py` re-derives a *brand new* `ScenePlan` from the raw
+    script/topic on *every* invocation, regardless of any scenes.json
+    that a previous attempt already wrote to disk. So a mid-run failure
+    on a create job (e.g. a transient 69labs/Claude error at scene 90 of
+    112) auto-retried into silently discarding every already-generated,
+    already-paid-for asset and regenerating the entire video from
+    scratch — the exact opposite of what auto-retry was built for
+    (see MAX_RUN_ATTEMPTS's own docstring: "re-invoking ... just picks up
+    whatever didn't finish, never redoes completed work").
+
+    Once a plan has actually been persisted (`scenes_json.exists()` —
+    `make_video.py` calls `save_plan()` immediately after resolving
+    title/format, before any asset generation starts), every later
+    attempt should load *that* instead of re-parsing the source: same
+    `--scenes-file` argv shape "resume" already uses successfully,
+    dropping the script/topic-construction flags (title/format inside
+    the persisted plan are already correct — attempt 1 applied them
+    before its own `save_plan()` — so there's nothing left to reapply
+    except `--skip-render`, which every create job always sets and a
+    `--scenes-file` invocation understands identically).
+
+    A no-op for every job kind that already passes `--scenes-file` (every
+    non-create kind), and for a create job whose attempt 1 crashed before
+    ever reaching `save_plan()` (nothing to resume from yet either way).
+    """
+    if "--scenes-file" in job_argv or not scenes_json.exists():
+        return job_argv
+    extra = ["--skip-render"] if "--skip-render" in job_argv else []
+    return ["--scenes-file", str(scenes_json), *extra]
+
 _settings = Settings.load()
 celery_app = Celery(
     "renderflow", broker=_settings.redis_url, backend=_settings.redis_url
@@ -222,17 +267,30 @@ def run_pipeline(job_id: int) -> None:
         project_dir = Path(project.dir_path)
         paths = ProjectPaths.create(project_dir.parent, project_dir.name)
         script = SCRIPT_BY_JOB_KIND.get(job.kind, "make_video.py")
-        argv = [
-            sys.executable,
-            str(REPO_ROOT / script),
-            *job.argv,
-            "--slug",
-            project_dir.name,
-            # CLI flag, never env: Settings.load() uses
-            # load_dotenv(override=True), which clobbers inherited env vars.
-            "--projects-dir",
-            str(project_dir.parent),
-        ]
+
+        def _effective_job_argv(attempt: int) -> list[str]:
+            # Attempt 1 always uses the job's own argv verbatim; a later
+            # attempt resumes from whatever got persisted instead of
+            # re-deriving the plan from scratch — see
+            # _resumable_job_argv's docstring for why that distinction
+            # matters (only "create" jobs are actually affected).
+            if attempt == 1:
+                return job.argv
+            return _resumable_job_argv(job.argv, paths.scenes_json)
+
+        def _argv_for_attempt(attempt: int) -> list[str]:
+            return [
+                sys.executable,
+                str(REPO_ROOT / script),
+                *_effective_job_argv(attempt),
+                "--slug",
+                project_dir.name,
+                # CLI flag, never env: Settings.load() uses
+                # load_dotenv(override=True), which clobbers inherited env vars.
+                "--projects-dir",
+                str(project_dir.parent),
+            ]
+
         log_path = paths.logs / "run.log"
         # Auto-retry only the resumable pipeline (make_video.py): a failed
         # asset leaves completed ones in place (schema.AssetRef's state
@@ -250,10 +308,12 @@ def run_pipeline(job_id: int) -> None:
             session.refresh(job)  # the API may have cancelled it between attempts
             if job.status == "cancelled":
                 return
+            argv = _argv_for_attempt(attempt)
             with log_path.open("a", encoding="utf-8") as log_file:
                 log_file.write(
                     f"\n=== {datetime.now().isoformat()} job {job.id} ({job.kind}) "
-                    f"attempt {attempt}/{max_attempts} {' '.join(job.argv)} ===\n"
+                    f"attempt {attempt}/{max_attempts} "
+                    f"{' '.join(_effective_job_argv(attempt))} ===\n"
                 )
                 log_file.flush()
                 proc = subprocess.Popen(

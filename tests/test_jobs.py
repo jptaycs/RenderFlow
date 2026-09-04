@@ -32,9 +32,10 @@ def _make_project(saas_env, session, slug="demo") -> rdb.Project:
     return project
 
 
-def _make_job(session, project, status="queued", kind="resume", **kwargs) -> rdb.Job:
+def _make_job(session, project, status="queued", kind="resume", argv=None, **kwargs) -> rdb.Job:
     job = rdb.Job(
-        project_id=project.id, kind=kind, argv=["--scenes-file", "x"], status=status, **kwargs
+        project_id=project.id, kind=kind, argv=argv or ["--scenes-file", "x"],
+        status=status, **kwargs,
     )
     session.add(job)
     session.commit()
@@ -135,6 +136,64 @@ def test_run_pipeline_retries_and_recovers(saas_env, monkeypatch):
         assert job.status == "succeeded"
         assert job.error is None
     assert len(calls) == 3  # stopped retrying the moment it succeeded
+
+
+def test_run_pipeline_retries_a_create_job_via_scenes_file_once_a_plan_exists(
+    saas_env, monkeypatch
+):
+    # Regression, caught live on a real 112-scene project: retrying a
+    # "create" job (built with --script-file/--topic, never --scenes-file
+    # -- none exists yet when it's first enqueued) reused the exact same
+    # argv on every attempt. make_video.py re-derives a BRAND NEW
+    # ScenePlan from the raw script/topic on every invocation, so a
+    # mid-run failure that auto-retried was silently discarding every
+    # already-generated, already-paid-for asset and starting the whole
+    # video over -- the opposite of what auto-retry is documented to do.
+    # Once a plan has actually been persisted, a retry must resume from
+    # it via --scenes-file instead, exactly like "resume"/"regenerate"
+    # jobs already do.
+    monkeypatch.setattr(tasks.time, "sleep", lambda seconds: None)
+    with rdb.new_session() as session:
+        project = _make_project(saas_env, session)
+        job = _make_job(
+            session, project, kind="create",
+            argv=[
+                "--script-file", "source.txt", "--style", "documentary",
+                "--title", "Demo", "--format", "landscape", "--skip-render",
+            ],
+        )
+        job_id = job.id
+
+    paths = tasks.ProjectPaths.create(saas_env.projects_dir / "u1", "demo")
+    calls: list[list[str]] = []
+
+    def popen(argv, **kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            # Simulate attempt 1 getting far enough to persist a plan
+            # (make_video.py's real save_plan() call) before crashing.
+            paths.scenes_json.write_text('{"fake": "plan"}')
+            return FakeProc(returncode=1)
+        return FakeProc(returncode=0)
+
+    monkeypatch.setattr(tasks.subprocess, "Popen", popen)
+    tasks.run_pipeline(job_id)
+
+    with rdb.new_session() as session:
+        assert session.get(rdb.Job, job_id).status == "succeeded"
+    assert len(calls) == 2
+
+    attempt1, attempt2 = calls
+    assert "--script-file" in attempt1
+    assert "--scenes-file" not in attempt1
+
+    assert "--scenes-file" in attempt2
+    assert attempt2[attempt2.index("--scenes-file") + 1] == str(paths.scenes_json)
+    assert "--script-file" not in attempt2  # original source flags dropped
+    assert "--title" not in attempt2  # already correct inside the persisted plan
+    assert "--skip-render" in attempt2  # still understood by --scenes-file mode
+    # --slug/--projects-dir are always appended fresh, same on every attempt.
+    assert "--slug" in attempt2 and "--projects-dir" in attempt2
 
 
 def test_run_pipeline_does_not_retry_youtube_publish(saas_env, monkeypatch):
