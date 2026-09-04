@@ -22,6 +22,7 @@ a pid namespace with the worker anymore.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import signal
@@ -40,6 +41,44 @@ from renderflow.db import Job, Project, init_db, new_session
 from renderflow.storage import ProjectPaths
 
 log = logging.getLogger("renderflow.tasks")
+
+# Windows SetThreadExecutionState flags — see _prevent_system_sleep below.
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+
+@contextlib.contextmanager
+def _prevent_system_sleep():
+    """Hold off Windows system sleep for the duration of a pipeline run.
+
+    Added 2026-09 after a real render appeared to take ~9 hours: the log
+    showed normal ~5s status-poll cadence, then a silent multi-hour gap,
+    then polling resumed at the same cadence like nothing happened — the
+    signature of the OS suspending the process (laptop slept), not
+    anything actually slow. In eager mode (this dev machine) or a real
+    Celery worker, the thread that calls proc.wait() blocks synchronously
+    on network I/O for the whole run; if the machine sleeps mid-render, a
+    render that would otherwise finish in minutes just freezes until
+    someone wakes the machine back up, then continues from where it left
+    off — which reads as "rendering takes forever."
+
+    ES_SYSTEM_REQUIRED (not ES_DISPLAY_REQUIRED) only blocks *system*
+    sleep — the display can still turn off/lock normally, this doesn't
+    keep the screen on. Windows-only: SetThreadExecutionState doesn't
+    exist elsewhere, and a deployed Linux server doesn't sleep on its own
+    the way a laptop does, so this is a no-op there by construction.
+    """
+    if sys.platform != "win32":
+        yield
+        return
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+    try:
+        yield
+    finally:
+        kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ERROR_TAIL_CHARS = 2000
@@ -211,7 +250,11 @@ def run_pipeline(job_id: int) -> None:
                     job.started_at = time.time()
                 job.pid = proc.pid
                 session.commit()
-                returncode = proc.wait()
+                # See _prevent_system_sleep's docstring — a Windows sleep
+                # mid-wait() would otherwise freeze this render until
+                # someone wakes the machine, then silently resume.
+                with _prevent_system_sleep():
+                    returncode = proc.wait()
 
             session.refresh(job)  # the API may have marked it cancelled mid-run
             if job.status == "cancelled":

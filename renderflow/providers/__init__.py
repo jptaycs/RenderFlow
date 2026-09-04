@@ -63,22 +63,27 @@ def build_tts(settings: Settings) -> TTSProvider:
     raise ValueError(f"unknown TTS provider: {settings.tts_provider}")
 
 
-def build_broll(settings: Settings) -> VideoProvider | None:
+def build_broll(settings: Settings, name: str | None = None) -> VideoProvider | None:
     """Stock-video B-roll provider, or None when disabled (the default).
+
+    `name` overrides the configured default (used for
+    settings.shorts_broll_provider, so Shorts can run a faster/cheaper
+    provider than landscape without touching the main setting).
 
     B-roll is optional end to end: None simply means every scene renders
     from its still image, exactly as before the feature existed."""
-    if not settings.broll_provider:
+    name = name or settings.broll_provider
+    if not name:
         return None
-    if settings.broll_provider == "pexels-video":
+    if name == "pexels-video":
         from renderflow.providers.video.pexels_video import PexelsVideo
 
         return PexelsVideo()
-    if settings.broll_provider == "labs69":
+    if name == "labs69":
         from renderflow.providers.video.labs69_video import Labs69Video
 
         return Labs69Video()
-    raise ValueError(f"unknown b-roll provider: {settings.broll_provider}")
+    raise ValueError(f"unknown b-roll provider: {name}")
 
 
 def build_avatar(settings: Settings) -> AvatarProvider:

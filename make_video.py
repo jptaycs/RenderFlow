@@ -251,6 +251,15 @@ def main() -> int:
         plan.title = args.title
     if args.format:
         plan.format = args.format
+    # Shorts v1 scope skips cards and the AI clickbait thumbnail entirely
+    # (see render.py's format-gating notes and CLAUDE.md) — no point
+    # spending provider calls generating assets render_video/
+    # render_shorts_thumbnail will never use. Captions run for shorts like
+    # any other format (write_scene_subtitles renders at the correct
+    # width via pipeline.render.dims_for). Defined here (not right before
+    # its first use) because build_broll's per-format provider override
+    # also needs it, earlier in the asset-generation sequence.
+    is_shorts = plan.format == "shorts"
 
     projects_dir = args.projects_dir or settings.projects_dir
     paths = ProjectPaths.create(projects_dir, args.slug or slugify(plan.title))
@@ -267,7 +276,22 @@ def main() -> int:
     print(f"[2/4] Generating {len(plan.scenes)} images ({image.name})")
     generate_images(plan, image, paths, avatar_image=avatar_image)
 
-    broll = build_broll(settings)
+    broll_name = (
+        settings.shorts_broll_provider if is_shorts and settings.shorts_broll_provider else None
+    )
+    try:
+        broll = build_broll(settings, broll_name)
+    except Exception as exc:
+        # B-roll is optional end to end (generate_broll already falls back
+        # to the still image per scene on a *generation* failure) — a
+        # *construction* failure (e.g. RENDERFLOW_SHORTS_BROLL_PROVIDER=
+        # pexels-video set without PEXELS_API_KEY) must degrade the same
+        # way, not crash the whole run right after images were already
+        # paid for. Caught live before shipping: this exact combination
+        # (shorts B-roll override set, no Pexels key) would otherwise have
+        # raised ValueError uncaught here.
+        print(f"      B-roll provider unavailable ({exc}) — continuing without it")
+        broll = None
     if broll is not None:
         # Optional stock-video B-roll for full-frame scenes — failures fall
         # back to the still image and never block the render. labs69 is
@@ -276,7 +300,7 @@ def main() -> int:
         # pipeline/script.py::rewrite_video_prompt for why that matters.
         broll_llm = build_llm(settings) if broll.name == "labs69" else None
         print(f"      Fetching {'AI-generated' if broll_llm else 'stock'} B-roll ({broll.name})")
-        generate_broll(plan, broll, paths, llm=broll_llm)
+        generate_broll(plan, broll, paths, llm=broll_llm, max_concurrency=settings.broll_concurrency)
 
     print(f"[3/4] Generating {len(plan.scenes)} voice clips ({tts.name})")
     tts_params = {}
@@ -288,17 +312,6 @@ def main() -> int:
         tts_params["speed"] = 1.0 / settings.tts_length_scale
         tts_params["sentence_pause_sec"] = settings.tts_sentence_pause
     generate_voice(plan, tts, settings.tts_voice, paths, **tts_params)
-
-    # Shorts v1 scope skips cards and the AI clickbait thumbnail entirely
-    # (see render.py's format-gating notes and CLAUDE.md) — no point
-    # spending provider calls generating assets render_video/
-    # render_shorts_thumbnail will never use. Captions DO run for shorts
-    # (added 2026-09, right after the format shipped) — write_scene_
-    # subtitles/render_caption_png already render at the correct 1080
-    # canvas width via pipeline.render.dims_for(plan), so there's nothing
-    # format-specific left to skip; captions read as more essential for
-    # phone-viewed vertical video than for landscape, not less.
-    is_shorts = plan.format == "shorts"
 
     if settings.intro_outro and not is_shorts:
         print("      Narrating intro/outro cards")

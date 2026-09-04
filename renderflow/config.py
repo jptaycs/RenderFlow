@@ -59,6 +59,23 @@ class Settings:
     # Stock-video B-roll provider ("" = disabled, "pexels-video"). Eligible
     # full-frame scenes use a real stock clip instead of still+motion.
     broll_provider: str = ""
+    # Per-format override ("" = same as broll_provider), added 2026-09.
+    # RENDERFLOW_BROLL_PROVIDER=labs69 (real AI generation, ~60-90s/clip —
+    # see generate_broll) makes total render time scale with scene count
+    # regardless of format: a 1-minute Short still runs 6-12 scenes, the
+    # same per-scene cost as the first 6-12 scenes of a full-length video.
+    # Set to "pexels-video" (free stock search, ~1-2s/scene) to make
+    # Shorts specifically fast, independent of whatever the main
+    # broll_provider is for landscape.
+    shorts_broll_provider: str = ""
+    # How many scenes' B-roll generate_broll fetches concurrently, added
+    # 2026-09 — each find_clip call is a long, mostly-idle network wait
+    # (labs69 real generation: ~60-90s/clip), so running them one at a
+    # time meant total B-roll time scaled linearly with scene count for no
+    # good reason. 3 is a modest default: real speedup without hammering
+    # either provider's backend. 1 restores the old fully-sequential
+    # behavior.
+    broll_concurrency: int = 3
     # Background music: directory of royalty-free tracks (empty/missing dir
     # = no music) and the pre-duck music volume (0..1).
     music_dir: Path = Path("music")
@@ -143,6 +160,8 @@ class Settings:
             in ("1", "true", "yes"),
             env=os.getenv("RENDERFLOW_ENV", "dev"),
             broll_provider=os.getenv("RENDERFLOW_BROLL_PROVIDER", ""),
+            shorts_broll_provider=os.getenv("RENDERFLOW_SHORTS_BROLL_PROVIDER", ""),
+            broll_concurrency=int(os.getenv("RENDERFLOW_BROLL_CONCURRENCY", "3")),
             music_dir=Path(os.getenv("RENDERFLOW_MUSIC_DIR", "music")),
             music_volume=float(os.getenv("RENDERFLOW_MUSIC_VOLUME", "0.20")),
             transition=os.getenv("RENDERFLOW_TRANSITION", "fade"),

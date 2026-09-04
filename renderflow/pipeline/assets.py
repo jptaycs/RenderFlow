@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from renderflow.pipeline import facecheck
@@ -142,11 +144,15 @@ def generate_images(
         log.info("scene %d avatar image done (%s)", scene.id, avatar_out.name)
 
 
+DEFAULT_BROLL_CONCURRENCY = 3
+
+
 def generate_broll(
     plan: ScenePlan,
     provider: VideoProvider,
     paths: ProjectPaths,
     llm: LLMProvider | None = None,
+    max_concurrency: int = DEFAULT_BROLL_CONCURRENCY,
 ) -> None:
     """Optional stock-video B-roll for scenes rendered full-frame from a
     still (plain narration scenes, and visual-only avatar scenes).
@@ -164,18 +170,55 @@ def generate_broll(
     is a pure best-effort add-on: any failure (missing API key, rate
     limit, whatever) just falls back to the original prompt rather than
     failing the scene — B-roll must stay optional end to end either way.
+
+    Runs up to `max_concurrency` scenes' generation concurrently (added
+    2026-09) — each `find_clip` call is a long, mostly-idle network wait
+    (labs69's real AI generation runs ~60-90s per clip), so this was
+    almost entirely wasted wall-clock time when done one scene at a time:
+    a 1-minute Short still runs 6-12 scenes, the same per-scene cost as a
+    full-length video, so "quick Short" and "6-12 minutes of sequential
+    generation" were in tension. `provider.find_clip` is called
+    concurrently on the *same* provider instance from multiple threads —
+    verified safe for both bundled VideoProviders: PexelsVideo's
+    `_next_allowed` self-throttle and Labs69Video's cached `/videos/models`
+    lookup both have a benign best-effort race under concurrency (a
+    slightly-under-strict throttle window / an occasional duplicate cache
+    fetch — neither corrupts state or crashes), and Labs69Client mints a
+    fresh Idempotency-Key as a local per-call variable, never shared
+    instance state, so concurrent submits can never collide or double-bill.
+    `save_plan` (the only truly shared mutable resource — one scenes.json
+    file for the whole plan) is serialized behind a lock so concurrent
+    scene completions can never interleave writes to it.
     """
-    for scene in plan.scenes:
-        eligible = scene.type == "narration" or (
-            scene.type == "talking_avatar" and scene_is_visual_only(scene)
+    eligible_scenes = [
+        scene
+        for scene in plan.scenes
+        if (
+            scene.type == "narration"
+            or (scene.type == "talking_avatar" and scene_is_visual_only(scene))
         )
-        if not eligible or scene.broll_mode != "auto":
-            continue
+        and scene.broll_mode == "auto"
+        and not _skip(scene.assets.broll)
+    ]
+    if not eligible_scenes:
+        return
+
+    save_lock = threading.Lock()
+
+    def locked_save() -> None:
+        with save_lock:
+            save_plan(plan, paths)
+
+    # Mark every eligible scene RUNNING up front, sequentially, before any
+    # concurrent work starts — same recoverable-on-crash semantics as the
+    # old one-at-a-time loop (a crash mid-batch still leaves each scene's
+    # true state on disk), just batched into one write instead of N.
+    for scene in eligible_scenes:
+        _start(scene.assets.broll)
+    locked_save()
+
+    def generate_one(scene: Scene) -> None:
         ref = scene.assets.broll
-        if _skip(ref):
-            continue
-        _start(ref)
-        save_plan(plan, paths)
         prompt = scene.image_prompt
         rewrite_cost = 0.0
         if llm is not None:
@@ -199,8 +242,8 @@ def generate_broll(
         except Exception:
             log.warning("scene %d b-roll failed, continuing", scene.id, exc_info=True)
             ref.advance(AssetStatus.FAILED)
-            save_plan(plan, paths)
-            continue
+            locked_save()
+            return
         out = paths.broll / f"scene_{scene.id:03d}.mp4"
         out.write_bytes(asset.data)
         ref.path = str(out)
@@ -211,8 +254,15 @@ def generate_broll(
         # ScenePlan.total_asset_cost) when neither figure is known.
         ref.cost = None if asset.cost is None and rewrite_cost == 0.0 else (asset.cost or 0.0) + rewrite_cost
         ref.advance(AssetStatus.COMPLETED)
-        save_plan(plan, paths)
+        locked_save()
         log.info("scene %d b-roll done (%s)", scene.id, out.name)
+
+    with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+        # list(...) drains the map so every task finishes (and any
+        # exception a task itself failed to catch is raised here) before
+        # generate_broll returns — generate_one already catches everything
+        # it does per scene, so this should never actually raise.
+        list(pool.map(generate_one, eligible_scenes))
 
 
 def generate_voice(
