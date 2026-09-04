@@ -6,6 +6,12 @@ subprocess.Popen is stubbed so no real make_video.py ever runs.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import time
+
+import pytest
+
 from renderflow import db as rdb
 from renderflow import tasks
 
@@ -243,3 +249,25 @@ def test_recover_orphaned_jobs_kills_surviving_subprocess(saas_env, monkeypatch)
     with rdb.new_session() as session:
         assert session.get(rdb.Job, job_id).status == "failed"
     assert killed == [1234]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific process kill path")
+def test_kill_pipeline_pgid_actually_kills_a_real_process_on_windows():
+    # Regression: os.killpg/signal.SIGKILL don't exist on Windows at all
+    # (AttributeError) — caught live 2026-09 when "Cancel run" / deleting
+    # a running project 500'd instead of stopping it, leaving the
+    # subprocess orphaned and running indefinitely. taskkill /F /T is the
+    # actual fix; this spawns a real sleeping process to prove it works,
+    # not just that the code path avoids the AttributeError.
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        time.sleep(0.5)
+        assert tasks.pid_is_pipeline(proc.pid) is True
+
+        tasks.kill_pipeline_pgid(proc.pid)
+        time.sleep(0.5)
+
+        assert tasks.pid_is_pipeline(proc.pid) is False
+        assert proc.poll() is not None  # the process actually exited
+    finally:
+        proc.kill()  # safety net if the assertion above ever fails

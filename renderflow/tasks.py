@@ -109,6 +109,22 @@ if _settings.celery_eager:
 
 
 def pid_is_pipeline(pid: int) -> bool:
+    # Windows has no `ps` binary and no equivalent -o command= flag on
+    # `tasklist` — bug found live 2026-09 while verifying the eager-mode
+    # threaded-dispatch fix above: cancelling a genuinely-running project
+    # 500'd instead of stopping it, leaving the subprocess orphaned and
+    # still running. tasklist can't give us the full command line without
+    # WMI/psutil (neither in this project's dependencies), so this checks
+    # image name only — make_video.py/publish_youtube.py are always
+    # spawned as `sys.executable <script>`, i.e. python.exe, so this is
+    # the same "plausibly our pipeline, not some unrelated process reusing
+    # the pid" approximation the POSIX branch already made, just coarser.
+    if sys.platform == "win32":
+        proc = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True,
+        )
+        return proc.returncode == 0 and "python.exe" in proc.stdout.lower()
     proc = subprocess.run(
         ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True
     )
@@ -120,12 +136,24 @@ def pid_is_pipeline(pid: int) -> bool:
 
 
 def kill_pipeline_pgid(pid: int) -> None:
-    """SIGTERM the pipeline's whole process group, escalating to SIGKILL.
+    """Kill the pipeline's whole process tree.
 
-    Ported from api._kill_run: make_video.py is spawned with
-    start_new_session=True, so killpg reaches its own children (wav2lip
-    inference.py, ffmpeg) too.
+    POSIX: SIGTERM the process group (make_video.py is spawned with
+    start_new_session=True, so killpg reaches its own children too —
+    wav2lip inference.py, ffmpeg), escalating to SIGKILL if it doesn't
+    exit within 5s. Windows has neither process groups nor SIGKILL —
+    os.killpg/signal.SIGKILL don't exist there at all (AttributeError,
+    caught live 2026-09: "Cancel run" / deleting a running project 500'd
+    instead of stopping it). `taskkill /F /T` kills the whole descendant
+    tree unconditionally in one call — no graceful-then-forceful two-step
+    the way POSIX gets from SIGTERM to SIGKILL, since Windows has nothing
+    analogous to SIGTERM for an ordinary process either.
     """
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, text=True
+        )
+        return
 
     def _signal(sig: int) -> None:
         try:

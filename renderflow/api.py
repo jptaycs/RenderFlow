@@ -17,6 +17,7 @@ import json
 import logging
 import random
 import shutil
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -82,16 +83,35 @@ def _active_job(session: Session, project: Project) -> Job | None:
 def _enqueue(session: Session, project: Project, kind: str, argv: list[str]) -> Job:
     """Queue a pipeline run for the Celery worker.
 
-    The Job row must be committed *before* .delay() — the worker can pick
-    the message up faster than this request finishes, and an uncommitted
-    job id would look like a stale delivery and be dropped.
+    The Job row must be committed *before* dispatch — the worker (or, in
+    eager dev mode, the background thread below) can start faster than
+    this request finishes, and an uncommitted job id would look like a
+    stale delivery and be dropped.
     """
     job = Job(project_id=project.id, kind=kind, argv=argv)
     session.add(job)
     session.commit()
-    result = run_pipeline.delay(job.id)
-    job.celery_task_id = result.id
-    session.commit()
+    if Settings.load().celery_eager:
+        # task_always_eager makes .delay() execute the *entire* pipeline
+        # synchronously in the calling thread before returning — correct
+        # for a one-off manual CLI-style test, but it means this HTTP
+        # request doesn't return until a real render finishes, which can
+        # be many minutes. Client-reported: creating a new Short showed
+        # "Starting…" and never resolved while an unrelated 11-minute
+        # video was still generating — not actually stuck, just blocked
+        # behind that other request's full pipeline run on whichever
+        # thread picked it up. Dispatch on a background thread instead so
+        # this request returns immediately, the way a real worker's async
+        # queue would — run_pipeline opens its own DB session internally
+        # (never reuses the caller's `session`), so handing it to a
+        # different thread is safe. celery_task_id stays unset on this
+        # path; cancellation already works off job.pid, not the task id,
+        # so nothing else depends on it being set here.
+        threading.Thread(target=run_pipeline.run, args=(job.id,), daemon=True).start()
+    else:
+        result = run_pipeline.delay(job.id)
+        job.celery_task_id = result.id
+        session.commit()
     return job
 
 

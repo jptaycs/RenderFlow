@@ -242,6 +242,52 @@ def test_create_project_enqueues_a_job(client, pipeline_stub, saas_env):
     assert (saas_env.projects_dir / "u1" / slug / "script" / "source.txt").exists()
 
 
+def test_enqueue_dispatches_on_a_background_thread_in_eager_mode(client, saas_env, monkeypatch):
+    # Client-reported: creating a Short showed "Starting…" and never
+    # resolved while an unrelated 11-minute video was still generating.
+    # task_always_eager makes .delay() execute the *entire* pipeline
+    # synchronously in the calling thread — in eager mode, _enqueue must
+    # dispatch on a background thread instead (via run_pipeline.run, not
+    # .delay()) so the HTTP response isn't held open for the render.
+    import threading
+
+    from renderflow import api
+    from tests.conftest import make_settings
+
+    eager_settings = make_settings(
+        projects_dir=saas_env.projects_dir, celery_eager=True,
+    )
+    monkeypatch.setattr(api.Settings, "load", classmethod(lambda cls: eager_settings))
+
+    ran = threading.Event()
+    calls: list[int] = []
+
+    class FakeTask:
+        def run(self, job_id: int) -> None:
+            calls.append(job_id)
+            ran.set()
+
+        def delay(self, job_id: int):
+            raise AssertionError(".delay() must not be called in eager mode — use .run()")
+
+    monkeypatch.setattr(api, "run_pipeline", FakeTask())
+
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+
+    assert ran.wait(timeout=5), "background thread never invoked run_pipeline.run"
+
+    from renderflow import db as rdb
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).one()
+        assert calls == [job.id]
+        # No real Celery dispatch happened on this path, so there's no
+        # task id to record — cancellation already works off job.pid.
+        assert job.celery_task_id is None
+    assert slug  # the request itself still returned normally
+
+
 def test_create_project_topic_mode_enqueues_topic_job(client, pipeline_stub, saas_env):
     register(client, "admin@example.com")
     res = client.post(
