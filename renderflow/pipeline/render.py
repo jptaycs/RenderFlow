@@ -26,7 +26,7 @@ WIDTH, HEIGHT = 1920, 1080
 # YouTube Shorts (added 2026-09): vertical 9:16. Threaded through the
 # per-scene clip functions below as explicit width/height params (default
 # to WIDTH/HEIGHT, so every existing call site is unaffected) rather than
-# a second module-level WIDTH/HEIGHT pair — see _dims_for. Split-screen
+# a second module-level WIDTH/HEIGHT pair — see dims_for. Split-screen
 # avatar (side-by-side) has no room in a 9:16 frame, so any talking-avatar
 # scene renders full-screen solo instead when height > width (see
 # render_scene_clip) — a portrait-orientation check, not a shorts-specific
@@ -73,7 +73,7 @@ class RenderError(RuntimeError):
     pass
 
 
-def _dims_for(plan: ScenePlan) -> tuple[int, int]:
+def dims_for(plan: ScenePlan) -> tuple[int, int]:
     if plan.format == "shorts":
         return SHORTS_WIDTH, SHORTS_HEIGHT
     return WIDTH, HEIGHT
@@ -704,7 +704,7 @@ def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], l
 
 
 def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
-    width, height = _dims_for(plan)
+    width, height = dims_for(plan)
     clips: list[Path] = []
     for scene in plan.scenes:
         clip = paths.output / f"clip_{scene.id:03d}.mp4"

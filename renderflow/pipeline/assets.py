@@ -307,8 +307,13 @@ def generate_subtitles(plan: ScenePlan, paths: ProjectPaths) -> None:
     SubtitleRef has no state-machine transitions (unlike AssetRef); status is
     set directly.
     """
-    from renderflow.pipeline.render import probe_duration
+    from renderflow.pipeline.render import dims_for, probe_duration
     from renderflow.pipeline.subtitles import write_scene_subtitles
+
+    # Caption PNGs must be rendered at the actual output frame width (see
+    # write_scene_subtitles) — 1080 for shorts, 1920 for landscape — or
+    # render.py's centering overlay clips/misplaces them.
+    width, _height = dims_for(plan)
 
     for scene in plan.scenes:
         ref = scene.assets.subtitle
@@ -324,7 +329,7 @@ def generate_subtitles(plan: ScenePlan, paths: ProjectPaths) -> None:
         ref.status = AssetStatus.RUNNING
         save_plan(plan, paths)
         duration = probe_duration(Path(audio_path))
-        meta_path = write_scene_subtitles(scene, duration, paths)
+        meta_path = write_scene_subtitles(scene, duration, paths, width)
         ref.path = str(meta_path)
         ref.status = AssetStatus.COMPLETED
         save_plan(plan, paths)

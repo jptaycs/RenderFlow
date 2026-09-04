@@ -289,10 +289,15 @@ def main() -> int:
         tts_params["sentence_pause_sec"] = settings.tts_sentence_pause
     generate_voice(plan, tts, settings.tts_voice, paths, **tts_params)
 
-    # Shorts v1 scope skips cards, captions, and the AI clickbait thumbnail
-    # entirely (see render.py's format-gating notes and CLAUDE.md) — no
-    # point spending provider calls generating assets that render_video/
-    # render_shorts_thumbnail will never use.
+    # Shorts v1 scope skips cards and the AI clickbait thumbnail entirely
+    # (see render.py's format-gating notes and CLAUDE.md) — no point
+    # spending provider calls generating assets render_video/
+    # render_shorts_thumbnail will never use. Captions DO run for shorts
+    # (added 2026-09, right after the format shipped) — write_scene_
+    # subtitles/render_caption_png already render at the correct 1080
+    # canvas width via pipeline.render.dims_for(plan), so there's nothing
+    # format-specific left to skip; captions read as more essential for
+    # phone-viewed vertical video than for landscape, not less.
     is_shorts = plan.format == "shorts"
 
     if settings.intro_outro and not is_shorts:
@@ -310,7 +315,7 @@ def main() -> int:
     else:
         render_step = "[4/4]"
 
-    if settings.subtitles_enabled and not is_shorts:
+    if settings.subtitles_enabled:
         print("      Generating scene captions")
         generate_subtitles(plan, paths)
 

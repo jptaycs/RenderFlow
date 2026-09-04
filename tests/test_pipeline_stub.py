@@ -510,16 +510,22 @@ def test_render_shorts_produces_vertical_video_and_thumbnail(paths: ProjectPaths
     intro/outro cards (no AI-generated thumbnail path exists for shorts —
     render_shorts_thumbnail grabs a frame from the final video instead),
     and a split-screen-eligible talking-avatar scene falls back to
-    full-screen solo (no room for a side-by-side panel in a 9:16 frame)."""
+    full-screen solo (no room for a side-by-side panel in a 9:16 frame).
+    Captions DO run for shorts (unlike cards/AI thumbnail) — this also
+    proves a real ffmpeg overlay of a 1080-wide caption PNG onto a
+    1080-wide clip doesn't get clipped/misplaced the way a landscape
+    (1920-wide) caption PNG would if naively reused at shorts width."""
     pytest.importorskip("PIL")
     from renderflow.config import Settings
     from renderflow.pipeline.render import (
         SHORTS_HEIGHT,
         SHORTS_WIDTH,
+        dims_for,
         probe_duration,
         render_shorts_thumbnail,
         render_video,
     )
+    from renderflow.pipeline.subtitles import write_scene_subtitles
     from tests.conftest import make_settings
 
     settings = make_settings(
@@ -533,6 +539,7 @@ def test_render_shorts_produces_vertical_video_and_thumbnail(paths: ProjectPaths
     # fallback in render_scene_clip is unconditional, not dependent on the
     # scene's own avatar_layout choice.
     plan.scenes[0].type = "talking_avatar"
+    shorts_width, _ = dims_for(plan)
 
     for scene in plan.scenes:
         img = paths.images / f"scene_{scene.id:03d}.png"
@@ -565,6 +572,13 @@ def test_render_shorts_produces_vertical_video_and_thumbnail(paths: ProjectPaths
             scene.assets.avatar_clip.advance(AssetStatus.RUNNING)
             scene.assets.avatar_clip.path = str(avatar_clip)
             scene.assets.avatar_clip.advance(AssetStatus.COMPLETED)
+            caption_duration = probe_duration(avatar_clip)
+        else:
+            caption_duration = probe_duration(audio)
+
+        meta_path = write_scene_subtitles(scene, caption_duration, paths, shorts_width)
+        scene.assets.subtitle.path = str(meta_path)
+        scene.assets.subtitle.status = AssetStatus.COMPLETED
 
     final = render_video(plan, paths)
     assert final.exists()
@@ -626,6 +640,26 @@ def test_write_scene_subtitles_renders_pngs_and_json(paths: ProjectPaths):
         assert 0.0 <= entry["start"] < entry["end"] <= 6.0
 
 
+def test_write_scene_subtitles_respects_width_for_shorts(paths: ProjectPaths):
+    # Caption PNGs must be rendered at the actual output frame width — a
+    # 1920-wide PNG naively reused on a 1080-wide shorts frame would get
+    # clipped by render.py's centering overlay ((W-w)/2 goes negative).
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    from renderflow.pipeline.subtitles import load_scene_subtitles, write_scene_subtitles
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    scene = plan.scenes[0]
+    meta_path = write_scene_subtitles(scene, duration=6.0, paths=paths, width=1080)
+
+    entries = load_scene_subtitles(meta_path)
+    assert entries
+    for entry in entries:
+        with Image.open(entry["image"]) as img:
+            assert img.width == 1080
+
+
 @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
 def test_generate_subtitles_needs_completed_audio_and_is_resumable(paths: ProjectPaths):
     pytest.importorskip("PIL")
@@ -653,6 +687,39 @@ def test_generate_subtitles_needs_completed_audio_and_is_resumable(paths: Projec
 
     generate_subtitles(plan, paths)  # resume: already completed, must not redo
     assert scene.assets.subtitle.path == first_path
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_generate_subtitles_renders_shorts_width_captions(paths: ProjectPaths):
+    # generate_subtitles must resolve the caption PNG width from
+    # pipeline.render.dims_for(plan), not the hardcoded landscape default —
+    # otherwise a shorts project's captions would get clipped by render.py's
+    # centering overlay on the narrower 1080px frame.
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    from renderflow.pipeline.subtitles import load_scene_subtitles
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    plan.format = "shorts"
+    save_plan(plan, paths)
+
+    audio = paths.voice / "scene_001.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440", "-t", "2", str(audio)],
+        check=True, capture_output=True,
+    )
+    scene = plan.scenes[0]
+    scene.assets.voice.advance(AssetStatus.RUNNING)
+    scene.assets.voice.path = str(audio)
+    scene.assets.voice.advance(AssetStatus.COMPLETED)
+
+    generate_subtitles(plan, paths)
+    entries = load_scene_subtitles(scene.assets.subtitle.path)
+    assert entries
+    for entry in entries:
+        with Image.open(entry["image"]) as img:
+            assert img.width == 1080
 
 
 @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")

@@ -91,17 +91,27 @@ def build_chunks(narration: str, duration: float) -> list[tuple[str, float, floa
     return chunks
 
 
-def render_caption_png(text: str, out: Path) -> None:
+def render_caption_png(text: str, out: Path, width: int = CANVAS_W) -> None:
     """One transparent PNG, full canvas width, bold white text with a black
-    outline — the standard high-contrast caption look for narrated shorts."""
+    outline — the standard high-contrast caption look for narrated shorts.
+
+    `width` (added 2026-09 for YouTube Shorts' 1080-wide vertical canvas)
+    must match the actual output frame width: render.py's overlay filter
+    centers the PNG via `(W-w)/2` at ffmpeg-runtime, which only lands
+    flush when the PNG's own width equals the video's — a caption PNG
+    rendered at the wrong width would get clipped (too wide) or leave
+    unused margin (too narrow) rather than actually resizing. The caption
+    *band height* stays fixed (CAPTION_BAND_H) regardless of width — only
+    the max line width and horizontal centering scale with it.
+    """
     from PIL import Image, ImageDraw
 
-    image = Image.new("RGBA", (CANVAS_W, CAPTION_BAND_H), (0, 0, 0, 0))
+    image = Image.new("RGBA", (width, CAPTION_BAND_H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     font = _font(FONT_SIZE)
     upper = text.upper()
 
-    max_width = CANVAS_W * 0.88
+    max_width = width * 0.88
     lines = [upper]
     if draw.textbbox((0, 0), upper, font=font, stroke_width=STROKE_WIDTH)[2] > max_width:
         wrapped = textwrap.wrap(upper, width=max(len(upper) // 2, 8))
@@ -115,7 +125,7 @@ def render_caption_png(text: str, out: Path) -> None:
     y = (CAPTION_BAND_H - total_h) / 2
     for line, box, lh in zip(lines, line_boxes, line_heights):
         lw = box[2] - box[0]
-        x = (CANVAS_W - lw) / 2 - box[0]
+        x = (width - lw) / 2 - box[0]
         draw.text(
             (x, y - box[1]), line, font=font, fill=(255, 255, 255, 255),
             stroke_width=STROKE_WIDTH, stroke_fill=(0, 0, 0, 255),
@@ -124,13 +134,15 @@ def render_caption_png(text: str, out: Path) -> None:
     image.save(out)
 
 
-def write_scene_subtitles(scene: Scene, duration: float, paths: ProjectPaths) -> Path:
+def write_scene_subtitles(
+    scene: Scene, duration: float, paths: ProjectPaths, width: int = CANVAS_W
+) -> Path:
     """Render this scene's caption PNGs and return the chunk-timing JSON path."""
     chunks = build_chunks(scene.narration, duration)
     entries = []
     for i, (text, start, end) in enumerate(chunks):
         img = paths.subtitles / f"scene_{scene.id:03d}_{i:02d}.png"
-        render_caption_png(text, img)
+        render_caption_png(text, img, width)
         entries.append({"image": str(img), "start": start, "end": end})
     meta = paths.subtitles / f"scene_{scene.id:03d}.json"
     meta.write_text(json.dumps(entries))
