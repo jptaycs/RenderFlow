@@ -75,6 +75,30 @@ def test_submit_retries_on_429_then_succeeds(monkeypatch):
     assert len(calls) == 2
 
 
+def test_submit_falls_back_to_default_delay_on_http_date_retry_after(monkeypatch):
+    # Regression (full-app scan 2026-09): RFC 9110 allows Retry-After to be
+    # an HTTP-date string instead of delta-seconds — bare float() raised an
+    # uncaught ValueError on that form, aborting the whole retry loop
+    # instead of just falling back to the default backoff delay.
+    monkeypatch.setenv("LABS69_API_KEY", "vk_test")
+    monkeypatch.setattr(labs69_client.time, "sleep", lambda seconds: None)
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            return _json_response(
+                url, {"error": "slow down"}, status=429,
+                headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"},
+            )
+        return _json_response(url, {"id": "job1", "queuePosition": 0}, status=201)
+
+    monkeypatch.setattr(labs69_client.httpx, "post", fake_post)
+    result = Labs69Client().submit("/images/generate", {"prompt": "x"})
+    assert result["id"] == "job1"
+    assert len(calls) == 2
+
+
 def test_submit_raises_on_non_retryable_error(monkeypatch):
     monkeypatch.setenv("LABS69_API_KEY", "vk_test")
 
@@ -239,6 +263,59 @@ def test_labs69_video_pick_aspect_ratio():
     assert Labs69Video._pick_aspect_ratio(model_info) == "16:9"
     assert Labs69Video._pick_aspect_ratio({"aspectRatios": [{"value": "1:1"}]}) is None
     assert Labs69Video._pick_aspect_ratio(None) is None
+
+
+def test_labs69_video_lookup_model_is_race_free_under_concurrency(monkeypatch):
+    # Regression (full-app scan 2026-09): the old check-then-set
+    # (_model_info_fetched = True *before* the network call returned) let
+    # a thread arriving mid-fetch see the flag already True and return
+    # _model_info while it was still None — not a benign duplicate fetch,
+    # a real permanent miss for that thread's find_clip call. Forces the
+    # race window with a barrier so a second caller is guaranteed to be
+    # blocked mid-fetch when it calls _lookup_model, then asserts it still
+    # gets the real (non-None) catalog entry, not a premature None, and
+    # that the network was only hit once.
+    import threading
+
+    monkeypatch.setenv("LABS69_API_KEY", "vk_test")
+    from renderflow.providers.video.labs69_video import Labs69Video
+
+    fetch_started = threading.Event()
+    release_fetch = threading.Event()
+    fetch_calls = []
+
+    def fake_get_json(self, path):
+        fetch_calls.append(path)
+        fetch_started.set()
+        assert release_fetch.wait(timeout=5), "second caller never reached _lookup_model"
+        return {
+            "models": [{"id": "m1", "durations": ["6"], "aspectRatios": [{"value": "16:9"}]}],
+            "defaultModelId": "m1",
+        }
+
+    monkeypatch.setattr(labs69_client.Labs69Client, "get_json", fake_get_json)
+    provider = Labs69Video()
+
+    results: list[dict | None] = [None, None]
+
+    def call_first():
+        results[0] = provider._lookup_model()
+
+    def call_second():
+        fetch_started.wait(timeout=5)  # ensure we arrive while the fetch is in flight
+        release_fetch.set()
+        results[1] = provider._lookup_model()
+
+    t1 = threading.Thread(target=call_first)
+    t2 = threading.Thread(target=call_second)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert len(fetch_calls) == 1  # only one real fetch, not one per thread
+    assert results[0] is not None and results[0]["id"] == "m1"
+    assert results[1] is not None and results[1]["id"] == "m1"  # not the stale None
 
 
 def test_labs69_video_find_clip_happy_path(monkeypatch):

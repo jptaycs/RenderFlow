@@ -168,7 +168,12 @@ class Settings:
             env=os.getenv("RENDERFLOW_ENV", "dev"),
             broll_provider=os.getenv("RENDERFLOW_BROLL_PROVIDER", ""),
             shorts_broll_provider=os.getenv("RENDERFLOW_SHORTS_BROLL_PROVIDER", ""),
-            broll_concurrency=int(os.getenv("RENDERFLOW_BROLL_CONCURRENCY", "3")),
+            # Clamped to >=1 — ThreadPoolExecutor(max_workers=0) raises
+            # ValueError uncaught, which would otherwise crash an entire
+            # run (already-generated, already-paid-for images included)
+            # instead of degrading gracefully like every other B-roll
+            # failure mode. Found in a full-app scan 2026-09.
+            broll_concurrency=max(1, int(os.getenv("RENDERFLOW_BROLL_CONCURRENCY", "3"))),
             music_dir=Path(os.getenv("RENDERFLOW_MUSIC_DIR", "music")),
             music_volume=float(os.getenv("RENDERFLOW_MUSIC_VOLUME", "0.20")),
             transition=os.getenv("RENDERFLOW_TRANSITION", "fade"),

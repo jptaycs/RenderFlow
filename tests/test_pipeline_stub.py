@@ -387,6 +387,28 @@ def test_generate_images_skips_background_for_solo_scenes(paths: ProjectPaths):
     assert split.assets.avatar_image.status is AssetStatus.COMPLETED
 
 
+def test_generate_images_skips_background_for_shorts_scenes_left_on_split(
+    paths: ProjectPaths,
+):
+    # Regression (full-app scan 2026-09): a portrait Shorts render always
+    # forces every talking-avatar scene full-screen solo regardless of its
+    # own layout override (render.render_scene_clip's `height > width`
+    # check) — generate_images must know that too, or a Shorts scene left
+    # on "auto"/"split" pays for a background image render.py can never
+    # actually use.
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    plan.format = "shorts"
+    plan.scenes[0].type = "talking_avatar"  # avatar_layout stays "auto" == split
+    save_plan(plan, paths)
+
+    generate_images(plan, StubImage(), paths)
+
+    scene = load_plan(paths).scenes[0]
+    assert scene.assets.image.status is AssetStatus.PENDING
+    assert scene.assets.image.path is None
+    assert scene.assets.avatar_image.status is AssetStatus.COMPLETED
+
+
 def test_generate_images_and_avatar_clips_skip_avatar_assets_for_visual_only(
     paths: ProjectPaths,
 ):

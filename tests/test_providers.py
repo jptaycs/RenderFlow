@@ -88,6 +88,25 @@ def test_unknown_model_cost_is_none():
     assert compute_cost("some-future-model", 1000, 1000) is None
 
 
+def test_broll_concurrency_clamps_to_at_least_one(monkeypatch):
+    # Regression (full-app scan 2026-09): ThreadPoolExecutor(max_workers=0)
+    # raises ValueError uncaught — RENDERFLOW_BROLL_CONCURRENCY=0 (or
+    # negative) used to crash the entire run, including already-generated,
+    # already-paid-for images, instead of degrading gracefully like every
+    # other B-roll failure mode.
+    from renderflow import config as config_module
+
+    monkeypatch.setattr(config_module, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("RENDERFLOW_BROLL_CONCURRENCY", "0")
+    assert config_module.Settings.load().broll_concurrency == 1
+
+    monkeypatch.setenv("RENDERFLOW_BROLL_CONCURRENCY", "-5")
+    assert config_module.Settings.load().broll_concurrency == 1
+
+    monkeypatch.setenv("RENDERFLOW_BROLL_CONCURRENCY", "5")
+    assert config_module.Settings.load().broll_concurrency == 5
+
+
 def test_closed_schema_sets_additional_properties_false_recursively():
     from renderflow.providers.llm.claude import _closed_schema
     from renderflow.schema import GeneratedScript

@@ -408,30 +408,38 @@ def render_avatar_full_clip(
 
 
 def render_avatar_split_clip(
-    scene: Scene, avatar_clip: Path, visual_image: Path, out: Path
+    scene: Scene, avatar_clip: Path, visual_image: Path, out: Path,
+    width: int = WIDTH, height: int = HEIGHT,
 ) -> Path:
     # Render both panels (and hold the audio silent) for the full clip plus
     # a trailing pause — see SCENE_GAP_SEC. The avatar clip's own video ends
     # exactly when its narration does, so it needs its last frame held
     # (tpad) to cover the pause too; the visual panel is generated fresh for
     # the full padded duration, so it needs no such patch.
+    #
+    # width/height params added defensively (full-app scan 2026-09) to
+    # match every other clip-rendering function in this module — this one
+    # was the only one still hardcoding WIDTH/HEIGHT. Currently unreachable
+    # for anything but landscape (render_scene_clip's `height > width`
+    # check always routes a portrait render to render_avatar_full_clip
+    # first), but a future refactor of that routing shouldn't silently
+    # render split-screen avatar scenes at the wrong resolution.
     duration = probe_duration(avatar_clip) + SCENE_GAP_SEC
+    visual_w = width - AVATAR_W
 
-    visual = _parallax_visual(scene, VISUAL_W, HEIGHT, duration, out)
+    visual = _parallax_visual(scene, visual_w, height, duration, out)
     if visual is not None:
         right_input = ["-i", str(visual)]
         right_filter = f"[1:v]fps={FPS},setsar=1,format=yuv420p[right];"
     else:
         frames = math.ceil(duration * FPS)
-        right_zoom = _zoompan_expr(scene, frames).replace(
-            f"s={WIDTH}x{HEIGHT}", f"s={VISUAL_W}x{HEIGHT}"
-        )
+        right_zoom = _zoompan_expr(scene, frames, visual_w, height)
         right_input = ["-loop", "1", "-i", str(visual_image)]
         right_filter = f"[1:v]{right_zoom},format=yuv420p[right];"
 
     filter_complex = (
-        f"[0:v]scale={AVATAR_W}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={AVATAR_W}:{HEIGHT},fps={FPS},setsar=1,"
+        f"[0:v]scale={AVATAR_W}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={AVATAR_W}:{height},fps={FPS},setsar=1,"
         f"tpad=stop_mode=clone:stop_duration={SCENE_GAP_SEC:.3f},format=yuv420p[left];"
         + right_filter +
         "[left][right]hstack=inputs=2[vbase]"

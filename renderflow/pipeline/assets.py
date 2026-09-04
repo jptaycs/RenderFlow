@@ -86,8 +86,15 @@ def generate_images(
         # Solo-layout scenes (see scene_is_avatar_solo) render the avatar
         # full-screen with no background visual — skip generating an image
         # that render.py will never use, saving cost/time and rate-limit
-        # budget on ~1/3 of scenes.
-        is_solo = scene.type == "talking_avatar" and scene_is_avatar_solo(scene)
+        # budget on ~1/3 of scenes. A portrait (Shorts) render forces EVERY
+        # talking-avatar scene full-screen regardless of its own layout
+        # override (render_scene_clip's `height > width` check) — without
+        # this plan.format check, a Shorts scene left on "auto"/"split"
+        # would still generate (and pay for) a background image render.py
+        # can never actually use. Bug found in a full-app scan 2026-09.
+        is_solo = scene.type == "talking_avatar" and (
+            plan.format == "shorts" or scene_is_avatar_solo(scene)
+        )
         if not is_solo and not _skip(ref):
             _start(ref)
             save_plan(plan, paths)
@@ -241,20 +248,32 @@ def generate_broll(
             )
         except Exception:
             log.warning("scene %d b-roll failed, continuing", scene.id, exc_info=True)
-            ref.advance(AssetStatus.FAILED)
-            locked_save()
+            with save_lock:
+                ref.advance(AssetStatus.FAILED)
+                save_plan(plan, paths)
             return
         out = paths.broll / f"scene_{scene.id:03d}.mp4"
         out.write_bytes(asset.data)
-        ref.path = str(out)
-        ref.provider = asset.provider
-        # asset.cost is None on a credit-based 69labs account (unknown, not
-        # free — see cost_from_status); still record a known rewrite_cost
-        # rather than losing it to that None, but stay None (excluded from
-        # ScenePlan.total_asset_cost) when neither figure is known.
-        ref.cost = None if asset.cost is None and rewrite_cost == 0.0 else (asset.cost or 0.0) + rewrite_cost
-        ref.advance(AssetStatus.COMPLETED)
-        locked_save()
+        # The ref mutations and the save must share one lock acquisition,
+        # not just the save call — separate statements can be interleaved
+        # by another thread's own locked save (a scene's ref would briefly
+        # serialize with e.g. path set but provider/status not yet updated).
+        # Found in a full-app scan 2026-09 after generate_broll gained
+        # concurrency.
+        with save_lock:
+            ref.path = str(out)
+            ref.provider = asset.provider
+            # asset.cost is None on a credit-based 69labs account (unknown,
+            # not free — see cost_from_status); still record a known
+            # rewrite_cost rather than losing it to that None, but stay
+            # None (excluded from ScenePlan.total_asset_cost) when neither
+            # figure is known.
+            ref.cost = (
+                None if asset.cost is None and rewrite_cost == 0.0
+                else (asset.cost or 0.0) + rewrite_cost
+            )
+            ref.advance(AssetStatus.COMPLETED)
+            save_plan(plan, paths)
         log.info("scene %d b-roll done (%s)", scene.id, out.name)
 
     with ThreadPoolExecutor(max_workers=max_concurrency) as pool:

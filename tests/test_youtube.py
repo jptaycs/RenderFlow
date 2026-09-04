@@ -66,6 +66,23 @@ class _FakeYouTubeClient:
         return self.thumbnails_resource
 
 
+def test_token_paths_are_anchored_to_the_repo_root_not_cwd():
+    # Regression (full-app scan 2026-09): TOKEN_PATH/CLIENT_SECRET_PATH
+    # used to be bare relative paths (Path(".youtube_token.json")),
+    # resolved against whatever the current process's cwd happened to be —
+    # api.py's in-process is_connected() check had nothing anchoring it,
+    # unlike tasks.py's explicit cwd=REPO_ROOT spawn of publish_youtube.py.
+    from renderflow import youtube as yt
+
+    assert yt.TOKEN_PATH.is_absolute()
+    assert yt.CLIENT_SECRET_PATH.is_absolute()
+    assert yt.TOKEN_PATH.parent == yt.REPO_ROOT
+    assert yt.CLIENT_SECRET_PATH.parent == yt.REPO_ROOT
+    # REPO_ROOT must actually be the repo root, not some other ancestor.
+    assert (yt.REPO_ROOT / "CLAUDE.md").exists()
+    assert (yt.REPO_ROOT / "make_video.py").exists()
+
+
 def test_is_connected_reflects_token_file(tmp_path, monkeypatch):
     from renderflow import youtube as yt
 

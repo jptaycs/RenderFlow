@@ -120,6 +120,43 @@ def test_broll_runs_scenes_concurrently_and_writes_valid_state(tmp_path: Path):
     assert all(s.assets.broll.status is AssetStatus.COMPLETED for s in reloaded.scenes)
 
 
+def test_broll_never_saves_a_scene_mid_mutation_under_concurrency(tmp_path: Path, monkeypatch):
+    # Regression (full-app scan 2026-09): generate_one used to set
+    # ref.path/provider/cost, THEN advance to COMPLETED, THEN call the
+    # locked save — only the save itself was inside save_lock. Another
+    # scene's own locked save could serialize this scene's ref in the
+    # window between those statements (path already set, status still
+    # RUNNING). The whole mutate-then-save sequence is now one locked
+    # block per scene; assert no snapshot ever shows that torn state.
+    import renderflow.pipeline.assets as assets_module
+
+    paths = ProjectPaths.create(tmp_path, "demo")
+    scenes = [_scene(i) for i in range(1, 9)]
+    plan = _plan(*scenes)
+    provider = _ConcurrencyTrackingVideo()
+
+    snapshots: list[dict] = []
+    real_save_plan = assets_module.save_plan
+
+    def spying_save_plan(plan_, paths_):
+        snapshots.append(plan_.model_dump())
+        real_save_plan(plan_, paths_)
+
+    monkeypatch.setattr(assets_module, "save_plan", spying_save_plan)
+
+    generate_broll(plan, provider, paths, max_concurrency=4)
+
+    assert len(snapshots) >= len(scenes)  # at least one save per scene, plus the initial batch
+    for snapshot in snapshots:
+        for scene in snapshot["scenes"]:
+            broll = scene["assets"]["broll"]
+            if broll["path"] is not None:
+                assert broll["status"] == "completed", (
+                    f"scene {scene['id']} snapshot has path set but status "
+                    f"{broll['status']!r} — a torn mid-mutation save"
+                )
+
+
 def test_broll_concurrency_one_matches_old_sequential_behavior(tmp_path: Path):
     # max_concurrency=1 is the escape hatch back to the pre-2026-09
     # one-at-a-time behavior — must still fully work.

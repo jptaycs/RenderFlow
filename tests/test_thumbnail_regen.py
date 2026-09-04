@@ -109,3 +109,58 @@ def test_failed_generation_keeps_old_thumbnail_and_freshness(tmp_path, monkeypat
     # final.mp4 must not have been demoted to stale by the aborted run.
     assert (paths.output / "thumbnail.jpg").read_bytes() == b"old-thumb"
     assert final.stat().st_mtime >= paths.scenes_json.stat().st_mtime
+
+
+def test_shorts_regenerate_uses_the_free_frame_grab_not_the_paid_pipeline(
+    tmp_path, monkeypatch
+):
+    # Regression (full-app scan 2026-09): --thumbnail-only had no
+    # plan.format check, so regenerating a Shorts project's thumbnail ran
+    # the paid AI clickbait background+reaction pipeline that normal Shorts
+    # creation deliberately skips — real provider cost on an image a Shorts
+    # project never displays. Must call the same $0 render_shorts_thumbnail
+    # frame-grab the normal render path uses instead.
+    paths = ProjectPaths.create(tmp_path, "demo")
+    plan = _plan()
+    plan.format = "shorts"
+    save_plan(plan, paths)
+    (paths.output / "thumbnail.jpg").write_bytes(b"old-thumb")
+    final = paths.output / "final.mp4"
+    final.write_bytes(b"video")
+
+    called_paid_pipeline = {"generate": False, "render": False}
+    monkeypatch.setattr(
+        make_video, "generate_thumbnail",
+        lambda *a, **k: called_paid_pipeline.__setitem__("generate", True),
+    )
+    monkeypatch.setattr(
+        make_video, "render_thumbnail",
+        lambda *a, **k: called_paid_pipeline.__setitem__("render", True),
+    )
+
+    def fake_shorts_thumbnail(final_, paths_):
+        assert not (paths_.output / "thumbnail.jpg").exists()  # old one deleted first
+        (paths_.output / "thumbnail.jpg").write_bytes(b"new-frame-grab")
+        return paths_.output / "thumbnail.jpg"
+
+    monkeypatch.setattr(make_video, "render_shorts_thumbnail", fake_shorts_thumbnail)
+
+    assert make_video._regenerate_thumbnail(plan, paths, StubImage(), StubImage(), None) == 0
+
+    assert not called_paid_pipeline["generate"]
+    assert not called_paid_pipeline["render"]
+    assert (paths.output / "thumbnail.jpg").read_bytes() == b"new-frame-grab"
+
+
+def test_shorts_regenerate_without_a_final_video_reports_failure_not_a_crash(
+    tmp_path, monkeypatch
+):
+    paths = ProjectPaths.create(tmp_path, "demo")
+    plan = _plan()
+    plan.format = "shorts"
+    save_plan(plan, paths)
+    # No final.mp4 yet — render_shorts_thumbnail has nothing to grab a frame
+    # from (see its own "only meaningful once final.mp4 exists" docstring).
+
+    assert make_video._regenerate_thumbnail(plan, paths, StubImage(), StubImage(), None) == 1
+    assert not (paths.output / "thumbnail.jpg").exists()

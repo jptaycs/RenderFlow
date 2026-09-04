@@ -25,8 +25,16 @@ from typing import Any
 
 log = logging.getLogger("renderflow.youtube")
 
-TOKEN_PATH = Path(".youtube_token.json")
-CLIENT_SECRET_PATH = Path(".youtube_client_secret.json")
+# Anchored to the repo root (same pattern as tasks.py's REPO_ROOT), not a
+# bare relative path — api.py calls is_connected() in-process (see the
+# module docstring above; that one check is a local file-existence read,
+# not an external API call, so it doesn't need the subprocess indirection
+# publish_youtube.py uses for the actual upload). A relative path would
+# silently resolve against whatever the API/worker process's cwd happens
+# to be instead of always the repo root. Found in a full-app scan 2026-09.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TOKEN_PATH = REPO_ROOT / ".youtube_token.json"
+CLIENT_SECRET_PATH = REPO_ROOT / ".youtube_client_secret.json"
 # youtube.upload alone covers both videos.insert and thumbnails.set —
 # verified against the live API docs 2026-09 rather than assumed; no need
 # for the broader (and riskier, full read/write) `youtube` scope.

@@ -128,6 +128,23 @@ def _regenerate_thumbnail(
         final.exists()
         and final.stat().st_mtime >= paths.scenes_json.stat().st_mtime
     )
+    if plan.format == "shorts":
+        # Shorts thumbnails are a free frame-grab from final.mp4
+        # (render_shorts_thumbnail), never the paid AI clickbait
+        # background+reaction pipeline landscape uses — main()'s normal
+        # generation path already skips that pipeline for shorts (see the
+        # is_shorts gating above). Without this check, --thumbnail-only
+        # (and the dashboard's "New thumbnail" button) unconditionally ran
+        # the paid path for every format, spending real provider cost on a
+        # 1280x720 landscape image a Shorts project never displays. Bug
+        # found in a full-app scan 2026-09.
+        (paths.output / "thumbnail.jpg").unlink(missing_ok=True)
+        thumb = render_shorts_thumbnail(final, paths)
+        if thumb is None:
+            print("No final.mp4 yet — resume the render first, then regenerate the thumbnail.")
+            return 1
+        print(f"\nDone: {thumb}")
+        return 0
     # COMPLETED is terminal in the asset state machine — a regenerate is a
     # fresh asset, not a transition.
     plan.thumbnail = AssetRef()

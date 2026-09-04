@@ -298,6 +298,11 @@ def _project_view(
         for s in plan.scenes
     ]
 
+    # Must sum to plan.total_asset_cost() (the displayed total below) — it
+    # used to omit B-Roll and the plan-level thumbnail/intro/outro assets
+    # entirely, so the per-module breakdown silently undercounted real
+    # spend (e.g. every narrated intro/outro card). Found in a full-app
+    # scan 2026-09.
     cost_by_category = {
         "Images": sum(
             (s.assets.image.cost or 0.0) + (s.assets.avatar_image.cost or 0.0)
@@ -305,6 +310,12 @@ def _project_view(
         ),
         "Voice": sum(s.assets.voice.cost or 0.0 for s in plan.scenes),
         "Avatar": sum(s.assets.avatar_clip.cost or 0.0 for s in plan.scenes),
+        "B-Roll": sum(s.assets.broll.cost or 0.0 for s in plan.scenes),
+        "Branding": (
+            (plan.thumbnail.cost or 0.0)
+            + (plan.intro_audio.cost or 0.0)
+            + (plan.outro_audio.cost or 0.0)
+        ),
     }
 
     cost = plan.total_asset_cost()

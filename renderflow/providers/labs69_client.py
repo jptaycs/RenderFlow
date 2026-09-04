@@ -123,7 +123,15 @@ class Labs69Client:
                 delay = min(delay * 2, 30.0)
                 continue
             if response.status_code in _RETRYABLE_STATUS and attempt < max_retries:
-                retry_after = float(response.headers.get("Retry-After", delay))
+                # Retry-After can legally be an HTTP-date string instead of
+                # delta-seconds (RFC 9110) — bare float() raised an
+                # uncaught ValueError on that form, skipping the backoff
+                # entirely instead of just falling back to the default
+                # delay. Found in a full-app scan 2026-09.
+                try:
+                    retry_after = float(response.headers.get("Retry-After", delay))
+                except (TypeError, ValueError):
+                    retry_after = delay
                 log.warning(
                     "69labs POST %s -> %d, retrying in %.1fs (attempt %d/%d)",
                     path, response.status_code, retry_after, attempt, max_retries,

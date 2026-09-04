@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Any
 
 from renderflow.providers.base import GeneratedAsset
@@ -45,28 +46,49 @@ class Labs69Video:
         self.model = model or os.environ.get("RENDERFLOW_LABS69_VIDEO_MODEL") or None
         self._model_info: dict[str, Any] | None = None
         self._model_info_fetched = False
+        self._model_info_lock = threading.Lock()
 
     def _lookup_model(self) -> dict[str, Any] | None:
         """Best-effort model-catalog lookup for the active model's valid
         durations/aspectRatios. Fetched once and cached; a failure here
         just means generation falls back to omitting those optional
         params rather than blocking B-roll entirely (B-roll is optional
-        end to end — see generate_broll)."""
+        end to end — see generate_broll).
+
+        Double-checked locking (added 2026-09, full-app scan): under
+        generate_broll's concurrent ThreadPoolExecutor, the old
+        check-then-set (`_model_info_fetched = True` before the network
+        call returns) let a second thread see the flag already True and
+        return `_model_info` while it was still None — not the "occasional
+        duplicate fetch" this was assumed to be, but a real miss: that
+        thread's find_clip call silently omitted duration/aspectRatio for
+        the whole life of the provider instance. Fixed with a lock AND by
+        moving `_model_info_fetched = True` to after the fetch actually
+        resolves (success or failure) — setting it first, even under the
+        lock, would have left the *unlocked* fast-path check above just as
+        racy as the original bug, only one line later. Every concurrent
+        caller now either does the one real fetch or blocks until it
+        finishes and reads the now-populated (or now-given-up-on) cache.
+        """
         if self._model_info_fetched:
             return self._model_info
-        self._model_info_fetched = True
-        try:
-            catalog = self.client.get_json("/videos/models")
-        except Exception:
-            log.warning(
-                "could not fetch 69labs /videos/models, using request defaults",
-                exc_info=True,
-            )
-            return None
-        models = catalog.get("models") or []
-        target = self.model or catalog.get("defaultModelId")
-        self._model_info = next((m for m in models if m.get("id") == target), None)
-        return self._model_info
+        with self._model_info_lock:
+            if self._model_info_fetched:
+                return self._model_info
+            try:
+                catalog = self.client.get_json("/videos/models")
+            except Exception:
+                log.warning(
+                    "could not fetch 69labs /videos/models, using request defaults",
+                    exc_info=True,
+                )
+                self._model_info_fetched = True
+                return None
+            models = catalog.get("models") or []
+            target = self.model or catalog.get("defaultModelId")
+            self._model_info = next((m for m in models if m.get("id") == target), None)
+            self._model_info_fetched = True
+            return self._model_info
 
     @staticmethod
     def _pick_duration(

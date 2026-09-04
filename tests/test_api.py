@@ -207,6 +207,49 @@ def test_project_view_computes_profit_and_production_time(tmp_path):
     assert view["profit"] == pytest.approx(25.0 - view["cost"])
 
 
+def test_project_view_cost_by_category_sums_to_the_displayed_total(tmp_path):
+    # Regression (full-app scan 2026-09): costByCategory only covered
+    # per-scene Images/Voice/Avatar — B-Roll and the plan-level thumbnail/
+    # intro/outro assets were silently missing from the per-module
+    # breakdown even though plan.total_asset_cost() (the displayed total)
+    # includes all of them.
+    import pytest
+
+    from renderflow import api
+    from renderflow.db import Project
+    from renderflow.schema import AssetRef, AssetStatus, Scene, SceneAssets, ScenePlan
+    from renderflow.storage import ProjectPaths, save_plan
+
+    paths = ProjectPaths.create(tmp_path, "demo")
+    scene = Scene(
+        id=1,
+        type="narration",
+        duration_estimate_sec=5.0,
+        narration="Hello.",
+        image_prompt="A photo.",
+        assets=SceneAssets(
+            image=AssetRef(status=AssetStatus.COMPLETED, path="x", cost=0.01),
+            voice=AssetRef(status=AssetStatus.COMPLETED, path="x", cost=0.02),
+            broll=AssetRef(status=AssetStatus.COMPLETED, path="x", cost=0.03),
+        ),
+    )
+    plan = ScenePlan(
+        title="Demo", style="documentary", scenes=[scene],
+        thumbnail=AssetRef(status=AssetStatus.COMPLETED, path="x", cost=0.04),
+        intro_audio=AssetRef(status=AssetStatus.COMPLETED, path="x", cost=0.05),
+        outro_audio=AssetRef(status=AssetStatus.COMPLETED, path="x", cost=0.06),
+    )
+    save_plan(plan, paths)
+    project = Project(owner_id=1, slug="demo", title="Demo", dir_path=str(paths.root))
+
+    view = api._project_view(project, plan, paths, job=None)
+
+    assert view["cost"] == pytest.approx(0.01 + 0.02 + 0.03 + 0.04 + 0.05 + 0.06)
+    assert sum(view["costByCategory"].values()) == pytest.approx(view["cost"])
+    assert view["costByCategory"]["B-Roll"] == pytest.approx(0.03)
+    assert view["costByCategory"]["Branding"] == pytest.approx(0.04 + 0.05 + 0.06)
+
+
 """Endpoint tests: ownership scoping, the job queue, quotas, file serving.
 
 These use the fixtures in conftest.py — in-memory SQLite and a stubbed
