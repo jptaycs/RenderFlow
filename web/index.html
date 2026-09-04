@@ -185,6 +185,13 @@ const state = {
   selectedSlug: null,
   detailTab: 'pipeline',
   selectedSceneId: null,
+  // Slug of the project whose inline video preview is expanded in the
+  // detail view's video card (null = collapsed everywhere). Lets a viewer
+  // watch the render before deciding whether to actually download a copy
+  // to their own machine — previously "Download MP4" was the only way to
+  // see the finished video at all, download-only, forcing a full local
+  // copy just to check it.
+  previewSlug: null,
   modalOpen: false,
   newTitle: '',
   newTopicBase: null,
@@ -979,19 +986,29 @@ function detailScreenHtml() {
       : p.videoUrl
       ? '<div data-act="openYoutubeModal" data-arg="' + esc(p.slug) + '" style="background:transparent;border:1px solid #33333a;color:#c8c8cc;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;flex-shrink:0">▶ Publish to YouTube</div>'
       : '';
+    // Preview plays the video inline (native <video controls>, streamed —
+    // the browser fetches only what it plays/buffers, not the whole file
+    // up front) instead of forcing a full local download just to check
+    // the render. "Download MP4" stays for anyone who wants an actual
+    // copy; preview is the lightweight look-before-you-download path.
+    const previewOpen = state.previewSlug === p.slug && p.videoUrl;
+    const thumbClickable = p.videoUrl && !previewOpen;
     const videoCard = (p.videoUrl || p.thumbnailUrl) ? ('' +
       '<div style="background:#161618;border:1px solid #26262a;border-radius:14px;padding:22px;margin-bottom:26px;display:flex;gap:22px;align-items:center;flex-wrap:wrap">' +
-        '<div style="width:220px;height:124px;flex-shrink:0;border-radius:10px;' + thumbBg(dlThumb) + ';display:flex;align-items:center;justify-content:center">' +
+        '<div' + (thumbClickable ? ' data-act="togglePreview" data-arg="' + esc(p.slug) + '"' : '') + ' style="width:220px;height:124px;flex-shrink:0;border-radius:10px;position:relative;' + thumbBg(dlThumb) + ';display:flex;align-items:center;justify-content:center;' + (thumbClickable ? 'cursor:pointer' : '') + '">' +
           (dlThumb ? '' : '<span style="font-family:\'JetBrains Mono\',monospace;font-size:11px;color:#4c4c52">NO THUMBNAIL</span>') +
+          (thumbClickable ? '<span style="position:absolute;width:40px;height:40px;border-radius:50%;background:rgba(0,0,0,0.55);color:#ffffff;font-size:15px;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px)">▶</span>' : '') +
         '</div>' +
         '<div style="flex:1;min-width:220px">' +
           '<div style="font-size:14px;font-weight:600;margin-bottom:4px">' + (p.videoUrl ? 'Final render ready' : 'Thumbnail ready') + '</div>' +
           '<div style="font-size:12.5px;color:#8a8a91">' + (p.videoUrl ? (mmss(p.estDurationSec) + ' · 1080p · MP4') : '1280×720 · JPG') + '</div>' +
         '</div>' +
+        (p.videoUrl ? '<div data-act="togglePreview" data-arg="' + esc(p.slug) + '" style="background:transparent;border:1px solid #33333a;color:#c8c8cc;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;flex-shrink:0">' + (previewOpen ? '✕ Close preview' : '▶ Preview') + '</div>' : '') +
         (p.videoUrl ? '<a href="' + esc(p.videoUrl) + '" download="' + esc(downloadFilename(p.title)) + '" style="background:#FF0000;color:#ffffff;font-weight:600;font-size:13px;padding:9px 16px;border-radius:8px;cursor:pointer;display:inline-flex;text-decoration:none;flex-shrink:0">Download MP4</a>' : '') +
         downloadThumbBtn +
         regenThumbBtn +
         ytBtn +
+        (previewOpen ? '<video id="rf-preview-video" data-slug="' + esc(p.slug) + '" controls preload="metadata" poster="' + esc(dlThumb || '') + '" style="flex-basis:100%;width:100%;max-height:520px;border-radius:10px;background:#000;margin-top:4px" src="' + esc(p.videoUrl) + '"></video>' : '') +
       '</div>') : '';
 
     const stages = p.stages.map((stage, i) => {
@@ -1434,6 +1451,17 @@ function render() {
   const prevPanel = document.getElementById('rf-panel');
   const panelScroll = prevPanel && panelKey === lastPanelKey ? prevPanel.scrollTop : 0;
   panelJustOpened = panelKey !== '' && panelKey !== lastPanelKey;
+  // The whole view is rebuilt via innerHTML on every poll tick (up to every
+  // 2.5s, sooner if some other project has a running job — see refresh()'s
+  // lastStateJson diff), which would otherwise yank playback position and
+  // pause an open video preview mid-watch on every tick. Same
+  // capture-before/restore-after trick as scroll position above, keyed to
+  // the same project (data-slug) so switching previews doesn't carry over
+  // a stale playback position onto a different video.
+  const prevVideo = document.getElementById('rf-preview-video');
+  const videoState = prevVideo && prevVideo.dataset.slug === state.previewSlug
+    ? { slug: prevVideo.dataset.slug, time: prevVideo.currentTime, paused: prevVideo.paused }
+    : null;
 
   let main;
   if (state.screen === 'activity') main = activityScreenHtml();
@@ -1460,6 +1488,18 @@ function render() {
   if (newPanel && panelScroll) newPanel.scrollTop = panelScroll;
   lastViewKey = viewKey;
   lastPanelKey = panelKey;
+
+  if (videoState) {
+    const newVideo = document.getElementById('rf-preview-video');
+    if (newVideo && newVideo.dataset.slug === videoState.slug) {
+      // src is byte-identical across this re-render (same cache-busted
+      // videoUrl unless the file actually changed underneath), so setting
+      // currentTime resumes exactly where it was rather than rebuffering
+      // from scratch.
+      newVideo.currentTime = videoState.time;
+      if (!videoState.paused) newVideo.play().catch(() => {});
+    }
+  }
 
   const title = document.getElementById('rf-title');
   const script = document.getElementById('rf-script');
@@ -1528,12 +1568,13 @@ let clickbaitIndex = 0;
 let suppressBaseReset = false;
 
 const actions = {
-  goProjects() { state.screen = 'projects'; state.selectedSlug = null; state.selectedSceneId = null; render(); },
-  goShorts() { state.screen = 'shorts'; state.selectedSlug = null; state.selectedSceneId = null; render(); },
+  goProjects() { state.screen = 'projects'; state.selectedSlug = null; state.selectedSceneId = null; state.previewSlug = null; render(); },
+  goShorts() { state.screen = 'shorts'; state.selectedSlug = null; state.selectedSceneId = null; state.previewSlug = null; render(); },
   goActivity() { state.screen = 'activity'; render(); },
   goStack() { state.screen = 'stack'; render(); },
   goReporting() { state.screen = 'reporting'; render(); },
-  openProject(slug) { state.screen = 'detail'; state.selectedSlug = slug; state.detailTab = 'pipeline'; render(); },
+  openProject(slug) { state.screen = 'detail'; state.selectedSlug = slug; state.detailTab = 'pipeline'; state.previewSlug = null; render(); },
+  togglePreview(slug) { state.previewSlug = state.previewSlug === slug ? null : slug; render(); },
   openProjectRevenue(slug) { state.screen = 'detail'; state.selectedSlug = slug; state.detailTab = 'revenue'; render(); },
   setTabPipeline() { state.detailTab = 'pipeline'; render(); },
   setTabCost() { state.detailTab = 'cost'; render(); },
