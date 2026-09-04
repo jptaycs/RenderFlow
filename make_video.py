@@ -330,8 +330,15 @@ def main() -> int:
         tts_params["sentence_pause_sec"] = settings.tts_sentence_pause
     generate_voice(plan, tts, settings.tts_voice, paths, **tts_params)
 
-    if settings.intro_outro and not is_shorts:
-        print("      Narrating intro/outro cards")
+    if settings.intro_outro:
+        # Shorts (added 2026-09, client request: "at the end of video of
+        # short make a question also... that will leave the viewer a
+        # message") get the outro narration too, just not the intro —
+        # include_intro=False skips plan.intro_audio since Shorts have no
+        # intro card at all (v1 scope, hook-first), but still resolves
+        # plan.outro_text/outro_audio for render.py's Shorts-specific
+        # closing clip (_shorts_outro_clip).
+        print("      Narrating intro/outro cards" if not is_shorts else "      Narrating closing message")
         # Best-effort: a missing/invalid ANTHROPIC_API_KEY, rate limit, or
         # any other failure just falls back to the plain "thanks for
         # watching" outro inside generate_branding_audio — same optional,
@@ -342,7 +349,7 @@ def main() -> int:
             engagement_llm = None
         generate_branding_audio(
             plan, tts, settings.tts_voice, settings.channel_name, paths,
-            llm=engagement_llm, **tts_params
+            llm=engagement_llm, include_intro=not is_shorts, **tts_params
         )
 
     avatar_scene_count = sum(scene.type == "talking_avatar" for scene in plan.scenes)

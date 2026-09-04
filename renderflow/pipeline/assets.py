@@ -340,6 +340,7 @@ def generate_branding_audio(
     channel_name: str,
     paths: ProjectPaths,
     llm: LLMProvider | None = None,
+    include_intro: bool = True,
     **tts_params,
 ) -> None:
     """Narrate the intro title card and the outro subscribe card with the
@@ -357,22 +358,40 @@ def generate_branding_audio(
     and best-effort — a missing key, rate limit, or any other failure just
     falls back to the plain subscribe line via `_outro_line`'s default,
     same as every other LLM-dependent optional feature in this pipeline
-    (rewrite_video_prompt, generate_topic_idea).
+    (rewrite_video_prompt, generate_topic_idea). The resolved text is
+    persisted to `plan.outro_text` regardless of which branch produced
+    it, so render.py can show the *same* words on-screen (the landscape
+    outro card, and Shorts' closing caption) instead of a fixed generic
+    line unrelated to what's actually being said.
+
+    `include_intro=False` (added 2026-09, client request: a Shorts closing
+    message too) skips `plan.intro_audio` entirely — Shorts have no intro
+    card at all (v1 scope, hook-first) so there's nothing to narrate there,
+    but they still get an outro line for render.py's Shorts-specific
+    closing clip (see render.render_video's shorts branch).
     """
-    outro_text = _outro_line(channel_name)
-    if llm is not None:
-        try:
-            question, _ = generate_engagement_question(llm, plan)
-            outro_text = _outro_line(channel_name, question)
-        except Exception:
-            log.warning(
-                "engagement question generation failed, using the plain "
-                "subscribe line instead", exc_info=True,
-            )
-    for ref, text, name in (
-        (plan.intro_audio, plan.title, "intro"),
-        (plan.outro_audio, outro_text, "outro"),
-    ):
+    # Resolved (and `plan.outro_text` persisted) only when the outro
+    # actually needs (re)generating — resuming an already-COMPLETED outro
+    # must never overwrite plan.outro_text with a freshly-reworded
+    # question that wasn't the one actually synthesized into the existing
+    # audio file (the LLM call is non-deterministic; re-running it here
+    # would desync the caption/card text from what's actually spoken).
+    if not _skip(plan.outro_audio):
+        outro_text = _outro_line(channel_name)
+        if llm is not None:
+            try:
+                question, _ = generate_engagement_question(llm, plan)
+                outro_text = _outro_line(channel_name, question)
+            except Exception:
+                log.warning(
+                    "engagement question generation failed, using the plain "
+                    "subscribe line instead", exc_info=True,
+                )
+        plan.outro_text = outro_text
+    refs = [(plan.outro_audio, plan.outro_text or _outro_line(channel_name), "outro")]
+    if include_intro:
+        refs.insert(0, (plan.intro_audio, plan.title, "intro"))
+    for ref, text, name in refs:
         if _skip(ref):
             continue
         _start(ref)

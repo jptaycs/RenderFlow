@@ -884,6 +884,173 @@ def test_shorts_first_frame_is_not_black_but_still_fades_out_at_the_end(
     assert _mean_brightness(max(duration - 0.05, 0.0)) < 0.2
 
 
+def _mean_volume_db(path: Path, start: float, duration: float) -> float:
+    """mean_volume (dBFS) of an audio slice, via ffmpeg's volumedetect
+    filter. `-ss` placed BEFORE `-i` (input-side seeking) — verified
+    directly against a hand-built afade fixture that placing it AFTER
+    `-i` here silently seeks to the wrong position (every probed offset
+    read the same value, regardless of where an actual fade sat in the
+    file); input-side seeking tracked a real fade ramp correctly across
+    a range of offsets."""
+    proc = subprocess.run(
+        ["ffmpeg", "-ss", f"{start:.3f}", "-i", str(path), "-vn", "-t", f"{duration:.3f}",
+         "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    for line in proc.stderr.splitlines():
+        if "mean_volume:" in line:
+            return float(line.split("mean_volume:")[1].strip().split(" ")[0])
+    raise AssertionError(f"mean_volume not found in ffmpeg/volumedetect output for {path}")
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_music_fade_at_the_end_does_not_silence_the_narration(paths: ProjectPaths, monkeypatch):
+    # Regression, client report: "dont make the voice fade at the last of
+    # video". render_video's afade used to apply to the already-mixed
+    # narration+ducked-music output ([nar_mix][ducked]amix...afade), so
+    # the documented intent ("music... faded out over the last seconds")
+    # silenced the *narration* too, right when a spoken outro line
+    # (subscribe reminder, or the new engagement question) matters most.
+    # Set up a real (loud, unmistakable) music track and a final scene
+    # whose narration audio runs well past the last-2-seconds fade
+    # window, then confirm the tail of the FINAL MIXED audio is still
+    # clearly audible, not faded down to near-silence.
+    from renderflow.config import Settings
+    from renderflow.pipeline.render import probe_duration, render_video
+    from tests.conftest import make_settings
+
+    music_dir = paths.root / "music"
+    music_dir.mkdir()
+    music_file = music_dir / "track.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=220:duration=30",
+         str(music_file)],
+        check=True, capture_output=True,
+    )
+    settings = make_settings(intro_outro=False, music_dir=music_dir, transition="none")
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+    monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+
+    for scene in plan.scenes:
+        img = paths.images / f"scene_{scene.id:03d}.png"
+        audio = paths.voice / f"scene_{scene.id:03d}.mp3"
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=steelblue:s=640x360",
+             "-frames:v", "1", str(img)],
+            check=True, capture_output=True,
+        )
+        # Full-scale, unmistakably loud narration tone (distinct frequency
+        # from the music), long enough that its tail sits well inside the
+        # music fade's last-2-seconds window.
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=880:duration=4",
+             str(audio)],
+            check=True, capture_output=True,
+        )
+        for ref, path in ((scene.assets.image, img), (scene.assets.voice, audio)):
+            ref.advance(AssetStatus.RUNNING)
+            ref.path = str(path)
+            ref.advance(AssetStatus.COMPLETED)
+
+    final = render_video(plan, paths)
+    duration = probe_duration(final)
+
+    # Probe just before the trailing SCENE_GAP_SEC pad (true silence by
+    # design, baked into every clip's own audio regardless of this fix —
+    # see render.SCENE_GAP_SEC) but still comfortably inside the music
+    # fade's last-2-seconds window, where the last scene's own narration
+    # tone is still genuinely playing.
+    from renderflow.pipeline.render import SCENE_GAP_SEC
+
+    probe_start = max(duration - SCENE_GAP_SEC - 0.3, 0.0)
+    tail_db = _mean_volume_db(final, probe_start, 0.2)
+    # Empirically verified against both versions of render.py before
+    # picking this threshold: the buggy version (afade applied to the
+    # already-mixed [nar_mix][ducked] output) reads ~-31dB at this exact
+    # probe point — narration audibly fading along with the music: fixed
+    # (afade on [ducked] alone, before mixing with the untouched
+    # narration), it reads ~-19dB, matching the unfaded baseline earlier
+    # in the same scene. -25dB sits cleanly between the two.
+    assert tail_db > -25.0, f"tail of final audio reads {tail_db:.1f}dB — narration faded"
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_shorts_gets_a_narrated_closing_message_card(paths: ProjectPaths, monkeypatch):
+    # Added 2026-09, client request: "at the end of video of short make a
+    # question also or anything that will leave the viewer a message".
+    # Shorts previously hard-cut straight from the last scene to nothing
+    # (v1 scope skipped the whole landscape intro/outro card pair) — now
+    # they get their own portrait closing-message card, narrated, holding
+    # whatever plan.outro_text was actually synthesized.
+    from renderflow.config import Settings
+    from renderflow.pipeline.render import SHORTS_HEIGHT, SHORTS_WIDTH, probe_duration, render_video
+    from tests.conftest import make_settings
+
+    settings = make_settings(
+        intro_outro=True, music_dir=paths.root / "no-music", transition="none",
+    )
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+    monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    plan.format = "shorts"
+    # Simulates what generate_branding_audio(include_intro=False) would
+    # have persisted — the actual engagement question, plus a real
+    # narrated outro audio file.
+    plan.outro_text = "If you were him, what would you do?"
+    outro_audio = paths.voice / "outro.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=660:duration=2",
+         str(outro_audio)],
+        check=True, capture_output=True,
+    )
+    plan.outro_audio.advance(AssetStatus.RUNNING)
+    plan.outro_audio.path = str(outro_audio)
+    plan.outro_audio.advance(AssetStatus.COMPLETED)
+    # intro_audio deliberately left PENDING — Shorts never narrate an
+    # intro (no intro card exists for them at all).
+
+    for scene in plan.scenes:
+        img = paths.images / f"scene_{scene.id:03d}.png"
+        audio = paths.voice / f"scene_{scene.id:03d}.mp3"
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=steelblue:s=640x360",
+             "-frames:v", "1", str(img)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440",
+             "-t", "1", str(audio)],
+            check=True, capture_output=True,
+        )
+        for ref, path in ((scene.assets.image, img), (scene.assets.voice, audio)):
+            ref.advance(AssetStatus.RUNNING)
+            ref.path = str(path)
+            ref.advance(AssetStatus.COMPLETED)
+
+    final = render_video(plan, paths)
+
+    outro_clip = paths.output / "outro.mp4"
+    assert outro_clip.exists()
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(outro_clip)],
+        check=True, capture_output=True, text=True,
+    )
+    w, h = (int(x) for x in probe.stdout.strip().split(","))
+    assert (w, h) == (SHORTS_WIDTH, SHORTS_HEIGHT)  # portrait, not landscape
+
+    # The closing card's own narration duration (>= OUTRO_SEC) is folded
+    # into the final concat — the whole video runs noticeably longer than
+    # just the ~1s scene, proving the card was actually appended, not
+    # silently skipped.
+    scenes_only_duration = sum(probe_duration(paths.output / f"clip_{s.id:03d}.mp4") for s in plan.scenes)
+    assert probe_duration(final) > scenes_only_duration + 1.0
+
+    # No landscape-style intro card for Shorts, ever.
+    assert not (paths.output / "intro.mp4").exists()
+
+
 def test_build_caption_chunks_covers_full_duration_in_order():
     from renderflow.pipeline.subtitles import build_chunks
 

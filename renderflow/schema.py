@@ -143,6 +143,16 @@ class ScenePlan(BaseModel):
     # render.py's cards stay silent, their original behavior.
     intro_audio: AssetRef = Field(default_factory=AssetRef)
     outro_audio: AssetRef = Field(default_factory=AssetRef)
+    # The actual outro line that was synthesized into outro_audio (added
+    # 2026-09, alongside the comment-bait engagement question feature) —
+    # either a topic-specific question ("If you were him, what would you
+    # do?") or the plain "Thanks for watching!" fallback, whichever
+    # generate_branding_audio actually used. Persisted so render.py can
+    # show the *same* text on-screen (the landscape outro card, and the
+    # Shorts closing caption, which has no card at all) without having to
+    # re-derive or re-guess it — captions must always match what's
+    # actually being said. None until generate_branding_audio runs once.
+    outro_text: str | None = None
     # Background-music track filename (relative to RENDERFLOW_MUSIC_DIR),
     # chosen randomly at first render and persisted so re-renders keep the
     # same track. None = not chosen yet or music disabled.

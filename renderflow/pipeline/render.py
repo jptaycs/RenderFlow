@@ -30,9 +30,12 @@ WIDTH, HEIGHT = 1920, 1080
 # avatar (side-by-side) has no room in a 9:16 frame, so any talking-avatar
 # scene renders full-screen solo instead when height > width (see
 # render_scene_clip) — a portrait-orientation check, not a shorts-specific
-# one, so it stays correct for any future non-landscape format. Cards,
-# thumbnail, and captions are skipped for shorts entirely (v1 scope, see
-# make_video.py's format gating) rather than taught to render vertically.
+# one, so it stays correct for any future non-landscape format. The AI
+# clickbait thumbnail and the landscape-style intro card are skipped for
+# shorts entirely (v1 scope, see make_video.py's format gating) rather
+# than taught to render vertically — but captions DO run for shorts (see
+# CLAUDE.md), and shorts get their own portrait closing-message outro
+# card (_shorts_outro_clip, added later the same session as this format).
 SHORTS_WIDTH, SHORTS_HEIGHT = 1080, 1920
 AVATAR_W = 768
 VISUAL_W = WIDTH - AVATAR_W
@@ -87,6 +90,16 @@ def _prescale_for(width: int, height: int) -> tuple[int, int]:
     sub-pixel-small (the "shaky text" bug class) at any output size.
     """
     factor = PRESCALE_W / WIDTH
+    return round(width * factor), round(height * factor)
+
+
+def _card_prescale_for(width: int, height: int) -> tuple[int, int]:
+    """Same idea as `_prescale_for`, sized for title-card text instead of
+    photos — see `CARD_PRESCALE_W/H`'s docstring for why cards need a much
+    larger (4x, not ~1.33x) prescale factor. Added 2026-09 alongside the
+    Shorts closing-message card (`_shorts_outro_clip`), the first non-
+    landscape caller of `_render_card_clip`."""
+    factor = CARD_PRESCALE_W / WIDTH
     return round(width * factor), round(height * factor)
 
 
@@ -645,7 +658,8 @@ def _pick_music_track(plan: ScenePlan, paths: ProjectPaths) -> Path | None:
 
 
 def _render_card_clip(
-    png: Path, duration: float, out: Path, audio_path: Path | None = None
+    png: Path, duration: float, out: Path, audio_path: Path | None = None,
+    width: int = WIDTH, height: int = HEIGHT, fade_in: bool = True,
 ) -> Path:
     """A title card as a scene-shaped clip: slow zoom, faded in/out.
 
@@ -655,14 +669,22 @@ def _render_card_clip(
     the sidechain key that ducks the music bed under it too (render_video's
     ducking keys off the final concatenated `[a]`, so this needs no change
     there). No `audio_path` keeps the exact original silent-card behavior.
+
+    `width`/`height` (added 2026-09 for the Shorts closing-message card —
+    see `_shorts_outro_clip`) default to the landscape constants so every
+    existing landscape call site is unaffected; the 4x prescale factor
+    (`CARD_PRESCALE_W/H` at WIDTH/HEIGHT) is preserved proportionally at
+    any other target size via `_card_prescale_for`, same pattern as
+    `_prescale_for` for zoompan visuals.
     """
     frames = math.ceil(duration * FPS)
+    prescale_w, prescale_h = _card_prescale_for(width, height)
     filter_complex = (
-        f"[0:v]scale={CARD_PRESCALE_W}:{CARD_PRESCALE_H}:flags=lanczos,"
+        f"[0:v]scale={prescale_w}:{prescale_h}:flags=lanczos,"
         f"zoompan=z='1+0.04*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-        f"d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS},setsar=1,format=yuv420p[card]"
+        f"d={frames}:s={width}x{height}:fps={FPS},setsar=1,format=yuv420p[card]"
     )
-    filter_complex, final_label = _apply_fade(filter_complex, "card", duration)
+    filter_complex, final_label = _apply_fade(filter_complex, "card", duration, fade_in)
     if audio_path is not None:
         audio_input = ["-i", str(audio_path)]
         audio_filter = ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
@@ -695,10 +717,11 @@ def _card_audio(ref, paths: ProjectPaths) -> Path | None:
 
 def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], list[Path]]:
     """(intro clips, outro clips) — empty when RENDERFLOW_INTRO_OUTRO is off,
-    the format is "shorts" (v1 scope: cards render at landscape WIDTH/HEIGHT
-    only, see _render_card_clip — a proper vertical card is future work, not
-    yet needed since Shorts is meant to be short and hook-first anyway), or
-    the cards fail to build (branding must never block a render)."""
+    the format is "shorts" (the full landscape intro+outro card pair is v1
+    scope, hook-first — Shorts get their own, portrait-sized closing-message
+    card instead, see `_shorts_outro_clip`; there's still no landscape-style
+    intro for Shorts), or the cards fail to build (branding must never block
+    a render)."""
     settings = Settings.load()
     if not settings.intro_outro or plan.format == "shorts":
         return [], []
@@ -709,7 +732,7 @@ def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], l
             plan.title, settings.channel_name, paths.output / "intro_card.png"
         )
         outro_png = branding.build_outro_card(
-            settings.channel_name, paths.output / "outro_card.png"
+            settings.channel_name, paths.output / "outro_card.png", message=plan.outro_text
         )
         # Narration (assets.generate_branding_audio) is optional — a PENDING/
         # missing ref just means a silent card, exactly like before that
@@ -731,6 +754,57 @@ def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], l
         return [], []
 
 
+def _shorts_outro_clip(plan: ScenePlan, paths: ProjectPaths) -> Path | None:
+    """A portrait closing-message card for Shorts (added 2026-09, client
+    request: "at the end of video of short make a question also or
+    anything that will leave the viewer a message").
+
+    Shorts skip the full landscape intro+outro card pair (v1 scope, see
+    `_branding_clips`) — no intro card, and previously no outro either,
+    so a Short just hard-cut from the last scene straight to nothing.
+    This is Shorts' own equivalent of the landscape outro card: same
+    `branding.build_outro_card`/`_render_card_clip` machinery, rendered
+    at the Short's own portrait dimensions (`dims_for(plan)`) instead of
+    landscape WIDTH/HEIGHT. Shows `plan.outro_text` (the comment-bait
+    engagement question, or the plain "Thanks for watching" fallback —
+    see `assets.generate_branding_audio`) whichever was actually
+    narrated, or the card's own built-in fallback copy if narration never
+    ran at all (`RENDERFLOW_INTRO_OUTRO=0`, or an old project from before
+    this feature) — a Short always ends with *some* closing message,
+    matching the "or anything" half of the request.
+
+    Returns None (no outro clip; render_video falls back to the plain
+    hard-cut it always used before) when `RENDERFLOW_INTRO_OUTRO` is off
+    or the card fails to build — same never-block-the-render convention
+    as `_branding_clips`.
+    """
+    settings = Settings.load()
+    if not settings.intro_outro:
+        return None
+    from renderflow.pipeline import branding
+
+    width, height = dims_for(plan)
+    try:
+        outro_png = branding.build_outro_card(
+            settings.channel_name, paths.output / "outro_card.png",
+            message=plan.outro_text, width=width, height=height,
+        )
+        outro_audio = _card_audio(plan.outro_audio, paths)
+        duration = max(OUTRO_SEC, probe_duration(outro_audio) + 0.4) if outro_audio else OUTRO_SEC
+        # fade_in stays the default True here — this card isn't the first
+        # clip in the timeline (only that one needs the YouTube-thumbnail
+        # workaround, see _apply_fade's docstring), so it gets the same
+        # dip-through-black transition every other clip boundary already
+        # uses, matching the landscape outro card's behavior.
+        return _render_card_clip(
+            outro_png, duration, paths.output / "outro.mp4", audio_path=outro_audio,
+            width=width, height=height,
+        )
+    except Exception as exc:  # pillow/font hiccup — skip the card, keep the video
+        log.warning("shorts closing-message card skipped: %s", exc)
+        return None
+
+
 def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
     width, height = dims_for(plan)
     # Computed before the scene loop (added 2026-09, client report: "the
@@ -738,6 +812,16 @@ def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
     # first scene clip knows whether an intro card precedes it — see
     # _apply_fade's fade_in docstring for why that matters.
     intro_clips, outro_clips = _branding_clips(plan, paths)
+    if plan.format == "shorts":
+        # _branding_clips always returns ([], []) for shorts (no landscape
+        # intro/outro card pair, v1 scope) — Shorts get their own portrait
+        # closing-message card instead (added 2026-09, client request: "at
+        # the end of video of short make a question also... leave the
+        # viewer a message"). outro_clips stays [] (falls back to the
+        # original plain hard-cut) if the card can't be built.
+        shorts_outro = _shorts_outro_clip(plan, paths)
+        if shorts_outro is not None:
+            outro_clips = [shorts_outro]
     clips: list[Path] = []
     for index, scene in enumerate(plan.scenes):
         clip = paths.output / f"clip_{scene.id:03d}.mp4"
@@ -768,13 +852,22 @@ def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
         music_inputs = ["-stream_loop", "-1", "-i", str(music)]
         # [a] feeds both the ducker (as the sidechain signal) and the final
         # mix — ffmpeg filter labels are single-use, hence the asplit.
+        #
+        # Bug fixed 2026-09, client report: "dont make the voice fade at
+        # the last of video". afade used to apply to the already-mixed
+        # [nar_mix][ducked] output — the intent was always just "fade the
+        # music bed out at the end" (see the comment above this block),
+        # but applying the fade AFTER combining it with the narration
+        # faded the voice too, right when the outro's spoken engagement
+        # question/subscribe line mattered most. Now the fade is on
+        # [ducked] alone, before it's mixed with the untouched narration.
         filter_complex += (
             ";[a]asplit=2[nar_sc][nar_mix]"
             f";[{music_index}:a]volume={settings.music_volume:.3f}[music]"
             ";[music][nar_sc]sidechaincompress="
             "threshold=0.03:ratio=8:attack=150:release=600[ducked]"
-            ";[nar_mix][ducked]amix=inputs=2:duration=first:normalize=0,"
-            f"afade=t=out:st={fade_start:.3f}:d=2.0[aout]"
+            f";[ducked]afade=t=out:st={fade_start:.3f}:d=2.0[ducked_out]"
+            ";[nar_mix][ducked_out]amix=inputs=2:duration=first:normalize=0[aout]"
         )
         audio_map = "[aout]"
         log.info("music bed: %s (volume %.2f, ducked)", music.name, settings.music_volume)
