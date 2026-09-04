@@ -346,7 +346,7 @@ def test_random_topic_idea_returns_generated_idea(client, monkeypatch):
 
     register(client, "admin@example.com")
 
-    def fake_generate_topic_idea(llm, existing_titles):
+    def fake_generate_topic_idea(llm, existing_titles, length_minutes):
         return (
             GeneratedTopicIdea(title="The Shark Born Before America", script="Some fact."),
             LLMResult(text="{}", provider="stub", cost=0.001),
@@ -368,7 +368,7 @@ def test_random_topic_idea_passes_existing_project_titles(client, pipeline_stub,
 
     captured: dict = {}
 
-    def fake_generate_topic_idea(llm, existing_titles):
+    def fake_generate_topic_idea(llm, existing_titles, length_minutes):
         captured["existing_titles"] = existing_titles
         return (
             GeneratedTopicIdea(title="Something New", script="A fresh fact."),
@@ -396,7 +396,7 @@ def test_random_topic_idea_merges_client_excluded_titles(client, monkeypatch):
 
     captured: dict = {}
 
-    def fake_generate_topic_idea(llm, existing_titles):
+    def fake_generate_topic_idea(llm, existing_titles, length_minutes):
         captured["existing_titles"] = existing_titles
         return (
             GeneratedTopicIdea(title="Yet Another Idea", script="A fact."),
@@ -419,7 +419,7 @@ def test_random_topic_idea_failure_returns_503(client, monkeypatch):
 
     register(client, "admin@example.com")
 
-    def failing_generate_topic_idea(llm, existing_titles):
+    def failing_generate_topic_idea(llm, existing_titles, length_minutes):
         raise RuntimeError("no ANTHROPIC_API_KEY")
 
     monkeypatch.setattr(api, "build_llm", lambda settings: object())
@@ -427,6 +427,33 @@ def test_random_topic_idea_failure_returns_503(client, monkeypatch):
 
     res = client.post("/api/topics/random")
     assert res.status_code == 503
+
+
+def test_random_topic_idea_passes_and_clamps_length_minutes(client, monkeypatch):
+    from renderflow import api
+
+    register(client, "admin@example.com")
+
+    captured: dict = {}
+
+    def fake_generate_topic_idea(llm, existing_titles, length_minutes):
+        captured["length_minutes"] = length_minutes
+        return (
+            GeneratedTopicIdea(title="A Title", script="A fact."),
+            LLMResult(text="{}", provider="stub"),
+        )
+
+    monkeypatch.setattr(api, "build_llm", lambda settings: object())
+    monkeypatch.setattr(api, "generate_topic_idea", fake_generate_topic_idea)
+
+    res = client.post("/api/topics/random", json={"lengthMinutes": 11})
+    assert res.status_code == 200, res.text
+    assert captured["length_minutes"] == 11.0
+
+    # Out-of-range values clamp the same way NewProject.lengthMinutes does.
+    res = client.post("/api/topics/random", json={"lengthMinutes": 999})
+    assert res.status_code == 200, res.text
+    assert captured["length_minutes"] == 15.0
 
 
 def test_project_with_active_job_rejects_further_runs(client):

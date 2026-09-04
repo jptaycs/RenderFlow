@@ -1663,10 +1663,16 @@ const actions = {
     state.randomTopicLoading = true;
     render();
     try {
+      // Sizes the generated script to actually match the video it's about
+      // to become — the modal's currently-selected length for landscape
+      // (state.newLength, not shown while in script mode but still the
+      // right target), or ~1 minute for Shorts. Previously always
+      // returned a fixed ~60-100 word teaser regardless of target length.
+      const targetLength = state.newFormat === 'shorts' ? 1 : state.newLength;
       const res = await fetch('/api/topics/random', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ excludeTitles: suggestedTopicTitles }),
+        body: JSON.stringify({ excludeTitles: suggestedTopicTitles, lengthMinutes: targetLength }),
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok) {

@@ -104,6 +104,63 @@ def test_split_script_passes_scaled_max_tokens():
     assert llm.calls[0]["max_tokens"] == _script_max_tokens(100)
 
 
+class _RecordingTopicIdeaLLM:
+    """Like _RecordingLLM but returns a valid GeneratedTopicIdea payload —
+    generate_topic_idea's schema ({title, script}), not a full scene plan."""
+
+    name = "recording-topic-idea-llm"
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def complete(self, system, prompt, **params):
+        self.calls.append({"prompt": prompt, **params})
+        return LLMResult(
+            text=json.dumps({"title": "A Title", "script": "A fact."}),
+            provider=self.name, cost=0.001,
+        )
+
+
+def test_topic_idea_scales_word_target_and_max_tokens_with_length():
+    # Regression: generate_topic_idea used to always request a fixed
+    # 60-100 word teaser regardless of the video's actual target length —
+    # a "Random topic" landscape video (targeting the monetization-driven
+    # 8-12 minute default) came out with a script only long enough for
+    # ~30 seconds once split into scenes. Client-reported: "the random
+    # topic script must have a length the same with the target time like
+    # 11 minutes of video and in shorts is 1 minute script also."
+    from renderflow.pipeline.script import (
+        _topic_idea_max_tokens,
+        _topic_idea_target_words,
+        generate_topic_idea,
+    )
+
+    llm = _RecordingTopicIdeaLLM()
+    generate_topic_idea(llm, [], length_minutes=11)
+
+    assert len(llm.calls) == 1
+    call = llm.calls[0]
+    expected_words = _topic_idea_target_words(11)
+    assert expected_words > 1000  # a real 11-minute script, not a teaser
+    assert call["max_tokens"] == _topic_idea_max_tokens(expected_words)
+    assert str(expected_words) in call["prompt"]
+
+
+def test_topic_idea_short_target_stays_short():
+    from renderflow.pipeline.script import (
+        _topic_idea_max_tokens,
+        _topic_idea_target_words,
+        generate_topic_idea,
+    )
+
+    llm = _RecordingTopicIdeaLLM()
+    generate_topic_idea(llm, [], length_minutes=1)
+
+    expected_words = _topic_idea_target_words(1)
+    assert expected_words < 250  # a Shorts-length target, not a full script
+    assert llm.calls[0]["max_tokens"] == _topic_idea_max_tokens(expected_words)
+
+
 class _TrackingTTS:
     """StubTTS but records every (text, voice) it was asked to synthesize —
     needed to assert on the narrated intro/outro text content, which the

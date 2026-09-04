@@ -138,31 +138,67 @@ minutes, a shark older than the United States, that kind of thing).
 Rules:
 - Invent exactly ONE idea: a punchy, hooky title (under ~9 words — a
   specific factual hook, not a generic clickbait template like "The Truth
-  About X") and a short narration script (3-5 sentences, 60-100 words)
-  that reads naturally spoken aloud: no headings, no markdown, no scene
-  numbers, no "Scene 1:" prefixes.
-- The fact must be real, specific, and checkable — no invented statistics
-  or made-up numbers.
-- Open with the hook itself, not a preamble.
+  About X") and a narration script that reads naturally spoken aloud: no
+  headings, no markdown, no scene numbers, no "Scene 1:" prefixes.
+- Hit the requested word count below — this drives the actual video
+  length, so undershooting it matters, not just staying under a cap. A
+  short target (under ~200 words) should open with the hook itself, not
+  a preamble. A long target needs real structure to fill the runtime
+  without padding or repeating itself: open with the hook, then develop
+  several distinct facts, examples, or beats of the same story (a
+  timeline, a chain of causes and effects, a few related anecdotes),
+  and close with a memorable final line — like a real short-documentary
+  script, not one paragraph stretched thin.
+- The facts must be real, specific, and checkable — no invented
+  statistics or made-up numbers, and no filler sentences that don't add
+  new information just to hit the word count.
 - Never reuse a fact, story, or subject from the "already used" list below
   — not even with a different title or wording. Pick a different subject
   entirely (different era, place, field, and kind of surprise) from every
   title listed, not just a different sentence about the same fact.
 """
 
+# Words/second spoken pace assumed throughout the app (see script.py's
+# split_script/split_script_local docstrings and SECONDS_PER_SCENE) — used
+# here to size the requested word count to the actual target video length.
+WORDS_PER_SECOND = 2.5
 
-def build_topic_idea_prompt(existing_titles: list[str]) -> str:
+
+def _topic_idea_target_words(length_minutes: float) -> int:
+    return max(50, round(length_minutes * 60 * WORDS_PER_SECOND))
+
+
+def build_topic_idea_prompt(existing_titles: list[str], length_minutes: float = 1.5) -> str:
+    target_words = _topic_idea_target_words(length_minutes)
+    length_note = (
+        f"Target length: about {length_minutes:g} minutes of narration — "
+        f"roughly {target_words} words at a natural spoken pace."
+    )
     if existing_titles:
         taken = "\n".join(f"- {t}" for t in existing_titles)
         return (
             "Invent one new short-documentary video idea. These titles are "
-            f"already used — invent something different:\n{taken}"
+            f"already used — invent something different:\n{taken}\n\n{length_note}"
         )
-    return "Invent one new short-documentary video idea."
+    return f"Invent one new short-documentary video idea.\n\n{length_note}"
+
+
+def _topic_idea_max_tokens(target_words: int) -> int:
+    # Adaptive thinking tokens count against max_tokens alongside the
+    # actual output — verified live (2026-09) at an 11-minute target: the
+    # model wrote a 1564-word script (needing ~2000-2100 output tokens on
+    # its own) but response.usage.output_tokens came back at 3691, roughly
+    # 2.4x the target word count once thinking is included. An earlier
+    # ~1.5x-word estimate (sized for the final text alone) truncated that
+    # exact call. 3x plus a flat floor keeps real margin for run-to-run
+    # variance in how much the model decides to think. Same streaming-call
+    # path as generate_script (ClaudeLLM.complete uses messages.stream(),
+    # not create()), so there's no HTTP-timeout risk from raising this.
+    return max(1200, round(target_words * 3) + 1000)
 
 
 def generate_topic_idea(
-    llm: LLMProvider, existing_titles: list[str]
+    llm: LLMProvider, existing_titles: list[str], length_minutes: float = 1.5
 ) -> tuple[GeneratedTopicIdea, LLMResult]:
     """One "surprise me" idea for the dashboard's New Video modal.
 
@@ -170,16 +206,27 @@ def generate_topic_idea(
     kept in git history for prompt calibration — see TOPIC_IDEA_SYSTEM_PROMPT
     above) with a fresh Claude-generated idea on every click: the fixed
     10-entry bank ran out (and started repeating) well before a real user's
-    project count did. Small, fast completion (~100-200 output tokens) —
-    unlike full script generation (generate_script), which is deliberately
-    kept out of the request path (see api.py's create_project), this is
-    cheap and quick enough to call directly from a request handler.
+    project count did. Small, fast completion by default — unlike full
+    script generation (generate_script), which is deliberately kept out of
+    the request path (see api.py's create_project), this is cheap and
+    quick enough to call directly from a request handler even at longer
+    lengths, now that ClaudeLLM.complete() streams.
+
+    `length_minutes` (added 2026-09 — previously always produced a fixed
+    60-100 word teaser regardless of what the video would actually target)
+    sizes the requested word count to the real target: the New Video
+    modal's currently-selected length for landscape (client-reported: "the
+    random topic script must have a length the same with the target time
+    like 11 minutes"), or ~1 minute for Shorts, so the returned script
+    isn't wildly shorter than the video it's about to become once split
+    into scenes.
     """
+    target_words = _topic_idea_target_words(length_minutes)
     result = llm.complete(
         TOPIC_IDEA_SYSTEM_PROMPT,
-        build_topic_idea_prompt(existing_titles),
+        build_topic_idea_prompt(existing_titles, length_minutes),
         json_schema=GeneratedTopicIdea.model_json_schema(),
-        max_tokens=500,
+        max_tokens=_topic_idea_max_tokens(target_words),
     )
     try:
         idea = GeneratedTopicIdea.model_validate_json(result.text)

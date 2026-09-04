@@ -478,6 +478,15 @@ class TopicIdeaRequest(BaseModel):
     # excludeTitles docstring note below for why this is required, not just
     # the DB's project titles.
     excludeTitles: list[str] = []
+    # Target video length in minutes — the modal's currently-selected
+    # length for landscape, or ~1 for Shorts (see web/index.html's
+    # randomTopic()). Sizes the generated script's word count to actually
+    # match the video it's about to become, instead of always returning a
+    # fixed short teaser regardless of target length (client-reported:
+    # "the random topic script must have a length the same with the
+    # target time like 11 minutes"). Same 1-15 clamp as NewProject's
+    # lengthMinutes below.
+    lengthMinutes: float = 1.5
 
 
 @app.post("/api/topics/random")
@@ -493,10 +502,12 @@ def random_topic_idea(
     before a real user's project count did.
 
     Deliberately a plain synchronous call, not a queued Job like project
-    creation: it's one short completion (~100-200 output tokens, a couple
-    seconds), unlike the full --topic script generation that stays inside
-    the worker subprocess (see create_project) because it can take
-    substantially longer and cost more.
+    creation — even at a long target length this is one completion, a few
+    seconds to a bit over a minute depending on length_minutes (see
+    generate_topic_idea's word-count scaling), unlike the full --topic
+    script generation that stays inside the worker subprocess (see
+    create_project) because it also drives image/voice/broll generation
+    on top of the script itself.
 
     `body.excludeTitles` matters because this call is otherwise stateless:
     the *only* exclusion this endpoint used to send Claude was the DB's
@@ -511,9 +522,10 @@ def random_topic_idea(
         row.title
         for row in session.query(Project).filter(Project.owner_id == user.id).all()
     ] + body.excludeTitles
+    length_minutes = min(max(body.lengthMinutes, 1.0), 15.0)
     try:
         llm = build_llm(Settings.load())
-        idea, _ = generate_topic_idea(llm, existing_titles)
+        idea, _ = generate_topic_idea(llm, existing_titles, length_minutes)
     except Exception as exc:  # missing/invalid ANTHROPIC_API_KEY, rate limit, etc.
         log.warning("random topic idea generation failed: %s", exc)
         raise HTTPException(
