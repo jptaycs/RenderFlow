@@ -806,6 +806,84 @@ def test_render_shorts_produces_vertical_video_and_thumbnail(paths: ProjectPaths
     assert thumb == paths.output / "thumbnail.jpg"
 
 
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_shorts_first_frame_is_not_black_but_still_fades_out_at_the_end(
+    paths: ProjectPaths, monkeypatch
+):
+    # Regression, client report: "the shorts has no thumbnail when its in
+    # youtube studio". A Shorts render has no intro card (unlike landscape)
+    # to absorb the first clip's fade-in-from-black, so the finished
+    # video's very first ~0.15s used to be a black frame fading up — and
+    # YouTube's own Shorts thumbnail auto-selection (the only mechanism
+    # that reliably applies to Shorts) would grab an early, still-fading
+    # frame, reading as a blank/missing thumbnail in Studio. The fade-OUT
+    # at the very end of the video must still happen — only the leading
+    # edge of the whole timeline is special-cased.
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    from renderflow.config import Settings
+    from renderflow.pipeline.render import probe_duration, render_video
+    from tests.conftest import make_settings
+
+    settings = make_settings(
+        intro_outro=False, music_dir=paths.root / "no-music", transition="fade"
+    )
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+    monkeypatch.setenv("RENDERFLOW_MOTION", "zoompan")
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    plan.format = "shorts"
+
+    for scene in plan.scenes:
+        img = paths.images / f"scene_{scene.id:03d}.png"
+        audio = paths.voice / f"scene_{scene.id:03d}.mp3"
+        # Bright, clearly-not-black source frame so a fading-in first frame
+        # (the bug) is easy to distinguish from a fully-visible one (fixed).
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=white:s=640x360",
+             "-frames:v", "1", str(img)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440",
+             "-t", "1.5", str(audio)],
+            check=True, capture_output=True,
+        )
+        for ref, path in ((scene.assets.image, img), (scene.assets.voice, audio)):
+            ref.advance(AssetStatus.RUNNING)
+            ref.path = str(path)
+            ref.advance(AssetStatus.COMPLETED)
+
+    final = render_video(plan, paths)
+    duration = probe_duration(final)
+
+    def _mean_brightness(timestamp: float) -> float:
+        frame = paths.output / f"probe_frame_{timestamp}.png"
+        # Output-side seeking (-i first, -ss after) decodes precisely to
+        # the requested timestamp instead of snapping to the nearest
+        # keyframe — needed here since the probed timestamps are well
+        # inside the very first GOP, where keyframe-seeking could land on
+        # frame 0 regardless of the requested time.
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(final), "-ss", f"{timestamp:.3f}",
+             "-frames:v", "1", str(frame)],
+            check=True, capture_output=True,
+        )
+        gray = Image.open(frame).convert("L")
+        pixels = list(gray.getdata())
+        return sum(pixels) / (len(pixels) * 255)
+
+    # Well inside the old FADE_IN_SEC=0.15 window — under the bug this was
+    # still visibly mid fade-in-from-black; fixed, it's the fully-visible
+    # white source frame throughout (parallax/zoompan motion never
+    # darkens it). 0.2s (past the window either way) would pass under both
+    # the bug and the fix, so it wouldn't actually catch a regression.
+    assert _mean_brightness(0.05) > 0.8
+    # The final clip's own fade-out (unaffected by this fix) must still
+    # dip to black right at the very end of the video.
+    assert _mean_brightness(max(duration - 0.05, 0.0)) < 0.2
+
+
 def test_build_caption_chunks_covers_full_duration_in_order():
     from renderflow.pipeline.subtitles import build_chunks
 

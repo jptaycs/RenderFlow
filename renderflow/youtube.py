@@ -146,8 +146,27 @@ def upload_video(
     log.info("uploaded video %s (%r)", video_id, title)
 
     if thumbnail_path is not None and thumbnail_path.exists():
-        thumb_media = MediaFileUpload(str(thumbnail_path), mimetype="image/jpeg")
-        youtube.thumbnails().set(videoId=video_id, media_body=thumb_media).execute()
-        log.info("set custom thumbnail for %s", video_id)
+        # Best-effort, never fails the whole publish (added 2026-09, client
+        # report: "the shorts has no thumbnail when its in youtube
+        # studio"). Custom thumbnails via thumbnails.set are documented as
+        # unreliable/unsupported for Shorts specifically (YouTube's own
+        # Jan-2025 custom-Shorts-cover feature is gated to the YouTube
+        # Partner Program and only editable through Studio's own UI, not
+        # confirmed as an API capability at all — see the CLAUDE.md note)
+        # and even for a regular upload it needs a phone-verified channel;
+        # before this fix, either failure mode raised here and the video
+        # — already successfully uploaded a moment earlier — never got its
+        # youtube.json written, so the dashboard showed the publish as
+        # failed even though it had actually succeeded on YouTube.
+        try:
+            thumb_media = MediaFileUpload(str(thumbnail_path), mimetype="image/jpeg")
+            youtube.thumbnails().set(videoId=video_id, media_body=thumb_media).execute()
+            log.info("set custom thumbnail for %s", video_id)
+        except Exception:
+            log.warning(
+                "could not set a custom thumbnail for %s (video itself "
+                "still published) — this is expected for Shorts on most "
+                "channels, see CLAUDE.md", video_id, exc_info=True,
+            )
 
     return {"video_id": video_id, "url": f"https://youtu.be/{video_id}"}

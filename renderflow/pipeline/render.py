@@ -212,24 +212,41 @@ def _caption_filter_chain(
     return label, extra_inputs, ";".join(filters)
 
 
-def _apply_fade(filter_complex: str, label: str, duration: float) -> tuple[str, str]:
+def _apply_fade(
+    filter_complex: str, label: str, duration: float, fade_in: bool = True
+) -> tuple[str, str]:
     """Append the dip-to-black video fades to a clip's filter graph.
 
     Returns (filter_complex, final_video_label). No-op when
     RENDERFLOW_TRANSITION=none. Video only — audio is never touched.
+
+    `fade_in=False` (added 2026-09, client report: "the shorts has no
+    thumbnail when its in youtube studio") drops just the fade-in half —
+    every clip still dips to black at its own *end* the same as before.
+    Only `render_video()` passes False, and only for the very first clip
+    in the whole concatenated timeline when no intro card precedes it
+    (Shorts always, landscape when RENDERFLOW_INTRO_OUTRO=0): otherwise
+    the finished video's first ~0.15s is a black frame fading up, and
+    YouTube's own Shorts thumbnail auto-selection (the *only* mechanism
+    that reliably applies to Shorts — custom thumbnails via the Data
+    API's `thumbnails.set` are unreliable/unsupported for Shorts, see the
+    note in `renderflow/youtube.py`) grabs an early frame that's still
+    fading in, reading as a blank/missing thumbnail in Studio. A
+    landscape video never showed this because its intro card (2.8s+)
+    always came first and absorbed the fade.
     """
     if Settings.load().transition != "fade":
         return filter_complex, label
     fade_out_start = max(duration - FADE_OUT_SEC, 0.0)
-    filter_complex += (
-        f";[{label}]fade=t=in:st=0:d={FADE_IN_SEC},"
-        f"fade=t=out:st={fade_out_start:.3f}:d={FADE_OUT_SEC}[vfade]"
-    )
+    fades = f"fade=t=out:st={fade_out_start:.3f}:d={FADE_OUT_SEC}"
+    if fade_in:
+        fades = f"fade=t=in:st=0:d={FADE_IN_SEC}," + fades
+    filter_complex += f";[{label}]{fades}[vfade]"
     return filter_complex, "vfade"
 
 
 def render_scene_clip(
-    scene: Scene, out: Path, width: int = WIDTH, height: int = HEIGHT
+    scene: Scene, out: Path, width: int = WIDTH, height: int = HEIGHT, fade_in: bool = True
 ) -> Path:
     # Visual-only (see scene_is_visual_only) always falls through to the
     # plain image+voice path below, even if an avatar clip happens to
@@ -246,11 +263,12 @@ def render_scene_clip(
         # check, so this stays correct for any future non-landscape format.
         if scene_is_avatar_solo(scene) or height > width:
             return render_avatar_full_clip(
-                scene, Path(scene.assets.avatar_clip.path), out, width, height
+                scene, Path(scene.assets.avatar_clip.path), out, width, height, fade_in=fade_in
             )
         assert scene.assets.image.path
         return render_avatar_split_clip(
-            scene, Path(scene.assets.avatar_clip.path), Path(scene.assets.image.path), out
+            scene, Path(scene.assets.avatar_clip.path), Path(scene.assets.image.path), out,
+            fade_in=fade_in,
         )
 
     assert scene.assets.voice.path
@@ -274,7 +292,7 @@ def render_scene_clip(
         and Path(broll.path).exists()
     ):
         return _render_broll_clip(
-            scene, Path(broll.path), audio, duration, chunks, out, width, height
+            scene, Path(broll.path), audio, duration, chunks, out, width, height, fade_in=fade_in
         )
 
     assert scene.assets.image.path
@@ -286,7 +304,7 @@ def render_scene_clip(
         filter_complex = f"[0:v]fps={FPS},setsar=1,format=yuv420p[v0]"
         if cap_filter:
             filter_complex += ";" + cap_filter
-        filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
+        filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration, fade_in)
         _run(
             [
                 "ffmpeg", "-y",
@@ -310,7 +328,7 @@ def render_scene_clip(
     filter_complex = f"[0:v]{_zoompan_expr(scene, frames, width, height)}[base]"
     if cap_filter:
         filter_complex += ";" + cap_filter
-    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
+    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration, fade_in)
     _run(
         [
             "ffmpeg", "-y",
@@ -338,6 +356,7 @@ def _render_broll_clip(
     out: Path,
     width: int = WIDTH,
     height: int = HEIGHT,
+    fade_in: bool = True,
 ) -> Path:
     """Full-frame scene from a stock video clip instead of still+motion.
 
@@ -352,7 +371,7 @@ def _render_broll_clip(
     )
     if cap_filter:
         filter_complex += ";" + cap_filter
-    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
+    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration, fade_in)
     _run(
         [
             "ffmpeg", "-y",
@@ -373,7 +392,8 @@ def _render_broll_clip(
 
 
 def render_avatar_full_clip(
-    scene: Scene, avatar_clip: Path, out: Path, width: int = WIDTH, height: int = HEIGHT
+    scene: Scene, avatar_clip: Path, out: Path, width: int = WIDTH, height: int = HEIGHT,
+    fade_in: bool = True,
 ) -> Path:
     """Full-screen solo avatar shot — no background visual (see
     scene_is_avatar_solo). Also used for any talking-avatar scene in a
@@ -389,7 +409,7 @@ def render_avatar_full_clip(
     cap_label, cap_inputs, cap_filter = _caption_filter_chain("vbase", chunks, 1)
     if cap_filter:
         filter_complex += ";" + cap_filter
-    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
+    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration, fade_in)
     _run(
         [
             "ffmpeg", "-y",
@@ -409,7 +429,7 @@ def render_avatar_full_clip(
 
 def render_avatar_split_clip(
     scene: Scene, avatar_clip: Path, visual_image: Path, out: Path,
-    width: int = WIDTH, height: int = HEIGHT,
+    width: int = WIDTH, height: int = HEIGHT, fade_in: bool = True,
 ) -> Path:
     # Render both panels (and hold the audio silent) for the full clip plus
     # a trailing pause — see SCENE_GAP_SEC. The avatar clip's own video ends
@@ -448,7 +468,7 @@ def render_avatar_split_clip(
     cap_label, cap_inputs, cap_filter = _caption_filter_chain("vbase", chunks, 2)
     if cap_filter:
         filter_complex += ";" + cap_filter
-    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration)
+    filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration, fade_in)
     _run(
         [
             "ffmpeg", "-y",
@@ -713,13 +733,18 @@ def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], l
 
 def render_video(plan: ScenePlan, paths: ProjectPaths) -> Path:
     width, height = dims_for(plan)
+    # Computed before the scene loop (added 2026-09, client report: "the
+    # shorts has no thumbnail when its in youtube studio") so the very
+    # first scene clip knows whether an intro card precedes it — see
+    # _apply_fade's fade_in docstring for why that matters.
+    intro_clips, outro_clips = _branding_clips(plan, paths)
     clips: list[Path] = []
-    for scene in plan.scenes:
+    for index, scene in enumerate(plan.scenes):
         clip = paths.output / f"clip_{scene.id:03d}.mp4"
         log.info("rendering scene %d", scene.id)
-        clips.append(render_scene_clip(scene, clip, width, height))
+        fade_in = bool(intro_clips) or index > 0
+        clips.append(render_scene_clip(scene, clip, width, height, fade_in=fade_in))
 
-    intro_clips, outro_clips = _branding_clips(plan, paths)
     clips = intro_clips + clips + outro_clips
 
     final = paths.output / "final.mp4"

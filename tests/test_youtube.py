@@ -148,6 +148,35 @@ def test_upload_video_sets_thumbnail_when_given(tmp_path, monkeypatch):
     assert fake_client.thumbnails_resource.set_calls[0]["videoId"] == "vid456"
 
 
+def test_upload_video_survives_a_thumbnail_set_failure(tmp_path, monkeypatch):
+    # Regression (client report: "the shorts has no thumbnail when its in
+    # youtube studio") — custom thumbnails via thumbnails.set are
+    # documented as unreliable/unsupported for Shorts, and even a regular
+    # upload needs a phone-verified channel. Before this fix, a raised
+    # exception here propagated out of upload_video AFTER the video had
+    # already uploaded successfully, so publish_youtube.py never reached
+    # save_youtube_publish — the dashboard would show "Failed" for a video
+    # that had actually published fine.
+    from renderflow import youtube as yt
+
+    class _FailingThumbnailsResource:
+        def set(self, videoId, media_body):
+            raise RuntimeError("thumbnails.set not supported for this video")
+
+    fake_client = _FakeYouTubeClient({"id": "vid456"})
+    fake_client.thumbnails_resource = _FailingThumbnailsResource()
+    monkeypatch.setattr(yt, "_client", lambda: fake_client)
+
+    video_path = tmp_path / "final.mp4"
+    video_path.write_bytes(b"fake video bytes")
+    thumb_path = tmp_path / "thumbnail.jpg"
+    thumb_path.write_bytes(b"fake jpg bytes")
+
+    result = yt.upload_video(video_path, title="T", thumbnail_path=thumb_path)
+
+    assert result == {"video_id": "vid456", "url": "https://youtu.be/vid456"}
+
+
 def test_upload_video_skips_thumbnail_when_path_missing(tmp_path, monkeypatch):
     """A configured-but-nonexistent thumbnail path must not crash the
     upload — thumbnails are a nice-to-have, not required."""
