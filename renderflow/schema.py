@@ -240,12 +240,27 @@ class GeneratedScript(BaseModel):
         scenes = [
             Scene(
                 id=s.id,
-                type=s.type,
+                # Forced to "narration" regardless of what the LLM emitted
+                # (added 2026-09, client request: "remove the old feature
+                # of avatar talking and split screen... it stop processing
+                # before rendering"). SYSTEM_PROMPT/SPLIT_SYSTEM_PROMPT
+                # (pipeline/script.py) already instruct the model to never
+                # pick "talking_avatar", but a structured-output schema
+                # still technically permits it as a value — a model that
+                # ignores the instruction once would introduce a scene
+                # needing avatar_clip generation, which can fail/hang and
+                # strand the whole video at "Paused" needing a manual
+                # resume. This is a deterministic backstop, not a schema
+                # change: talking_avatar generation and rendering still
+                # work for any *existing* project that already has one
+                # (per-scene layout controls in the dashboard, older
+                # scenes.json files) — new scenes just never become one.
+                type="narration",
                 duration_estimate_sec=s.duration_estimate_sec,
                 narration=s.narration,
                 image_prompt=s.image_prompt,
                 negative_prompt=s.negative_prompt or None,
-                avatar=s.avatar,
+                avatar=None,
                 motion=Motion(
                     effect=s.motion.effect,
                     intensity=min(max(s.motion.intensity, 0.0), 1.0),

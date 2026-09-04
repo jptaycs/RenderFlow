@@ -127,6 +127,45 @@ def test_generated_script_converts_and_clamps():
     assert plan.project_id  # uuid assigned
 
 
+def test_generated_script_to_plan_forces_narration_over_talking_avatar():
+    # Deterministic backstop (added 2026-09, client request: "remove the
+    # old feature of avatar talking and split screen... it stop
+    # processing before rendering") — SYSTEM_PROMPT/SPLIT_SYSTEM_PROMPT
+    # (pipeline/script.py) already instruct the model to never emit
+    # talking_avatar, but the structured-output schema still technically
+    # permits it; a model that ignores the instruction once would
+    # introduce a scene needing avatar_clip generation, which can strand
+    # the whole video at "Paused". to_plan() must force every scene to
+    # "narration" with avatar=None regardless of what the LLM emitted —
+    # this does NOT touch Scene's own schema, which still fully supports
+    # talking_avatar for existing projects (see test_talking_avatar_
+    # scene_contract above).
+    generated = GeneratedScript.model_validate(
+        {
+            "title": "T",
+            "style": "documentary",
+            "scenes": [
+                {
+                    "id": 1,
+                    "type": "talking_avatar",
+                    "duration_estimate_sec": 5,
+                    "narration": "n",
+                    "image_prompt": "p",
+                    "negative_prompt": "",
+                    "avatar": {
+                        "name": "Host", "description": "a presenter",
+                        "background": "a studio",
+                    },
+                    "motion": {"effect": "zoom_in", "intensity": 0.1},
+                }
+            ],
+        }
+    )
+    plan = generated.to_plan()
+    assert plan.scenes[0].type == "narration"
+    assert plan.scenes[0].avatar is None
+
+
 def test_generation_schema_forbids_extras():
     schema = GeneratedScript.model_json_schema()
     assert schema["additionalProperties"] is False

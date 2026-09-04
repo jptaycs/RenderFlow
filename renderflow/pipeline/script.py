@@ -36,6 +36,9 @@ You produce complete video scripts broken into scenes. Each scene is a still
 image with slow pan/zoom motion, narrated by a voiceover.
 
 Rules:
+- Every scene's type must be "narration" — never "talking_avatar". This
+  channel has no on-camera host: it's narration over AI-generated visuals
+  only. Leave the avatar field null on every scene.
 - Narration must read naturally when spoken aloud: no headings, no markdown,
   no stage directions, no "Scene 1:" prefixes.
 - Keep scenes short: about 5 seconds each (10-16 spoken words), so the visual
@@ -243,6 +246,9 @@ split it into scenes for a stills-with-motion documentary video — you do NOT
 rewrite the script.
 
 Rules:
+- Every scene's type must be "narration" — never "talking_avatar". This
+  channel has no on-camera host: it's narration over AI-generated visuals
+  only. Leave the avatar field null on every scene.
 - Preserve the narration text VERBATIM. Every word of the input script must
   appear in exactly one scene's narration, in the original order. Do not add,
   remove, or rephrase anything. Only strip markdown/heading syntax if present.
