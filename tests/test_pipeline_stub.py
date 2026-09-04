@@ -231,6 +231,78 @@ def test_generate_branding_audio_is_resumable(paths: ProjectPaths):
     assert len(tts.calls) == 2
 
 
+class _FakeEngagementLLM:
+    """Minimal LLMProvider fake for generate_branding_audio's llm= param —
+    real StubLLM always returns a canned scene-plan JSON blob, not a plain
+    question string."""
+
+    name = "fake-engagement-llm"
+
+    def __init__(self, text: str = "If you were him, what would you do?", fail: bool = False):
+        self.text = text
+        self.fail = fail
+
+    def complete(self, system, prompt, **params):
+        if self.fail:
+            raise RuntimeError("fake LLM failure")
+        from renderflow.providers.base import LLMResult
+
+        return LLMResult(text=self.text, provider=self.name, cost=0.001)
+
+
+def test_generate_branding_audio_outro_uses_engagement_question_when_llm_given(
+    paths: ProjectPaths,
+):
+    # Added 2026-09, client request: end every video with a topic-specific
+    # comment-bait question instead of the plain "thanks for watching"
+    # close, driving comments the way "if you were him, what would you
+    # do?" does.
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+    tts = _TrackingTTS()
+
+    generate_branding_audio(plan, tts, "voice-id", "", paths, llm=_FakeEngagementLLM())
+
+    outro_text = tts.calls[1][0]
+    assert "If you were him, what would you do?" in outro_text
+    assert "comments" in outro_text.lower()
+    assert "subscribe" in outro_text.lower()  # subscribe reminder still present
+
+
+def test_generate_branding_audio_falls_back_to_plain_outro_when_engagement_llm_fails(
+    paths: ProjectPaths,
+):
+    # The engagement question is best-effort, exactly like the B-roll
+    # video-prompt rewrite — a failure must never block the (already-
+    # working) plain outro, let alone the whole render.
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+    tts = _TrackingTTS()
+
+    generate_branding_audio(plan, tts, "voice-id", "", paths, llm=_FakeEngagementLLM(fail=True))
+
+    outro_text = tts.calls[1][0]
+    assert "thanks for watching" in outro_text.lower()
+    assert "subscribe" in outro_text.lower()
+    reloaded = load_plan(paths)
+    assert reloaded.outro_audio.status is AssetStatus.COMPLETED  # not blocked
+
+
+def test_generate_branding_audio_omits_engagement_question_without_llm(paths: ProjectPaths):
+    # Default (llm=None) behavior must be byte-for-byte unchanged from
+    # before this feature — the existing narrates_title_and_outro_line
+    # test already covers this, this just makes the "no llm = old
+    # behavior" contract explicit.
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+    tts = _TrackingTTS()
+
+    generate_branding_audio(plan, tts, "voice-id", "", paths)
+
+    outro_text = tts.calls[1][0]
+    assert outro_text == "Thanks for watching! Please subscribe for more trivia like this."
+
+
 def test_completed_assets_are_skipped(paths: ProjectPaths):
     plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
     save_plan(plan, paths)
@@ -1116,6 +1188,44 @@ def test_rewrite_video_prompt_propagates_llm_errors():
 
     with pytest.raises(RuntimeError, match="boom"):
         rewrite_video_prompt(FailingLLM(), "narration", "a photo")
+
+
+def test_generate_engagement_question_returns_llm_text_and_cost():
+    # Added 2026-09, client request: "make a question about the topic for
+    # the viewers... leave an answer on comment section" — a comment-bait
+    # closing question for the outro, generated via Claude.
+    from renderflow.pipeline.script import generate_engagement_question
+    from renderflow.providers.base import LLMResult
+
+    class FakeLLM:
+        name = "fake"
+
+        def complete(self, system, prompt, **params):
+            assert "Eiffel Tower" in prompt
+            return LLMResult(
+                text="  If you were him, would you have risked it?  ",
+                provider=self.name, cost=0.001,
+            )
+
+    plan, _ = generate_script(StubLLM(), "The Man Who Sold the Eiffel Tower Twice", 1, "documentary")
+    plan.title = "The Man Who Sold the Eiffel Tower Twice"
+    question, result = generate_engagement_question(FakeLLM(), plan)
+    assert question == "If you were him, would you have risked it?"  # stripped
+    assert result.cost == 0.001
+
+
+def test_generate_engagement_question_propagates_llm_errors():
+    from renderflow.pipeline.script import generate_engagement_question
+
+    class FailingLLM:
+        name = "fake"
+
+        def complete(self, system, prompt, **params):
+            raise RuntimeError("boom")
+
+    plan, _ = generate_script(StubLLM(), "t", 1, "documentary")
+    with pytest.raises(RuntimeError, match="boom"):
+        generate_engagement_question(FailingLLM(), plan)
 
 
 def test_local_split_script_preserves_text_without_llm():

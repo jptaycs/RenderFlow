@@ -332,8 +332,17 @@ def main() -> int:
 
     if settings.intro_outro and not is_shorts:
         print("      Narrating intro/outro cards")
+        # Best-effort: a missing/invalid ANTHROPIC_API_KEY, rate limit, or
+        # any other failure just falls back to the plain "thanks for
+        # watching" outro inside generate_branding_audio — same optional,
+        # never-block-the-render convention as B-roll's prompt rewrite.
+        try:
+            engagement_llm = build_llm(settings)
+        except Exception:
+            engagement_llm = None
         generate_branding_audio(
-            plan, tts, settings.tts_voice, settings.channel_name, paths, **tts_params
+            plan, tts, settings.tts_voice, settings.channel_name, paths,
+            llm=engagement_llm, **tts_params
         )
 
     avatar_scene_count = sum(scene.type == "talking_avatar" for scene in plan.scenes)

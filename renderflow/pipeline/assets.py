@@ -10,6 +10,7 @@ from pathlib import Path
 
 from renderflow.pipeline import facecheck
 from renderflow.pipeline.script import (
+    generate_engagement_question,
     rewrite_video_prompt,
     scene_is_avatar_solo,
     scene_is_visual_only,
@@ -318,10 +319,18 @@ def generate_voice(
         log.info("scene %d voice done (%s)", scene.id, out.name)
 
 
-def _outro_line(channel_name: str) -> str:
-    if channel_name:
-        return f"Thanks for watching! Subscribe to {channel_name} for more trivia like this."
-    return "Thanks for watching! Please subscribe for more trivia like this."
+def _outro_line(channel_name: str, engagement_question: str | None = None) -> str:
+    subscribe = (
+        f"Subscribe to {channel_name} for more trivia like this."
+        if channel_name
+        else "Please subscribe for more trivia like this."
+    )
+    if engagement_question:
+        # The comment-bait question leads (it's the actual call to action —
+        # "leave your answer in the comments" is the whole point of it),
+        # subscribe stays a secondary close, same as before.
+        return f"{engagement_question} Let us know in the comments! {subscribe}"
+    return f"Thanks for watching! {subscribe}"
 
 
 def generate_branding_audio(
@@ -330,6 +339,7 @@ def generate_branding_audio(
     voice: str,
     channel_name: str,
     paths: ProjectPaths,
+    llm: LLMProvider | None = None,
     **tts_params,
 ) -> None:
     """Narrate the intro title card and the outro subscribe card with the
@@ -341,10 +351,27 @@ def generate_branding_audio(
     treats a non-COMPLETED ref as "no narration for this card" and falls
     back to its original silent-card behavior, so branding audio can never
     block a render.
+
+    `llm` (added 2026-09, client request: a topic-specific comment-bait
+    question instead of a generic "thanks for watching" close) is optional
+    and best-effort — a missing key, rate limit, or any other failure just
+    falls back to the plain subscribe line via `_outro_line`'s default,
+    same as every other LLM-dependent optional feature in this pipeline
+    (rewrite_video_prompt, generate_topic_idea).
     """
+    outro_text = _outro_line(channel_name)
+    if llm is not None:
+        try:
+            question, _ = generate_engagement_question(llm, plan)
+            outro_text = _outro_line(channel_name, question)
+        except Exception:
+            log.warning(
+                "engagement question generation failed, using the plain "
+                "subscribe line instead", exc_info=True,
+            )
     for ref, text, name in (
         (plan.intro_audio, plan.title, "intro"),
-        (plan.outro_audio, _outro_line(channel_name), "outro"),
+        (plan.outro_audio, outro_text, "outro"),
     ):
         if _skip(ref):
             continue

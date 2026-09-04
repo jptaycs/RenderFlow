@@ -359,6 +359,55 @@ def rewrite_video_prompt(
     return result.text.strip(), result
 
 
+ENGAGEMENT_QUESTION_SYSTEM_PROMPT = """\
+You write a single closing question for a YouTube trivia/documentary video,
+designed to make viewers stop and answer in the comments instead of just
+scrolling on.
+
+Rules:
+- Ask ONE short question (under 15 words) tied specifically to this video's
+  actual story, person, or dilemma — never a generic "What do you think?"
+  or "Did you learn something new?". Reference the real stakes, choice, or
+  situation the narration described.
+- Favor a "put yourself in their position" framing when the story has a
+  clear protagonist or decision point (e.g. "If you were him, what would
+  you do?", "Would you have taken that risk?", "What would you have done
+  in her place?"). If the topic has no single person to stand in for
+  (e.g. a natural phenomenon, a place, an object), ask for the viewer's
+  own opinion, guess, or experience instead ("Have you ever seen one of
+  these up close?", "What do you think caused it?").
+- Reads naturally when spoken aloud by a narrator — no quotation marks, no
+  "Question:" prefix, no hashtags, just the question itself as one sentence.
+
+Output ONLY the question text, nothing else.
+"""
+
+
+def generate_engagement_question(llm: LLMProvider, plan: ScenePlan) -> tuple[str, LLMResult]:
+    """One short, topic-specific comment-bait question for the outro card
+    (added 2026-09, client request: "make a question about the topic for
+    the viewers... leave an answer on comment section", sample: "if you
+    were him, what would you do?"). Read out as part of the narrated
+    outro (see assets.generate_branding_audio) in place of a generic
+    "thanks for watching" close — drives comments instead of just views.
+
+    Raises on any LLM failure — deliberately does not swallow exceptions,
+    same convention as rewrite_video_prompt, so callers can catch and fall
+    back to the outro's plain subscribe line; a missing/failed question
+    must never block the video.
+    """
+    # A short excerpt is enough context for a one-line question and keeps
+    # the call cheap even on a long (10+ minute) script — the full
+    # narration isn't needed to identify the story's central dilemma.
+    narration = " ".join(scene.narration for scene in plan.scenes)[:2000]
+    result = llm.complete(
+        ENGAGEMENT_QUESTION_SYSTEM_PROMPT,
+        f"Video title: {plan.title}\n\nNarration:\n{narration}",
+        max_tokens=100,
+    )
+    return result.text.strip(), result
+
+
 def split_script_local(
     script_text: str, style: str, topic_hint: str | None = None,
     avatar_enabled: bool = True,
