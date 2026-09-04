@@ -328,7 +328,12 @@ def main() -> int:
     else:
         render_step = "[4/4]"
 
-    if settings.subtitles_enabled:
+    subtitles_on = (
+        settings.shorts_subtitles_enabled
+        if is_shorts and settings.shorts_subtitles_enabled is not None
+        else settings.subtitles_enabled
+    )
+    if subtitles_on:
         print("      Generating scene captions")
         generate_subtitles(plan, paths)
 

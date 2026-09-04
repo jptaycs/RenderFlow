@@ -96,6 +96,13 @@ class Settings:
     # (make_video._incomplete_scenes, api._scene_assets) — no migration or
     # UI change needed for existing projects either way.
     subtitles_enabled: bool = True
+    # Per-format override (added 2026-09), None = follow subtitles_enabled
+    # above. Shorts and landscape want opposite defaults for a real
+    # reason, not just user taste: Shorts are watched sound-off while
+    # scrolling far more than landscape is, so captions matter a lot more
+    # there even for a user who prefers them off on their (sound-on,
+    # cinematic-feeling) landscape videos.
+    shorts_subtitles_enabled: bool | None = None
     # When both are set, the login page shows a one-click "Developer login"
     # button that prefills these credentials and submits them through the
     # normal password-checked login — there is no bypass endpoint. Local
@@ -170,4 +177,9 @@ class Settings:
             channel_name=os.getenv("RENDERFLOW_CHANNEL_NAME", ""),
             subtitles_enabled=os.getenv("RENDERFLOW_SUBTITLES", "1").lower()
             in ("1", "true", "yes"),
+            shorts_subtitles_enabled=(
+                None
+                if (raw := os.getenv("RENDERFLOW_SHORTS_SUBTITLES", "")) == ""
+                else raw.lower() in ("1", "true", "yes")
+            ),
         )
