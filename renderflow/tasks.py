@@ -124,8 +124,9 @@ def _resumable_job_argv(job_argv: list[str], scenes_json: Path) -> list[str]:
     dropping the script/topic-construction flags (title/format inside
     the persisted plan are already correct — attempt 1 applied them
     before its own `save_plan()` — so there's nothing left to reapply
-    except `--skip-render`, which every create job always sets and a
-    `--scenes-file` invocation understands identically).
+    except `--skip-render`, which a landscape create job sets (a Shorts
+    create job does not — see api.py::create_project) and a
+    `--scenes-file` invocation understands identically either way).
 
     A no-op for every job kind that already passes `--scenes-file` (every
     non-create kind), and for a create job whose attempt 1 crashed before

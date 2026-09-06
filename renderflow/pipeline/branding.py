@@ -21,6 +21,23 @@ TITLE_SIZE = 132
 SUBTITLE_SIZE = 58
 
 
+def _hex(rgb: tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+# Same four colors as the Pillow card above, converted for 69labs Motion
+# Graphics' "palette" control (background/foreground/accent/secondary hex
+# strings) — see pipeline/motion_graphics.py — so a rendered card matches
+# this project's existing look instead of the template's own default blue
+# palette.
+MOTION_GRAPHICS_PALETTE = {
+    "background": _hex(BACKGROUND),
+    "foreground": _hex(TEXT),
+    "accent": _hex(ACCENT),
+    "secondary": _hex(MUTED),
+}
+
+
 def _wrap(draw, text: str, font, max_width: int) -> list[str]:
     lines: list[str] = []
     line = ""
@@ -95,6 +112,42 @@ def build_intro_card(title: str, channel_name: str, out: Path) -> Path:
     return _card(lines, out)
 
 
+CTA_LINE = "Let us know in the comments!"
+
+
+def outro_lines(message: str | None) -> list[tuple[str, int, tuple]]:
+    """Pick the two headline lines for the outro card from the full
+    narrated outro sentence (assets._outro_line).
+
+    Bug fixed 2026-09: `message` is the *whole* narrated sentence, e.g.
+    "<question> Let us know in the comments! <subscribe line>" — this
+    used to be dumped onto the card as one dense wrapped line, with a
+    second, literally-duplicated "Let us know in the comments!" line
+    appended below it regardless of whether a real question was even
+    asked (the plain "Thanks for watching! <subscribe>" fallback got the
+    same bogus CTA line, with no question to react to). Client-reported
+    (indirectly, by asking for the question to be added — it technically
+    already was, just unreadable this way): "in shorts add the questions
+    at the end of the video for them to leave a comment". Fixed by
+    splitting the actual call-to-action phrase off the narrated sentence
+    so it renders once, in its own accent line, with just the question
+    above it — and falling back to the original clean two-line "Thanks
+    for watching" / "Subscribe for more trivia" copy whenever there's no
+    real question (LLM unset/failed, or an old project predating this
+    feature).
+    """
+    if message and CTA_LINE in message:
+        headline = message.split(CTA_LINE, 1)[0].strip()
+        return [
+            (headline, SUBTITLE_SIZE, TEXT),
+            (CTA_LINE, SUBTITLE_SIZE, ACCENT),
+        ]
+    return [
+        ("Thanks for watching", TITLE_SIZE, TEXT),
+        ("Subscribe for more trivia", SUBTITLE_SIZE, ACCENT),
+    ]
+
+
 def build_outro_card(
     channel_name: str, out: Path, message: str | None = None,
     width: int = WIDTH, height: int = HEIGHT,
@@ -106,23 +159,15 @@ def build_outro_card(
     on-screen instead of the old fixed "Thanks for watching" text, so the
     card matches what's actually being said instead of a generic line
     unrelated to it. None (narration disabled, or generation hasn't run
-    yet) keeps the original fixed copy.
+    yet) keeps the original fixed copy. See `outro_lines` for how it's
+    turned into the card's headline lines.
 
     `width`/`height` (added 2026-09, same change as `_card` above) let
     `render._shorts_outro_clip` build a portrait-sized version of this
     same card for Shorts, which have no landscape intro/outro cards at
     all in v1 scope but still get a closing message card of their own.
     """
-    if message:
-        lines = [
-            (message, SUBTITLE_SIZE, TEXT),
-            ("Let us know in the comments!", SUBTITLE_SIZE, ACCENT),
-        ]
-    else:
-        lines = [
-            ("Thanks for watching", TITLE_SIZE, TEXT),
-            ("Subscribe for more trivia", SUBTITLE_SIZE, ACCENT),
-        ]
+    lines = outro_lines(message)
     if channel_name:
         lines.append((channel_name.upper(), SUBTITLE_SIZE, MUTED))
     return _card(lines, out, width, height)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import random
 import shutil
 import threading
@@ -38,7 +39,8 @@ from renderflow.config import Settings
 from renderflow.db import Job, Project, User, get_db
 from renderflow.pipeline.script import (
     effective_avatar_layout,
-    generate_topic_idea,
+    generate_topic_only,
+    generate_topic_script,
     scene_is_avatar_solo,
     scene_is_visual_only,
 )
@@ -53,7 +55,7 @@ from renderflow.storage import (
     save_plan,
     slugify,
 )
-from renderflow.tasks import cancel_job, run_pipeline
+from renderflow.tasks import cancel_job, kill_pipeline_pgid, pid_is_pipeline, run_pipeline
 
 log = logging.getLogger("renderflow.api")
 
@@ -80,11 +82,67 @@ def _active_job(session: Session, project: Project) -> Job | None:
     return db.active_job(session, project.id)
 
 
+_EAGER_JOB_QUEUE: "queue.Queue[int]" = queue.Queue()
+_eager_worker_started = False
+_eager_worker_lock = threading.Lock()
+
+
+def _eager_worker_loop() -> None:
+    """The single persistent worker thread for `RENDERFLOW_CELERY_EAGER=1`
+    (added 2026-09) — pulls job ids off `_EAGER_JOB_QUEUE` and runs them
+    strictly one at a time, matching the real production Celery worker's
+    `--concurrency=1` (see the Commands section of CLAUDE.md).
+
+    Before this, `_enqueue`'s eager branch spawned a brand-new background
+    thread per job with no limit at all, so every queued video ran (and
+    CPU-contended for FFmpeg encoding, plus the concurrent broll/image/
+    voice HTTP calls) at once regardless of how many were already in
+    flight. Client-reported (after investigating "why does a Short render
+    too long"): four Shorts and several landscape videos were all
+    rendering simultaneously on this single dev machine, each one
+    crawling because it was sharing CPU with the others instead of
+    running at full speed. A single serialized worker (this loop) instead
+    of an unbounded thread-per-job gives the same one-at-a-time behavior
+    the real deployed worker already has.
+
+    `run_pipeline.run(job_id)` opens its own DB session internally (never
+    shares the enqueuing request's `session`), so calling it from this
+    one long-lived thread — instead of the caller's request thread, or a
+    fresh thread per job — is safe the same way it always was.
+    """
+    while True:
+        job_id = _EAGER_JOB_QUEUE.get()
+        try:
+            run_pipeline.run(job_id)
+        except Exception:
+            log.exception("eager-mode pipeline worker: job %d raised", job_id)
+
+
+def _ensure_eager_worker_started() -> None:
+    """Lazily starts the one `_eager_worker_loop` thread, exactly once.
+
+    Double-checked locking (same pattern as `Labs69Video._lookup_model`)
+    rather than starting it in `startup()`: a bare `TestClient(app)` (used
+    throughout this test suite) doesn't fire FastAPI's startup event
+    unless entered as a context manager, so tying worker startup to
+    `_enqueue` itself — the thing that actually needs it — works
+    regardless of how the app was booted.
+    """
+    global _eager_worker_started
+    if _eager_worker_started:
+        return
+    with _eager_worker_lock:
+        if _eager_worker_started:
+            return
+        threading.Thread(target=_eager_worker_loop, daemon=True).start()
+        _eager_worker_started = True
+
+
 def _enqueue(session: Session, project: Project, kind: str, argv: list[str]) -> Job:
     """Queue a pipeline run for the Celery worker.
 
     The Job row must be committed *before* dispatch — the worker (or, in
-    eager dev mode, the background thread below) can start faster than
+    eager dev mode, `_eager_worker_loop` below) can start faster than
     this request finishes, and an uncommitted job id would look like a
     stale delivery and be dropped.
     """
@@ -100,14 +158,16 @@ def _enqueue(session: Session, project: Project, kind: str, argv: list[str]) -> 
         # "Starting…" and never resolved while an unrelated 11-minute
         # video was still generating — not actually stuck, just blocked
         # behind that other request's full pipeline run on whichever
-        # thread picked it up. Dispatch on a background thread instead so
-        # this request returns immediately, the way a real worker's async
-        # queue would — run_pipeline opens its own DB session internally
-        # (never reuses the caller's `session`), so handing it to a
-        # different thread is safe. celery_task_id stays unset on this
-        # path; cancellation already works off job.pid, not the task id,
-        # so nothing else depends on it being set here.
-        threading.Thread(target=run_pipeline.run, args=(job.id,), daemon=True).start()
+        # thread picked it up. Dispatching onto the single persistent
+        # `_eager_worker_loop` (via a queue, not a thread spawned here)
+        # keeps that "request returns immediately" property while also
+        # processing jobs one at a time, matching the real worker's
+        # `--concurrency=1` — see `_eager_worker_loop`'s docstring.
+        # celery_task_id stays unset on this path; cancellation already
+        # works off job.pid, not the task id, so nothing else depends on
+        # it being set here.
+        _ensure_eager_worker_started()
+        _EAGER_JOB_QUEUE.put(job.id)
     else:
         result = run_pipeline.delay(job.id)
         job.celery_task_id = result.id
@@ -315,6 +375,13 @@ def _project_view(
             (plan.thumbnail.cost or 0.0)
             + (plan.intro_audio.cost or 0.0)
             + (plan.outro_audio.cost or 0.0)
+            # Motion Graphics cards (added 2026-09) are credit-based on
+            # 69labs (see cost_from_status) so this is usually 0.0 in
+            # practice — included for the same reason every other
+            # optional asset here is: total_asset_cost() sums them, so
+            # the breakdown must too or it silently undercounts again.
+            + (plan.intro_card_video.cost or 0.0)
+            + (plan.outro_card_video.cost or 0.0)
         ),
     }
 
@@ -488,7 +555,14 @@ def get_state(
         except (ValueError, json.JSONDecodeError):
             continue  # mid-write or hand-edited; next poll picks it up
         projects.append(_project_view(row, plan, paths, _active_job(session, row)))
-    projects.sort(key=lambda p: (not p["running"], p["title"].lower()))
+    # running-first (active work stays visible), then newest-created —
+    # the dashboard's own sort/filter controls (web/index.html's
+    # projectsGridHtml, GRID_SORT_OPTIONS) re-sort client-side on top of
+    # this, but the raw default itself used to be pure alphabetical by
+    # title, which read as arbitrary on a media dashboard where recency
+    # matters far more than title. Client-reported: the Shorts page "not
+    # organized well".
+    projects.sort(key=lambda p: (not p["running"], -(p["createdAt"] or 0)))
     return {
         "projects": projects,
         "jobs": _jobs_view(projects),
@@ -500,7 +574,6 @@ def get_state(
 
 class TopicIdea(BaseModel):
     title: str
-    script: str
 
 
 class TopicIdeaRequest(BaseModel):
@@ -509,15 +582,6 @@ class TopicIdeaRequest(BaseModel):
     # excludeTitles docstring note below for why this is required, not just
     # the DB's project titles.
     excludeTitles: list[str] = []
-    # Target video length in minutes — the modal's currently-selected
-    # length for landscape, or ~1 for Shorts (see web/index.html's
-    # randomTopic()). Sizes the generated script's word count to actually
-    # match the video it's about to become, instead of always returning a
-    # fixed short teaser regardless of target length (client-reported:
-    # "the random topic script must have a length the same with the
-    # target time like 11 minutes"). Same 1-15 clamp as NewProject's
-    # lengthMinutes below.
-    lengthMinutes: float = 1.5
 
 
 @app.post("/api/topics/random")
@@ -526,19 +590,27 @@ def random_topic_idea(
     user: User = Depends(current_user),
     session: Session = Depends(get_db),
 ) -> TopicIdea:
-    """One fresh Claude-generated video idea for the New Video modal's
-    "🎲 Random topic" button — replaces the old client-side static
-    RANDOM_TOPICS bank (see pipeline/script.py::generate_topic_idea), which
+    """One fresh Claude-generated video **title only** for the New Video
+    modal's "🎲 Random topic" button — replaces the old client-side static
+    RANDOM_TOPICS bank (see pipeline/script.py::generate_topic_only), which
     was a fixed 10-title array that ran out and started repeating well
     before a real user's project count did.
 
+    **Title-only, split from script generation, added 2026-09** (client
+    request: "generate the topic first then below is generate the script
+    if user like the topic") — this used to also write the full narration
+    in the same call (`generate_topic_idea`), which meant every click paid
+    for a full script even though most ideas are clicked past without
+    ever being used. The New Video modal now shows just the title with a
+    separate "Generate script" action below it (`POST /api/topics/script`)
+    that only fires once the user actually wants that specific idea.
+
     Deliberately a plain synchronous call, not a queued Job like project
-    creation — even at a long target length this is one completion, a few
-    seconds to a bit over a minute depending on length_minutes (see
-    generate_topic_idea's word-count scaling), unlike the full --topic
-    script generation that stays inside the worker subprocess (see
-    create_project) because it also drives image/voice/broll generation
-    on top of the script itself.
+    creation — a title-only completion is small and fast regardless of
+    the eventual video length, unlike the full --topic script generation
+    that stays inside the worker subprocess (see create_project) because
+    it also drives image/voice/broll generation on top of the script
+    itself.
 
     `body.excludeTitles` matters because this call is otherwise stateless:
     the *only* exclusion this endpoint used to send Claude was the DB's
@@ -553,16 +625,59 @@ def random_topic_idea(
         row.title
         for row in session.query(Project).filter(Project.owner_id == user.id).all()
     ] + body.excludeTitles
-    length_minutes = min(max(body.lengthMinutes, 1.0), 15.0)
     try:
         llm = build_llm(Settings.load())
-        idea, _ = generate_topic_idea(llm, existing_titles, length_minutes)
+        idea, _ = generate_topic_only(llm, existing_titles)
     except Exception as exc:  # missing/invalid ANTHROPIC_API_KEY, rate limit, etc.
         log.warning("random topic idea generation failed: %s", exc)
         raise HTTPException(
             503, "topic idea generation is unavailable right now"
         ) from exc
-    return TopicIdea(title=idea.title, script=idea.script)
+    return TopicIdea(title=idea.title)
+
+
+class TopicScript(BaseModel):
+    script: str
+
+
+class TopicScriptRequest(BaseModel):
+    title: str
+    # Target video length in minutes — the modal's currently-selected
+    # length for landscape, or ~1 for Shorts (see web/index.html's
+    # generateTopicScript()). Sizes the generated script's word count to
+    # actually match the video it's about to become, instead of always
+    # returning a fixed short teaser regardless of target length
+    # (client-reported: "the random topic script must have a length the
+    # same with the target time like 11 minutes"). Same 1-15 clamp as
+    # NewProject's lengthMinutes below.
+    lengthMinutes: float = 1.5
+
+
+@app.post("/api/topics/script")
+def random_topic_script(
+    body: TopicScriptRequest,
+    user: User = Depends(current_user),
+) -> TopicScript:
+    """Step 2 of the "🎲 Random topic" flow (added 2026-09): the full
+    narration script for a title the user has already seen and asked for
+    via the New Video modal's "Generate script" button (shown once a
+    title comes back from POST /api/topics/random). See
+    pipeline/script.py::generate_topic_script.
+
+    Deliberately a plain synchronous call, same reasoning as
+    random_topic_idea above — a few seconds to a bit over a minute
+    depending on length_minutes, not a queued Job.
+    """
+    length_minutes = min(max(body.lengthMinutes, 1.0), 15.0)
+    try:
+        llm = build_llm(Settings.load())
+        result, _ = generate_topic_script(llm, body.title, length_minutes)
+    except Exception as exc:  # missing/invalid ANTHROPIC_API_KEY, rate limit, etc.
+        log.warning("topic script generation failed: %s", exc)
+        raise HTTPException(
+            503, "script generation is unavailable right now"
+        ) from exc
+    return TopicScript(script=result.script)
 
 
 class NewProject(BaseModel):
@@ -662,15 +777,20 @@ def create_project(
     # immediately with whatever the first generation happened to produce.
     # The dashboard's existing "Resume run" button (shown for Paused
     # projects) does the render pass whenever they're ready.
-    _enqueue(
-        session,
-        project,
-        "create",
-        [
-            *source_args, "--style", body.style, "--title", title,
-            "--format", body.format, "--skip-render",
-        ],
-    )
+    # Shorts skip this pause and go straight through to a rendered
+    # final.mp4 in the same run: a Short is only ~6-12 scenes generated in
+    # one quick batch, so there's little to review mid-way, and stopping
+    # at "Paused" just forced an extra manual "Resume run" click for every
+    # Short. Client-reported: the shorts process "dont stop after assets
+    # in pipeline done". Landscape (potentially 50+ scenes) keeps the
+    # pause — that's still worth a review step before a long render.
+    create_args = [
+        *source_args, "--style", body.style, "--title", title,
+        "--format", body.format,
+    ]
+    if body.format != "shorts":
+        create_args.append("--skip-render")
+    _enqueue(session, project, "create", create_args)
     return {"slug": slug}
 
 
@@ -1061,6 +1181,63 @@ def logo() -> FileResponse:
     return FileResponse(WEB_DIR / "logo.png")
 
 
+def _recover_orphaned_jobs_eager(session: Session) -> None:
+    """Eager-mode counterpart to `tasks.recover_orphaned_jobs` (added
+    2026-09). That function only runs on a real Celery worker's
+    `worker_ready` signal — which never fires when
+    `RENDERFLOW_CELERY_EAGER=1` dispatches pipeline runs on a background
+    thread inside *this* process instead (see `_enqueue`). Restarting
+    api.py while a job is mid-run (e.g. to pick up a code change) kills
+    that background thread: the pipeline subprocess itself keeps running
+    independently, but nothing is left alive to write its result back, so
+    the Job row is stuck at 'running'/'queued' forever — and
+    `_project_view`'s `final_ready` check treats *any* active Job row as
+    "still rendering" regardless of what's actually on disk, so a
+    genuinely finished video shows as stuck "Generating" indefinitely.
+
+    Caught live 2026-09: three same-session api.py restarts (for unrelated
+    code changes) orphaned four Shorts create jobs; all four had actually
+    finished — real `final.mp4` on disk, 12-18 minutes after being queued
+    — but sat stuck at `status='running'` for 2+ hours until this function
+    existed to reconcile them. Client-reported (indirectly): "why the
+    queued shorts renders too long."
+
+    Unlike the Celery version (which always marks an orphan 'failed' —
+    correct there, since killing a *worker process* really does kill its
+    child pipeline subprocess too), this checks actual completion evidence
+    first: if the project looks Complete (`_project_view`'s own
+    `final_ready` logic, called with `job=None` to ask "if there were no
+    active run, would this look done?"), the job is marked 'succeeded'
+    instead — the work is real, and marking it 'failed' would hide a
+    finished video and could prompt a wasteful, unnecessary re-render.
+    Only runs when `settings.celery_eager` — a real Celery worker already
+    reconciles its own orphans via `recover_orphaned_jobs`.
+    """
+    for job in session.query(Job).filter(Job.status.in_(["running", "queued"])).all():
+        if job.pid and pid_is_pipeline(job.pid):
+            kill_pipeline_pgid(job.pid)
+        project = session.get(Project, job.project_id)
+        succeeded = False
+        if project and job.kind != "youtube_publish":
+            paths = ProjectPaths(root=Path(project.dir_path))
+            if paths.scenes_json.exists():
+                try:
+                    plan = load_plan(paths)
+                    succeeded = _project_view(project, plan, paths, None)["status"] == "Complete"
+                except (ValueError, json.JSONDecodeError):
+                    pass  # mid-write or hand-edited; leave it a failure below
+        job.status = "succeeded" if succeeded else "failed"
+        job.error = None if succeeded else (
+            "api server restarted while this job was running — resume to retry"
+        )
+        job.finished_at = job.finished_at or time.time()
+        log.warning(
+            "recovered orphaned job %d (%s, project %s) as %s",
+            job.id, job.kind, project.slug if project else "?", job.status,
+        )
+    session.commit()
+
+
 @app.on_event("startup")
 def startup() -> None:
     settings = Settings.load()
@@ -1095,6 +1272,16 @@ def startup() -> None:
             )
     db.init_db()
     _projects_dir().mkdir(parents=True, exist_ok=True)
+    if settings.celery_eager:
+        # See _recover_orphaned_jobs_eager's own docstring — a real Celery
+        # worker reconciles its own orphans via recover_orphaned_jobs
+        # (worker_ready signal), which never fires in this in-process
+        # dispatch mode, so api.py must do it on its own boot instead.
+        session = db.new_session()
+        try:
+            _recover_orphaned_jobs_eager(session)
+        finally:
+            session.close()
 
 
 if __name__ == "__main__":

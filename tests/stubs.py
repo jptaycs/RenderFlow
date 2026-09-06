@@ -73,6 +73,46 @@ class StubVideo:
         )
 
 
+class StubMotionGraphics:
+    """Stands in for providers.motion_graphics.Labs69MotionGraphics —
+    matches its render_card() signature, no network."""
+
+    name = "stub-motion-graphics"
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[dict[str, Any]] = []
+
+    def render_card(
+        self,
+        *,
+        title: str,
+        subtitle: str = "",
+        footer: str = "",
+        width: int,
+        height: int,
+        duration_seconds: float,
+        palette: dict[str, str] | None = None,
+        template_id: str = "kinetic-title-card",
+    ) -> GeneratedAsset:
+        self.calls.append(
+            {
+                "title": title, "subtitle": subtitle, "footer": footer,
+                "width": width, "height": height,
+                "duration_seconds": duration_seconds, "template_id": template_id,
+            }
+        )
+        if self.fail:
+            raise ValueError("stub motion-graphics failure")
+        return GeneratedAsset(
+            data=b"fake-motion-graphics-mp4",
+            provider=self.name,
+            params={"templateId": template_id, "title": title},
+            cost=None,  # credit-based account, same as the real adapter
+            meta={"format": "mp4"},
+        )
+
+
 class StubAvatar:
     name = "stub-avatar"
 

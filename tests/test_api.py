@@ -285,6 +285,31 @@ def test_create_project_enqueues_a_job(client, pipeline_stub, saas_env):
     assert (saas_env.projects_dir / "u1" / slug / "script" / "source.txt").exists()
 
 
+def test_create_shorts_project_does_not_skip_render(client, pipeline_stub, saas_env):
+    # Client-reported: the shorts process "dont stop after assets in
+    # pipeline done" — a Short is only ~6-12 scenes, so unlike landscape
+    # (which pauses for review before a potentially 50+ scene render) it
+    # should go straight through asset generation into a rendered
+    # final.mp4 in the same create job, with no --skip-render pause.
+    register(client, "admin@example.com")
+    res = client.post(
+        "/api/projects",
+        json={
+            "title": "A Short",
+            "script": "One sentence of narration.",
+            "format": "shorts",
+        },
+    )
+    assert res.status_code == 201, res.text
+
+    from renderflow import db as rdb
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).one()
+        assert "--skip-render" not in job.argv
+        assert "--format" in job.argv and "shorts" in job.argv
+
+
 def test_enqueue_dispatches_on_a_background_thread_in_eager_mode(client, saas_env, monkeypatch):
     # Client-reported: creating a Short showed "Starting…" and never
     # resolved while an unrelated 11-minute video was still generating.
@@ -329,6 +354,60 @@ def test_enqueue_dispatches_on_a_background_thread_in_eager_mode(client, saas_en
         # task id to record — cancellation already works off job.pid.
         assert job.celery_task_id is None
     assert slug  # the request itself still returned normally
+
+
+def test_eager_worker_runs_jobs_one_at_a_time(client, saas_env, monkeypatch):
+    # Added 2026-09: _enqueue used to spawn a brand-new thread per job
+    # with no limit at all, so N videos queued close together all
+    # rendered (and CPU-contended for FFmpeg encoding) simultaneously.
+    # Client-reported, after investigating "why does a Short render too
+    # long": four Shorts and several landscape videos were all rendering
+    # at once on one dev machine. The single persistent _eager_worker_loop
+    # must process jobs strictly one at a time, matching the real
+    # deployed worker's --concurrency=1 (see CLAUDE.md's Commands section).
+    import threading
+    import time
+
+    from renderflow import api
+    from tests.conftest import make_settings
+
+    eager_settings = make_settings(projects_dir=saas_env.projects_dir, celery_eager=True)
+    monkeypatch.setattr(api.Settings, "load", classmethod(lambda cls: eager_settings))
+
+    intervals: list[tuple[float, float]] = []
+    lock = threading.Lock()
+
+    class SlowTask:
+        def run(self, job_id: int) -> None:
+            start = time.monotonic()
+            time.sleep(0.2)
+            end = time.monotonic()
+            with lock:
+                intervals.append((start, end))
+
+        def delay(self, job_id: int):
+            raise AssertionError(".delay() must not be called in eager mode")
+
+    monkeypatch.setattr(api, "run_pipeline", SlowTask())
+
+    register(client, "admin@example.com")
+    # Two *different* projects, so the existing per-project "run already
+    # in progress" 409 guard can't be what's serializing them — only the
+    # shared worker queue is.
+    slug_a = _create_project(client, title="Video A")
+    slug_b = _create_project(client, title="Video B")
+
+    deadline = time.monotonic() + 5
+    while len(intervals) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert len(intervals) == 2, "both jobs should have run by now"
+
+    (start1, end1), (start2, end2) = sorted(intervals)
+    # Strictly sequential: the second job must not start until the first
+    # finished — if they'd run concurrently (the old per-job-thread
+    # behavior), start2 would fall before end1.
+    assert start2 >= end1, f"jobs overlapped: {intervals}"
+    assert slug_a and slug_b
 
 
 def test_create_project_topic_mode_enqueues_topic_job(client, pipeline_stub, saas_env):
@@ -421,32 +500,36 @@ def test_create_project_clamps_length_minutes(client, pipeline_stub, saas_env):
         assert float(job.argv[length_index]) == 15.0
 
 
-"""POST /api/topics/random: the "🎲 Random topic" button's Claude-backed
-idea generator (replaces the old client-side static RANDOM_TOPICS bank).
-Never touches a live LLM — build_llm/generate_topic_idea are monkeypatched
-at the api module boundary, same spirit as pipeline_stub for run_pipeline."""
+"""POST /api/topics/random + POST /api/topics/script: the "🎲 Random topic"
+button's two-step Claude-backed flow (added 2026-09, split from a single
+combined call — client request: "generate the topic first then below is
+generate the script if user like the topic"). Never touches a live LLM —
+build_llm/generate_topic_only/generate_topic_script are monkeypatched at
+the api module boundary, same spirit as pipeline_stub for run_pipeline."""
 
 from renderflow.providers.base import LLMResult
-from renderflow.schema import GeneratedTopicIdea
+from renderflow.schema import GeneratedTopicOnly, GeneratedTopicScript
 
 
-def test_random_topic_idea_returns_generated_idea(client, monkeypatch):
+def test_random_topic_idea_returns_title_only(client, monkeypatch):
     from renderflow import api
 
     register(client, "admin@example.com")
 
-    def fake_generate_topic_idea(llm, existing_titles, length_minutes):
+    def fake_generate_topic_only(llm, existing_titles):
         return (
-            GeneratedTopicIdea(title="The Shark Born Before America", script="Some fact."),
+            GeneratedTopicOnly(title="The Shark Born Before America"),
             LLMResult(text="{}", provider="stub", cost=0.001),
         )
 
     monkeypatch.setattr(api, "build_llm", lambda settings: object())
-    monkeypatch.setattr(api, "generate_topic_idea", fake_generate_topic_idea)
+    monkeypatch.setattr(api, "generate_topic_only", fake_generate_topic_only)
 
     res = client.post("/api/topics/random")
     assert res.status_code == 200, res.text
-    assert res.json() == {"title": "The Shark Born Before America", "script": "Some fact."}
+    # Title only — no script field. The client asks for the script
+    # separately, and only if it wants this specific idea.
+    assert res.json() == {"title": "The Shark Born Before America"}
 
 
 def test_random_topic_idea_passes_existing_project_titles(client, pipeline_stub, monkeypatch):
@@ -457,15 +540,15 @@ def test_random_topic_idea_passes_existing_project_titles(client, pipeline_stub,
 
     captured: dict = {}
 
-    def fake_generate_topic_idea(llm, existing_titles, length_minutes):
+    def fake_generate_topic_only(llm, existing_titles):
         captured["existing_titles"] = existing_titles
         return (
-            GeneratedTopicIdea(title="Something New", script="A fresh fact."),
+            GeneratedTopicOnly(title="Something New"),
             LLMResult(text="{}", provider="stub"),
         )
 
     monkeypatch.setattr(api, "build_llm", lambda settings: object())
-    monkeypatch.setattr(api, "generate_topic_idea", fake_generate_topic_idea)
+    monkeypatch.setattr(api, "generate_topic_only", fake_generate_topic_only)
 
     res = client.post("/api/topics/random")
     assert res.status_code == 200, res.text
@@ -485,15 +568,15 @@ def test_random_topic_idea_merges_client_excluded_titles(client, monkeypatch):
 
     captured: dict = {}
 
-    def fake_generate_topic_idea(llm, existing_titles, length_minutes):
+    def fake_generate_topic_only(llm, existing_titles):
         captured["existing_titles"] = existing_titles
         return (
-            GeneratedTopicIdea(title="Yet Another Idea", script="A fact."),
+            GeneratedTopicOnly(title="Yet Another Idea"),
             LLMResult(text="{}", provider="stub"),
         )
 
     monkeypatch.setattr(api, "build_llm", lambda settings: object())
-    monkeypatch.setattr(api, "generate_topic_idea", fake_generate_topic_idea)
+    monkeypatch.setattr(api, "generate_topic_only", fake_generate_topic_only)
 
     res = client.post(
         "/api/topics/random",
@@ -508,41 +591,75 @@ def test_random_topic_idea_failure_returns_503(client, monkeypatch):
 
     register(client, "admin@example.com")
 
-    def failing_generate_topic_idea(llm, existing_titles, length_minutes):
+    def failing_generate_topic_only(llm, existing_titles):
         raise RuntimeError("no ANTHROPIC_API_KEY")
 
     monkeypatch.setattr(api, "build_llm", lambda settings: object())
-    monkeypatch.setattr(api, "generate_topic_idea", failing_generate_topic_idea)
+    monkeypatch.setattr(api, "generate_topic_only", failing_generate_topic_only)
 
     res = client.post("/api/topics/random")
     assert res.status_code == 503
 
 
-def test_random_topic_idea_passes_and_clamps_length_minutes(client, monkeypatch):
+def test_topic_script_returns_generated_script(client, monkeypatch):
+    from renderflow import api
+
+    register(client, "admin@example.com")
+
+    def fake_generate_topic_script(llm, title, length_minutes):
+        return (
+            GeneratedTopicScript(script="Some fact about " + title),
+            LLMResult(text="{}", provider="stub", cost=0.002),
+        )
+
+    monkeypatch.setattr(api, "build_llm", lambda settings: object())
+    monkeypatch.setattr(api, "generate_topic_script", fake_generate_topic_script)
+
+    res = client.post("/api/topics/script", json={"title": "The Shark Born Before America"})
+    assert res.status_code == 200, res.text
+    assert res.json() == {"script": "Some fact about The Shark Born Before America"}
+
+
+def test_topic_script_passes_and_clamps_length_minutes(client, monkeypatch):
     from renderflow import api
 
     register(client, "admin@example.com")
 
     captured: dict = {}
 
-    def fake_generate_topic_idea(llm, existing_titles, length_minutes):
+    def fake_generate_topic_script(llm, title, length_minutes):
         captured["length_minutes"] = length_minutes
         return (
-            GeneratedTopicIdea(title="A Title", script="A fact."),
+            GeneratedTopicScript(script="A fact."),
             LLMResult(text="{}", provider="stub"),
         )
 
     monkeypatch.setattr(api, "build_llm", lambda settings: object())
-    monkeypatch.setattr(api, "generate_topic_idea", fake_generate_topic_idea)
+    monkeypatch.setattr(api, "generate_topic_script", fake_generate_topic_script)
 
-    res = client.post("/api/topics/random", json={"lengthMinutes": 11})
+    res = client.post("/api/topics/script", json={"title": "A Title", "lengthMinutes": 11})
     assert res.status_code == 200, res.text
     assert captured["length_minutes"] == 11.0
 
     # Out-of-range values clamp the same way NewProject.lengthMinutes does.
-    res = client.post("/api/topics/random", json={"lengthMinutes": 999})
+    res = client.post("/api/topics/script", json={"title": "A Title", "lengthMinutes": 999})
     assert res.status_code == 200, res.text
     assert captured["length_minutes"] == 15.0
+
+
+def test_topic_script_failure_returns_503(client, monkeypatch):
+    from renderflow import api
+
+    register(client, "admin@example.com")
+
+    def failing_generate_topic_script(llm, title, length_minutes):
+        raise RuntimeError("no ANTHROPIC_API_KEY")
+
+    monkeypatch.setattr(api, "build_llm", lambda settings: object())
+    monkeypatch.setattr(api, "generate_topic_script", failing_generate_topic_script)
+
+    res = client.post("/api/topics/script", json={"title": "A Title"})
+    assert res.status_code == 503
 
 
 def test_project_with_active_job_rejects_further_runs(client):
@@ -850,3 +967,143 @@ def test_project_view_surfaces_youtube_publish_result(client, saas_env):
     project = next(p for p in projects if p["slug"] == slug)
     assert project["youtube"]["url"] == "https://youtu.be/abc123"
     assert project["youtube"]["videoId"] == "abc123"
+
+
+"""_recover_orphaned_jobs_eager: the eager-mode (RENDERFLOW_CELERY_EAGER=1)
+counterpart to tasks.recover_orphaned_jobs, which only fires on a real
+Celery worker's worker_ready signal. Caught live 2026-09: three same-session
+api.py restarts orphaned four Shorts create jobs that had actually finished
+(real final.mp4 on disk) but stayed stuck at status='running' for 2+ hours."""
+
+
+def _orphan_project_and_job(saas_env, session, status="running", pid=99999):
+    from renderflow import db as rdb
+
+    user = rdb.User(email=f"orphan-{status}-{pid}@example.com", password_hash="x")
+    session.add(user)
+    session.flush()
+    slug = f"orphan-{pid}"
+    project = rdb.Project(
+        owner_id=user.id, slug=slug, title="Orphan",
+        dir_path=str(saas_env.projects_dir / f"u{user.id}" / slug),
+        created_at=0.0,
+    )
+    session.add(project)
+    session.flush()
+    job = rdb.Job(
+        project_id=project.id, kind="create", argv=["--scenes-file", "x"],
+        status=status, pid=pid,
+    )
+    session.add(job)
+    session.commit()
+    return project, job
+
+
+def test_recover_orphaned_jobs_eager_marks_genuinely_finished_job_succeeded(saas_env, monkeypatch):
+    # The exact live scenario: the pipeline subprocess actually finished
+    # (real, fresh final.mp4; every asset COMPLETED) after its dispatch
+    # thread was killed by an api.py restart — marking this "failed" would
+    # hide a finished video and invite a wasteful, unnecessary re-render.
+    import os
+    import time
+
+    from renderflow import api
+    from renderflow import db as rdb
+    from renderflow.schema import AssetRef, AssetStatus, Scene, SceneAssets, ScenePlan
+    from renderflow.storage import ProjectPaths, save_plan
+
+    monkeypatch.setattr(api, "pid_is_pipeline", lambda pid: False)
+    killed = []
+    monkeypatch.setattr(api, "kill_pipeline_pgid", lambda pid: killed.append(pid))
+
+    with rdb.new_session() as session:
+        project, job = _orphan_project_and_job(saas_env, session)
+        job_id, dir_path, owner_id = job.id, project.dir_path, project.owner_id
+
+    paths = ProjectPaths.create(saas_env.projects_dir / f"u{owner_id}", f"orphan-99999")
+    scene = Scene(
+        id=1, type="narration", duration_estimate_sec=5.0, narration="Hi.", image_prompt="x",
+        assets=SceneAssets(
+            image=AssetRef(status=AssetStatus.COMPLETED, path="i.png"),
+            voice=AssetRef(status=AssetStatus.COMPLETED, path="v.wav"),
+        ),
+    )
+    plan = ScenePlan(title="Orphan", style="documentary", scenes=[scene])
+    save_plan(plan, paths)
+    final = paths.output / "final.mp4"
+    final.write_bytes(b"data")
+    now = time.time() + 5
+    os.utime(final, (now, now))
+
+    with rdb.new_session() as session:
+        api._recover_orphaned_jobs_eager(session)
+
+    with rdb.new_session() as session:
+        recovered = session.get(rdb.Job, job_id)
+        assert recovered.status == "succeeded"
+        assert recovered.error is None
+    assert killed == []  # dead pid — nothing to kill
+
+
+def test_recover_orphaned_jobs_eager_fails_genuinely_unfinished_job(saas_env, monkeypatch):
+    from renderflow import api
+    from renderflow import db as rdb
+
+    monkeypatch.setattr(api, "pid_is_pipeline", lambda pid: False)
+    monkeypatch.setattr(api, "kill_pipeline_pgid", lambda pid: None)
+
+    with rdb.new_session() as session:
+        # No project directory/scenes.json at all — never got far enough
+        # to produce anything worth recovering.
+        _orphan_project_and_job(saas_env, session, pid=11111)
+        session.flush()
+        job_id = session.query(rdb.Job).filter(rdb.Job.pid == 11111).one().id
+
+    with rdb.new_session() as session:
+        api._recover_orphaned_jobs_eager(session)
+
+    with rdb.new_session() as session:
+        recovered = session.get(rdb.Job, job_id)
+        assert recovered.status == "failed"
+        assert "restarted" in recovered.error
+
+
+def test_recover_orphaned_jobs_eager_kills_surviving_subprocess(saas_env, monkeypatch):
+    from renderflow import api
+    from renderflow import db as rdb
+
+    monkeypatch.setattr(api, "pid_is_pipeline", lambda pid: True)
+    killed = []
+    monkeypatch.setattr(api, "kill_pipeline_pgid", lambda pid: killed.append(pid))
+
+    with rdb.new_session() as session:
+        _orphan_project_and_job(saas_env, session, pid=54321)
+
+    with rdb.new_session() as session:
+        api._recover_orphaned_jobs_eager(session)
+
+    assert killed == [54321]
+
+
+def test_recover_orphaned_jobs_eager_never_marks_youtube_publish_succeeded(saas_env, monkeypatch):
+    # youtube_publish never touches final.mp4 (see the "rendering" gate in
+    # _project_view) — completion evidence there is youtube.json, which
+    # this function deliberately doesn't check (a stuck publish job should
+    # always come back as "resume to retry", never silently "succeeded").
+    from renderflow import api
+    from renderflow import db as rdb
+
+    monkeypatch.setattr(api, "pid_is_pipeline", lambda pid: False)
+    monkeypatch.setattr(api, "kill_pipeline_pgid", lambda pid: None)
+
+    with rdb.new_session() as session:
+        project, job = _orphan_project_and_job(saas_env, session, pid=22222)
+        job.kind = "youtube_publish"
+        session.commit()
+        job_id = job.id
+
+    with rdb.new_session() as session:
+        api._recover_orphaned_jobs_eager(session)
+
+    with rdb.new_session() as session:
+        assert session.get(rdb.Job, job_id).status == "failed"

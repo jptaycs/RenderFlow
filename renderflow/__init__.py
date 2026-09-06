@@ -1,6 +1,29 @@
 """RenderFlow — AI video production orchestration."""
 
+import os
+
 __version__ = "0.1.0"
+
+# Second Avast Web Shield fallout, hit live 2026-09 (same root cause as the
+# truststore fix below, a different symptom): Avast sets SSLKEYLOGFILE
+# (verified live: `\\.\aswMonFltProxy\<id>`, a named pipe belonging to its
+# own HTTPS-scanning proxy driver) at the Windows user-env level, presumably
+# so it can capture TLS session keys for its own traffic inspection.
+# `ssl.create_default_context()` honors that env var unconditionally
+# (`context.keylog_filename = keylogfile`) — every single provider call in
+# this app failed identically with `PermissionError: [Errno 13] Permission
+# denied: '\\.\aswMonFltProxy\...'` deep in truststore's SSLContext proxy,
+# because the current (non-elevated) process can't write to Avast's device.
+# Reproduced live: every image AND voice call failed on every scene of a
+# real project, all ten create-job auto-retry attempts, and all ten of the
+# resume job's retries after — a systemic, per-process env issue, not a
+# per-call transient error retrying could ever fix. RenderFlow has no
+# legitimate use for TLS key logging, so this just removes it from *this
+# process's* environment (never the real Windows env var, and never
+# anything Avast itself does) before any SSL context gets created — must
+# run before the truststore import right below, and before any provider
+# constructs an httpx/anthropic client.
+os.environ.pop("SSLKEYLOGFILE", None)
 
 # Verify outbound HTTPS against the OS trust store instead of the bundled
 # `certifi` CA list, for every httpx-based provider call in this package

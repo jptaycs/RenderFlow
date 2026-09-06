@@ -153,6 +153,15 @@ class ScenePlan(BaseModel):
     # re-derive or re-guess it — captions must always match what's
     # actually being said. None until generate_branding_audio runs once.
     outro_text: str | None = None
+    # Animated intro/outro title cards from 69labs Motion Graphics (added
+    # 2026-09, RENDERFLOW_MOTION_GRAPHICS=1), replacing the static
+    # Pillow-drawn card with a real templated Remotion render — see
+    # pipeline/motion_graphics.py. Optional exactly like intro_audio/
+    # outro_audio: a PENDING/no-path ref (disabled, generation failed, or
+    # an old project from before this feature) just means render.py falls
+    # back to the original Pillow card, never blocks the render.
+    intro_card_video: AssetRef = Field(default_factory=AssetRef)
+    outro_card_video: AssetRef = Field(default_factory=AssetRef)
     # Background-music track filename (relative to RENDERFLOW_MUSIC_DIR),
     # chosen randomly at first render and persisted so re-renders keep the
     # same track. None = not chosen yet or music disabled.
@@ -160,7 +169,10 @@ class ScenePlan(BaseModel):
 
     def total_asset_cost(self) -> float:
         total = 0.0
-        refs = [self.thumbnail, self.intro_audio, self.outro_audio]
+        refs = [
+            self.thumbnail, self.intro_audio, self.outro_audio,
+            self.intro_card_video, self.outro_card_video,
+        ]
         for scene in self.scenes:
             refs += [
                 scene.assets.image,
@@ -281,12 +293,25 @@ class GeneratedScript(BaseModel):
         return ScenePlan(title=self.title, style=self.style, scenes=scenes)
 
 
-class GeneratedTopicIdea(BaseModel):
-    """A single fresh video idea from `pipeline/script.py::generate_topic_idea`
-    — the dashboard's "🎲 Random topic" button, replacing the old static
-    RANDOM_TOPICS bank in web/index.html with a live Claude call."""
+class GeneratedTopicOnly(BaseModel):
+    """A single fresh video title from `pipeline/script.py::generate_topic_only`
+    — step 1 of the dashboard's "🎲 Random topic" button (added 2026-09,
+    client request: show the topic first, only write the full script if
+    the user likes it, replacing the old single-call generate_topic_idea
+    that always wrote a full script immediately — most ideas were probably
+    going to be discarded with another click before the user ever saw it)."""
 
     model_config = ConfigDict(extra="forbid")
 
     title: str
+
+
+class GeneratedTopicScript(BaseModel):
+    """The narration script for a specific, already-chosen title, from
+    `pipeline/script.py::generate_topic_script` — step 2 of the "🎲 Random
+    topic" flow, called only once the user has seen the title and asked
+    for the script."""
+
+    model_config = ConfigDict(extra="forbid")
+
     script: str

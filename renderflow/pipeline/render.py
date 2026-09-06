@@ -50,6 +50,16 @@ PRESCALE_W, PRESCALE_H = 2560, 1440
 CARD_PRESCALE_W, CARD_PRESCALE_H = 7680, 4320
 # Gap between the caption image's bottom edge and the frame's bottom edge.
 CAPTION_MARGIN = 34
+# Shorts (portrait) captions need much more clearance than landscape's fixed
+# 34px: the YouTube/TikTok/Reels player UI overlays the bottom ~25-30% of a
+# vertical video with the channel name, video title/description, and sound
+# info — a caption sitting just above the physical frame edge sits right
+# behind that chrome and is unreadable in the actual app, even though it
+# looks fine in a bare video player. Client-reported: "in shorts format
+# preview subtitle got block by the name of page and video title and
+# description". Expressed as a fraction of frame height (not a fixed pixel
+# count) so it scales correctly if SHORTS_HEIGHT ever changes.
+SHORTS_CAPTION_BOTTOM_FRAC = 0.30
 # Silent beat appended to the end of every scene clip, so narration never
 # runs straight into the next line. NOT an audio crossfade: crossfading two
 # narration tracks blends the tail of one sentence into the head of the
@@ -200,19 +210,26 @@ def _subtitle_chunks(scene: Scene) -> list[dict]:
 
 
 def _caption_filter_chain(
-    base_label: str, chunks: list[dict], start_index: int
+    base_label: str, chunks: list[dict], start_index: int,
+    width: int = WIDTH, height: int = HEIGHT,
 ) -> tuple[str, list[str], str]:
     """Overlay each caption PNG onto base_label, timed to its (start, end).
 
     Returns (final_label, extra ffmpeg "-i" args, filter_complex additions).
     Empty chunks return base_label unchanged and no-op additions.
+
+    `width`/`height` (added 2026-09) decide how far above the bottom edge
+    the caption sits — see SHORTS_CAPTION_BOTTOM_FRAC's docstring for why
+    a portrait render needs far more clearance than landscape's fixed
+    CAPTION_MARGIN.
     """
     if not chunks:
         return base_label, [], ""
     extra_inputs: list[str] = []
     filters: list[str] = []
     label = base_label
-    y_expr = f"H-h-{CAPTION_MARGIN}"
+    margin = int(height * SHORTS_CAPTION_BOTTOM_FRAC) if height > width else CAPTION_MARGIN
+    y_expr = f"H-h-{margin}"
     for i, chunk in enumerate(chunks):
         idx = start_index + i
         extra_inputs += ["-i", chunk["image"]]
@@ -313,7 +330,7 @@ def render_scene_clip(
 
     visual = _parallax_visual(scene, width, height, duration, out)
     if visual is not None:
-        cap_label, cap_inputs, cap_filter = _caption_filter_chain("v0", chunks, 2)
+        cap_label, cap_inputs, cap_filter = _caption_filter_chain("v0", chunks, 2, width, height)
         filter_complex = f"[0:v]fps={FPS},setsar=1,format=yuv420p[v0]"
         if cap_filter:
             filter_complex += ";" + cap_filter
@@ -337,7 +354,7 @@ def render_scene_clip(
         return out
 
     frames = math.ceil(duration * FPS)
-    cap_label, cap_inputs, cap_filter = _caption_filter_chain("base", chunks, 2)
+    cap_label, cap_inputs, cap_filter = _caption_filter_chain("base", chunks, 2, width, height)
     filter_complex = f"[0:v]{_zoompan_expr(scene, frames, width, height)}[base]"
     if cap_filter:
         filter_complex += ";" + cap_filter
@@ -377,7 +394,7 @@ def _render_broll_clip(
     shorter than the scene loops; a longer one is trimmed by -t.
     """
     loop_args = ["-stream_loop", "-1"] if probe_duration(video) < duration else []
-    cap_label, cap_inputs, cap_filter = _caption_filter_chain("v0", chunks, 2)
+    cap_label, cap_inputs, cap_filter = _caption_filter_chain("v0", chunks, 2, width, height)
     filter_complex = (
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},fps={FPS},setsar=1,format=yuv420p[v0]"
@@ -419,7 +436,7 @@ def render_avatar_full_clip(
         f"tpad=stop_mode=clone:stop_duration={SCENE_GAP_SEC:.3f},format=yuv420p[vbase]"
     )
     chunks = _subtitle_chunks(scene)
-    cap_label, cap_inputs, cap_filter = _caption_filter_chain("vbase", chunks, 1)
+    cap_label, cap_inputs, cap_filter = _caption_filter_chain("vbase", chunks, 1, width, height)
     if cap_filter:
         filter_complex += ";" + cap_filter
     filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration, fade_in)
@@ -478,7 +495,7 @@ def render_avatar_split_clip(
         "[left][right]hstack=inputs=2[vbase]"
     )
     chunks = _subtitle_chunks(scene)
-    cap_label, cap_inputs, cap_filter = _caption_filter_chain("vbase", chunks, 2)
+    cap_label, cap_inputs, cap_filter = _caption_filter_chain("vbase", chunks, 2, width, height)
     if cap_filter:
         filter_complex += ";" + cap_filter
     filter_complex, final_label = _apply_fade(filter_complex, cap_label, duration, fade_in)
@@ -708,7 +725,66 @@ def _render_card_clip(
     return out
 
 
-def _card_audio(ref, paths: ProjectPaths) -> Path | None:
+def _render_motion_graphics_card_clip(
+    video: Path, duration: float, out: Path, audio_path: Path | None = None,
+    width: int = WIDTH, height: int = HEIGHT, fade_in: bool = True,
+) -> Path:
+    """A 69labs Motion Graphics render (added 2026-09,
+    RENDERFLOW_MOTION_GRAPHICS=1 — see assets.generate_motion_graphics_cards),
+    muxed with narration audio and normalized to match the rest of the
+    timeline. Used instead of `_render_card_clip` whenever
+    `plan.intro_card_video`/`outro_card_video` completed (see
+    `_branding_clips`/`_shorts_outro_clip`); same call shape (`audio_path`/
+    `width`/`height`/`fade_in`) so both card-rendering paths are
+    interchangeable at the call site.
+
+    The card was already requested at (close to) `duration` (see
+    `assets.generate_motion_graphics_cards`'s duration-matching), but never
+    trust that exactly — a 1s `tpad` safety net (same technique the avatar
+    clips use for their own trailing pause) covers any shortfall from
+    duration-rounding or template quirks, and the final `-t` trims any
+    surplus the same way every other clip in this pipeline is trimmed to
+    its target duration. `scale`/`crop` are a normalization safety net too
+    — the render is already generated at the requested aspect ratio, but
+    this guards against any minor mismatch the same way `_render_broll_clip`
+    guards an external stock clip's dimensions.
+    """
+    filter_complex = (
+        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},fps={FPS},setsar=1,"
+        f"tpad=stop_mode=clone:stop_duration=1.0,format=yuv420p[card]"
+    )
+    filter_complex, final_label = _apply_fade(filter_complex, "card", duration, fade_in)
+    if audio_path is not None:
+        audio_input = ["-i", str(audio_path)]
+        audio_filter = ["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]
+    else:
+        audio_input = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+        audio_filter = []
+    _run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(video),
+            *audio_input,
+            "-filter_complex", filter_complex,
+            "-map", f"[{final_label}]", "-map", "1:a",
+            "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+            *audio_filter,
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-t", f"{duration:.3f}",
+            str(out),
+        ]
+    )
+    return out
+
+
+def _completed_asset_path(ref) -> Path | None:
+    """The file for a COMPLETED AssetRef, or None if it's not done (or its
+    file went missing). Generic over what the ref actually holds — used
+    for card narration audio (`intro_audio`/`outro_audio`) and, since
+    2026-09, a 69labs Motion Graphics card render
+    (`intro_card_video`/`outro_card_video`) — renamed from the
+    audio-specific `_card_audio` when it grew that second use."""
     if ref.status is not AssetStatus.COMPLETED or not ref.path:
         return None
     path = Path(ref.path)
@@ -721,35 +797,58 @@ def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], l
     scope, hook-first — Shorts get their own, portrait-sized closing-message
     card instead, see `_shorts_outro_clip`; there's still no landscape-style
     intro for Shorts), or the cards fail to build (branding must never block
-    a render)."""
+    a render).
+
+    Uses the animated 69labs Motion Graphics render for a card
+    (`_render_motion_graphics_card_clip`) whenever
+    `plan.intro_card_video`/`outro_card_video` completed (added 2026-09,
+    RENDERFLOW_MOTION_GRAPHICS=1 — see assets.generate_motion_graphics_cards),
+    falling back to the original static Pillow card (`_render_card_clip`)
+    per card independently otherwise — disabled, generation failed, or an
+    old project predating this feature all look the same here: no
+    completed ref, use Pillow."""
     settings = Settings.load()
     if not settings.intro_outro or plan.format == "shorts":
         return [], []
     from renderflow.pipeline import branding
 
     try:
-        intro_png = branding.build_intro_card(
-            plan.title, settings.channel_name, paths.output / "intro_card.png"
-        )
-        outro_png = branding.build_outro_card(
-            settings.channel_name, paths.output / "outro_card.png", message=plan.outro_text
-        )
         # Narration (assets.generate_branding_audio) is optional — a PENDING/
         # missing ref just means a silent card, exactly like before that
         # feature existed. When present, the card holds at least as long as
         # the voiceover (plus a small pad) so it's never cut off mid-line.
-        intro_audio = _card_audio(plan.intro_audio, paths)
-        outro_audio = _card_audio(plan.outro_audio, paths)
+        intro_audio = _completed_asset_path(plan.intro_audio)
+        outro_audio = _completed_asset_path(plan.outro_audio)
         intro_duration = max(INTRO_SEC, probe_duration(intro_audio) + 0.4) if intro_audio else INTRO_SEC
         outro_duration = max(OUTRO_SEC, probe_duration(outro_audio) + 0.4) if outro_audio else OUTRO_SEC
-        intro = _render_card_clip(
-            intro_png, intro_duration, paths.output / "intro.mp4", audio_path=intro_audio
-        )
-        outro = _render_card_clip(
-            outro_png, outro_duration, paths.output / "outro.mp4", audio_path=outro_audio
-        )
+
+        intro_mg = _completed_asset_path(plan.intro_card_video)
+        if intro_mg is not None:
+            intro = _render_motion_graphics_card_clip(
+                intro_mg, intro_duration, paths.output / "intro.mp4", audio_path=intro_audio
+            )
+        else:
+            intro_png = branding.build_intro_card(
+                plan.title, settings.channel_name, paths.output / "intro_card.png"
+            )
+            intro = _render_card_clip(
+                intro_png, intro_duration, paths.output / "intro.mp4", audio_path=intro_audio
+            )
+
+        outro_mg = _completed_asset_path(plan.outro_card_video)
+        if outro_mg is not None:
+            outro = _render_motion_graphics_card_clip(
+                outro_mg, outro_duration, paths.output / "outro.mp4", audio_path=outro_audio
+            )
+        else:
+            outro_png = branding.build_outro_card(
+                settings.channel_name, paths.output / "outro_card.png", message=plan.outro_text
+            )
+            outro = _render_card_clip(
+                outro_png, outro_duration, paths.output / "outro.mp4", audio_path=outro_audio
+            )
         return [intro], [outro]
-    except Exception as exc:  # pillow/font hiccup — skip cards, keep the video
+    except Exception as exc:  # pillow/font/ffmpeg hiccup — skip cards, keep the video
         log.warning("intro/outro cards skipped: %s", exc)
         return [], []
 
@@ -777,6 +876,13 @@ def _shorts_outro_clip(plan: ScenePlan, paths: ProjectPaths) -> Path | None:
     hard-cut it always used before) when `RENDERFLOW_INTRO_OUTRO` is off
     or the card fails to build — same never-block-the-render convention
     as `_branding_clips`.
+
+    Uses the animated 69labs Motion Graphics render (added 2026-09,
+    RENDERFLOW_MOTION_GRAPHICS=1) when `plan.outro_card_video` completed,
+    same as the landscape outro card in `_branding_clips` — the render was
+    requested at this Short's own portrait aspect ratio (9:16) by
+    `assets.generate_motion_graphics_cards`, so no extra handling is
+    needed here beyond picking which render function to call.
     """
     settings = Settings.load()
     if not settings.intro_outro:
@@ -785,22 +891,28 @@ def _shorts_outro_clip(plan: ScenePlan, paths: ProjectPaths) -> Path | None:
 
     width, height = dims_for(plan)
     try:
-        outro_png = branding.build_outro_card(
-            settings.channel_name, paths.output / "outro_card.png",
-            message=plan.outro_text, width=width, height=height,
-        )
-        outro_audio = _card_audio(plan.outro_audio, paths)
+        outro_audio = _completed_asset_path(plan.outro_audio)
         duration = max(OUTRO_SEC, probe_duration(outro_audio) + 0.4) if outro_audio else OUTRO_SEC
         # fade_in stays the default True here — this card isn't the first
         # clip in the timeline (only that one needs the YouTube-thumbnail
         # workaround, see _apply_fade's docstring), so it gets the same
         # dip-through-black transition every other clip boundary already
         # uses, matching the landscape outro card's behavior.
+        outro_mg = _completed_asset_path(plan.outro_card_video)
+        if outro_mg is not None:
+            return _render_motion_graphics_card_clip(
+                outro_mg, duration, paths.output / "outro.mp4", audio_path=outro_audio,
+                width=width, height=height,
+            )
+        outro_png = branding.build_outro_card(
+            settings.channel_name, paths.output / "outro_card.png",
+            message=plan.outro_text, width=width, height=height,
+        )
         return _render_card_clip(
             outro_png, duration, paths.output / "outro.mp4", audio_path=outro_audio,
             width=width, height=height,
         )
-    except Exception as exc:  # pillow/font hiccup — skip the card, keep the video
+    except Exception as exc:  # pillow/font/ffmpeg hiccup — skip the card, keep the video
         log.warning("shorts closing-message card skipped: %s", exc)
         return None
 

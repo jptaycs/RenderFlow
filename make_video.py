@@ -33,6 +33,7 @@ from renderflow.pipeline.assets import (
     generate_branding_audio,
     generate_broll,
     generate_images,
+    generate_motion_graphics_cards,
     generate_subtitles,
     generate_thumbnail,
     generate_voice,
@@ -54,6 +55,7 @@ from renderflow.providers import (
     build_tts,
 )
 from renderflow.providers.base import ImageProvider
+from renderflow.providers.motion_graphics import Labs69MotionGraphics
 from renderflow.schema import AssetRef, ScenePlan
 from renderflow.storage import ProjectPaths, save_plan, slugify
 
@@ -351,6 +353,24 @@ def main() -> int:
             plan, tts, settings.tts_voice, settings.channel_name, paths,
             llm=engagement_llm, include_intro=not is_shorts, **tts_params
         )
+
+        if settings.motion_graphics_enabled:
+            # Animated intro/outro title cards via 69labs Motion Graphics,
+            # replacing render.py's static Pillow card — see
+            # assets.generate_motion_graphics_cards. Runs after the
+            # narration above so it can request a card duration matching
+            # the real narrated audio. Best-effort: a missing/invalid
+            # LABS69_API_KEY, or any render failure, just leaves
+            # intro_card_video/outro_card_video PENDING and render.py
+            # falls back to the Pillow card — never blocks the render.
+            print("      Rendering animated intro/outro cards (69labs Motion Graphics)")
+            try:
+                motion_graphics = Labs69MotionGraphics()
+                generate_motion_graphics_cards(
+                    plan, motion_graphics, paths, settings.channel_name
+                )
+            except Exception as exc:
+                print(f"      Motion Graphics unavailable ({exc}) — using plain cards")
 
     avatar_scene_count = sum(scene.type == "talking_avatar" for scene in plan.scenes)
     if avatar_scene_count:

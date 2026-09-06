@@ -25,6 +25,7 @@ from renderflow.providers.base import (
     TTSProvider,
     VideoProvider,
 )
+from renderflow.providers.motion_graphics import Labs69MotionGraphics
 from renderflow.schema import AssetRef, AssetStatus, Scene, ScenePlan
 from renderflow.storage import ProjectPaths, save_plan
 
@@ -358,7 +359,7 @@ def generate_branding_audio(
     and best-effort — a missing key, rate limit, or any other failure just
     falls back to the plain subscribe line via `_outro_line`'s default,
     same as every other LLM-dependent optional feature in this pipeline
-    (rewrite_video_prompt, generate_topic_idea). The resolved text is
+    (rewrite_video_prompt, generate_topic_script). The resolved text is
     persisted to `plan.outro_text` regardless of which branch produced
     it, so render.py can show the *same* words on-screen (the landscape
     outro card, and Shorts' closing caption) instead of a fixed generic
@@ -412,6 +413,96 @@ def generate_branding_audio(
         ref.advance(AssetStatus.COMPLETED)
         save_plan(plan, paths)
         log.info("%s card narration done (%s)", name, out.name)
+
+
+def generate_motion_graphics_cards(
+    plan: ScenePlan,
+    provider: Labs69MotionGraphics,
+    paths: ProjectPaths,
+    channel_name: str,
+) -> None:
+    """Animated intro/outro title cards from 69labs Motion Graphics (added
+    2026-09, RENDERFLOW_MOTION_GRAPHICS=1) — an upgrade over the static
+    Pillow-drawn card render.py falls back to when this is off or a render
+    fails. `provider` is a `providers.motion_graphics.Labs69MotionGraphics`
+    (not part of the Protocol registry — see that module's docstring).
+
+    Optional exactly like broll/thumbnail/branding audio: any failure
+    (missing key, API error, timeout) is logged and the ref marked FAILED,
+    never raised — render.py's `_branding_clips`/`_shorts_outro_clip`
+    already treat a non-COMPLETED `intro_card_video`/`outro_card_video`
+    ref as "no motion-graphics card, use the Pillow one", so this can
+    never block a render.
+
+    Must run after `generate_branding_audio` (needs `plan.intro_audio`/
+    `outro_audio`'s real duration, when narration ran, to request a
+    matching card length so the two rarely need render.py's tpad
+    safety-net) and before `render_video()`. Landscape only for the intro
+    — Shorts skip the intro card entirely (v1 scope, same as the Pillow
+    path, see `render._branding_clips`); both formats get an outro card.
+    Reuses `branding.outro_lines()` (the same question/CTA split that
+    fixed the Pillow outro card's duplicated-CTA bug) so the motion-
+    graphics card shows the identical headline/CTA text.
+    """
+    from renderflow.pipeline import branding
+    from renderflow.pipeline.render import (
+        HEIGHT,
+        INTRO_SEC,
+        OUTRO_SEC,
+        WIDTH,
+        dims_for,
+        probe_duration,
+    )
+
+    def _duration_for(audio_ref: AssetRef, floor: float) -> float:
+        if audio_ref.status is AssetStatus.COMPLETED and audio_ref.path:
+            path = Path(audio_ref.path)
+            if path.exists():
+                return max(floor, probe_duration(path) + 0.4)
+        return floor
+
+    def _render(
+        ref: AssetRef, name: str, title: str, subtitle: str, footer: str,
+        dims: tuple[int, int], duration: float,
+    ) -> None:
+        if _skip(ref):
+            return
+        _start(ref)
+        save_plan(plan, paths)
+        width, height = dims
+        try:
+            asset = provider.render_card(
+                title=title, subtitle=subtitle, footer=footer,
+                width=width, height=height, duration_seconds=duration,
+                palette=branding.MOTION_GRAPHICS_PALETTE,
+            )
+        except Exception:
+            log.warning("%s motion-graphics card failed, continuing", name, exc_info=True)
+            ref.advance(AssetStatus.FAILED)
+            save_plan(plan, paths)
+            return
+        out = paths.output / f"{name}_card_mg.mp4"
+        out.write_bytes(asset.data)
+        ref.path = str(out)
+        ref.provider = asset.provider
+        ref.cost = asset.cost
+        ref.advance(AssetStatus.COMPLETED)
+        save_plan(plan, paths)
+        log.info("%s motion-graphics card done (%s)", name, out.name)
+
+    if plan.format != "shorts":
+        _render(
+            plan.intro_card_video, "intro", plan.title, channel_name, "",
+            (WIDTH, HEIGHT), _duration_for(plan.intro_audio, INTRO_SEC),
+        )
+
+    outro_headline = branding.outro_lines(plan.outro_text)
+    outro_title = outro_headline[0][0]
+    outro_subtitle = outro_headline[1][0] if len(outro_headline) > 1 else ""
+    _render(
+        plan.outro_card_video, "outro", outro_title, outro_subtitle, channel_name,
+        dims_for(plan), _duration_for(plan.outro_audio, OUTRO_SEC),
+    )
 
 
 def generate_subtitles(plan: ScenePlan, paths: ProjectPaths) -> None:

@@ -103,6 +103,12 @@ class Settings:
     # there even for a user who prefers them off on their (sound-on,
     # cinematic-feeling) landscape videos.
     shorts_subtitles_enabled: bool | None = None
+    # Animated intro/outro cards via 69labs Motion Graphics (added 2026-09)
+    # instead of the static Pillow-drawn card — off by default: it's a new
+    # paid-credit external call (needs LABS69_API_KEY) that adds real
+    # render latency (~30-60s per card) to render_video(), so it's opt-in
+    # rather than a silent default-on upgrade. See pipeline/motion_graphics.py.
+    motion_graphics_enabled: bool = False
     # When both are set, the login page shows a one-click "Developer login"
     # button that prefills these credentials and submits them through the
     # normal password-checked login — there is no bypass endpoint. Local
@@ -187,4 +193,6 @@ class Settings:
                 if (raw := os.getenv("RENDERFLOW_SHORTS_SUBTITLES", "")) == ""
                 else raw.lower() in ("1", "true", "yes")
             ),
+            motion_graphics_enabled=os.getenv("RENDERFLOW_MOTION_GRAPHICS", "").lower()
+            in ("1", "true", "yes"),
         )

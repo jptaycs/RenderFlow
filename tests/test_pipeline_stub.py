@@ -104,11 +104,11 @@ def test_split_script_passes_scaled_max_tokens():
     assert llm.calls[0]["max_tokens"] == _script_max_tokens(100)
 
 
-class _RecordingTopicIdeaLLM:
-    """Like _RecordingLLM but returns a valid GeneratedTopicIdea payload —
-    generate_topic_idea's schema ({title, script}), not a full scene plan."""
+class _RecordingTopicOnlyLLM:
+    """Like _RecordingLLM but returns a valid GeneratedTopicOnly payload —
+    generate_topic_only's schema ({title}), not a full scene plan."""
 
-    name = "recording-topic-idea-llm"
+    name = "recording-topic-only-llm"
 
     def __init__(self):
         self.calls: list[dict] = []
@@ -116,27 +116,59 @@ class _RecordingTopicIdeaLLM:
     def complete(self, system, prompt, **params):
         self.calls.append({"prompt": prompt, **params})
         return LLMResult(
-            text=json.dumps({"title": "A Title", "script": "A fact."}),
-            provider=self.name, cost=0.001,
+            text=json.dumps({"title": "A Title"}), provider=self.name, cost=0.001,
         )
 
 
-def test_topic_idea_scales_word_target_and_max_tokens_with_length():
-    # Regression: generate_topic_idea used to always request a fixed
-    # 60-100 word teaser regardless of the video's actual target length —
-    # a "Random topic" landscape video (targeting the monetization-driven
-    # 8-12 minute default) came out with a script only long enough for
-    # ~30 seconds once split into scenes. Client-reported: "the random
-    # topic script must have a length the same with the target time like
-    # 11 minutes of video and in shorts is 1 minute script also."
+class _RecordingTopicScriptLLM:
+    """Like _RecordingLLM but returns a valid GeneratedTopicScript payload —
+    generate_topic_script's schema ({script}), not a full scene plan."""
+
+    name = "recording-topic-script-llm"
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def complete(self, system, prompt, **params):
+        self.calls.append({"prompt": prompt, **params})
+        return LLMResult(
+            text=json.dumps({"script": "A fact."}), provider=self.name, cost=0.001,
+        )
+
+
+def test_topic_only_does_not_request_a_length():
+    # generate_topic_only (step 1 of the "🎲 Random topic" flow, added
+    # 2026-09) is title-only and has no length_minutes param at all — the
+    # word-count scaling that used to live here moved to
+    # generate_topic_script (step 2), which is only called once the user
+    # has actually seen the title and asked for a script.
+    from renderflow.pipeline.script import generate_topic_only
+
+    llm = _RecordingTopicOnlyLLM()
+    generate_topic_only(llm, [])
+
+    assert len(llm.calls) == 1
+    assert "minute" not in llm.calls[0]["prompt"].lower()
+
+
+def test_topic_script_scales_word_target_and_max_tokens_with_length():
+    # Regression: the old combined generate_topic_idea used to always
+    # request a fixed 60-100 word teaser regardless of the video's actual
+    # target length — a "Random topic" landscape video (targeting the
+    # monetization-driven 8-12 minute default) came out with a script
+    # only long enough for ~30 seconds once split into scenes.
+    # Client-reported: "the random topic script must have a length the
+    # same with the target time like 11 minutes of video and in shorts is
+    # 1 minute script also." Same scaling, now in generate_topic_script
+    # (step 2, called only once the user has picked a title).
     from renderflow.pipeline.script import (
         _topic_idea_max_tokens,
         _topic_idea_target_words,
-        generate_topic_idea,
+        generate_topic_script,
     )
 
-    llm = _RecordingTopicIdeaLLM()
-    generate_topic_idea(llm, [], length_minutes=11)
+    llm = _RecordingTopicScriptLLM()
+    generate_topic_script(llm, "A Title", length_minutes=11)
 
     assert len(llm.calls) == 1
     call = llm.calls[0]
@@ -144,17 +176,18 @@ def test_topic_idea_scales_word_target_and_max_tokens_with_length():
     assert expected_words > 1000  # a real 11-minute script, not a teaser
     assert call["max_tokens"] == _topic_idea_max_tokens(expected_words)
     assert str(expected_words) in call["prompt"]
+    assert "A Title" in call["prompt"]
 
 
-def test_topic_idea_short_target_stays_short():
+def test_topic_script_short_target_stays_short():
     from renderflow.pipeline.script import (
         _topic_idea_max_tokens,
         _topic_idea_target_words,
-        generate_topic_idea,
+        generate_topic_script,
     )
 
-    llm = _RecordingTopicIdeaLLM()
-    generate_topic_idea(llm, [], length_minutes=1)
+    llm = _RecordingTopicScriptLLM()
+    generate_topic_script(llm, "A Title", length_minutes=1)
 
     expected_words = _topic_idea_target_words(1)
     assert expected_words < 250  # a Shorts-length target, not a full script
@@ -301,6 +334,82 @@ def test_generate_branding_audio_omits_engagement_question_without_llm(paths: Pr
 
     outro_text = tts.calls[1][0]
     assert outro_text == "Thanks for watching! Please subscribe for more trivia like this."
+
+
+def test_generate_motion_graphics_cards_renders_intro_and_outro(paths: ProjectPaths):
+    from renderflow.pipeline.assets import generate_motion_graphics_cards
+    from tests.stubs import StubMotionGraphics
+
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    plan.outro_text = "If you were him, what would you do? Let us know in the comments! Subscribe."
+    save_plan(plan, paths)
+    provider = StubMotionGraphics()
+
+    generate_motion_graphics_cards(plan, provider, paths, "Cool Facts Daily")
+
+    reloaded = load_plan(paths)
+    assert reloaded.intro_card_video.status is AssetStatus.COMPLETED
+    assert reloaded.outro_card_video.status is AssetStatus.COMPLETED
+    assert Path(reloaded.intro_card_video.path).read_bytes() == b"fake-motion-graphics-mp4"
+
+    intro_call, outro_call = provider.calls
+    assert intro_call["title"] == plan.title
+    assert intro_call["subtitle"] == "Cool Facts Daily"
+    assert intro_call["width"] == 1920 and intro_call["height"] == 1080
+    # The outro card reuses branding.outro_lines' question/CTA split — same
+    # fix that stopped the Pillow card from showing "Let us know in the
+    # comments!" twice — so the motion-graphics card gets the identical
+    # clean headline/CTA text instead of the whole run-on narrated line.
+    assert outro_call["title"] == "If you were him, what would you do?"
+    assert outro_call["subtitle"] == "Let us know in the comments!"
+    assert outro_call["footer"] == "Cool Facts Daily"
+
+
+def test_generate_motion_graphics_cards_skips_intro_for_shorts(paths: ProjectPaths):
+    from renderflow.pipeline.assets import generate_motion_graphics_cards
+    from tests.stubs import StubMotionGraphics
+
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    plan.format = "shorts"
+    save_plan(plan, paths)
+    provider = StubMotionGraphics()
+
+    generate_motion_graphics_cards(plan, provider, paths, "")
+
+    reloaded = load_plan(paths)
+    assert reloaded.intro_card_video.status is AssetStatus.PENDING  # no intro card for Shorts
+    assert reloaded.outro_card_video.status is AssetStatus.COMPLETED
+    outro_call = provider.calls[0]
+    assert outro_call["width"] == 1080 and outro_call["height"] == 1920  # portrait
+
+
+def test_generate_motion_graphics_cards_failure_is_optional(paths: ProjectPaths):
+    from renderflow.pipeline.assets import generate_motion_graphics_cards
+    from tests.stubs import StubMotionGraphics
+
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+    provider = StubMotionGraphics(fail=True)
+
+    generate_motion_graphics_cards(plan, provider, paths, "")  # must not raise
+
+    reloaded = load_plan(paths)
+    assert reloaded.intro_card_video.status is AssetStatus.FAILED
+    assert reloaded.outro_card_video.status is AssetStatus.FAILED
+
+
+def test_generate_motion_graphics_cards_is_resumable(paths: ProjectPaths):
+    from renderflow.pipeline.assets import generate_motion_graphics_cards
+    from tests.stubs import StubMotionGraphics
+
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+    provider = StubMotionGraphics()
+
+    generate_motion_graphics_cards(plan, provider, paths, "")
+    generate_motion_graphics_cards(plan, provider, paths, "")  # resume: no re-render
+
+    assert len(provider.calls) == 2  # intro + outro, not 4
 
 
 def test_completed_assets_are_skipped(paths: ProjectPaths):
@@ -1049,6 +1158,72 @@ def test_shorts_gets_a_narrated_closing_message_card(paths: ProjectPaths, monkey
 
     # No landscape-style intro card for Shorts, ever.
     assert not (paths.output / "intro.mp4").exists()
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_branding_clips_uses_motion_graphics_card_when_completed(paths: ProjectPaths, monkeypatch):
+    # Added 2026-09: 69labs Motion Graphics can replace the static Pillow
+    # intro/outro card with an animated render (RENDERFLOW_MOTION_GRAPHICS=1,
+    # see assets.generate_motion_graphics_cards) — _branding_clips must pick
+    # that render over the Pillow one whenever intro_card_video/
+    # outro_card_video actually completed, and never build the Pillow PNG
+    # at all in that case (proof the motion-graphics path, not just a
+    # visually-similar fallback, was taken).
+    from renderflow.config import Settings
+    from renderflow.pipeline.render import _branding_clips
+    from tests.conftest import make_settings
+
+    settings = make_settings(
+        intro_outro=True, music_dir=paths.root / "no-music", transition="none",
+    )
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+
+    mg_video = paths.output / "fake_mg.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=orange:s=1920x1080:d=3",
+         str(mg_video)],
+        check=True, capture_output=True,
+    )
+    for ref in (plan.intro_card_video, plan.outro_card_video):
+        ref.advance(AssetStatus.RUNNING)
+        ref.path = str(mg_video)
+        ref.advance(AssetStatus.COMPLETED)
+
+    intro_clips, outro_clips = _branding_clips(plan, paths)
+
+    assert len(intro_clips) == 1 and intro_clips[0].exists()
+    assert len(outro_clips) == 1 and outro_clips[0].exists()
+    assert not (paths.output / "intro_card.png").exists()
+    assert not (paths.output / "outro_card.png").exists()
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_branding_clips_falls_back_to_pillow_card_without_motion_graphics(
+    paths: ProjectPaths, monkeypatch,
+):
+    # The default (motion-graphics refs left PENDING, e.g.
+    # RENDERFLOW_MOTION_GRAPHICS unset) must render byte-for-byte the same
+    # Pillow card path as before this feature existed.
+    from renderflow.config import Settings
+    from renderflow.pipeline.render import _branding_clips
+    from tests.conftest import make_settings
+
+    settings = make_settings(
+        intro_outro=True, music_dir=paths.root / "no-music", transition="none",
+    )
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    save_plan(plan, paths)
+
+    intro_clips, outro_clips = _branding_clips(plan, paths)
+
+    assert len(intro_clips) == 1 and intro_clips[0].exists()
+    assert (paths.output / "intro_card.png").exists()
+    assert (paths.output / "outro_card.png").exists()
 
 
 def test_build_caption_chunks_covers_full_duration_in_order():
