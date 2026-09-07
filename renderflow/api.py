@@ -20,7 +20,7 @@ import random
 import shutil
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -386,6 +386,18 @@ def _project_view(
     }
 
     cost = plan.total_asset_cost()
+    # RenderFlow has no first-class multi-channel model (added 2026-09) —
+    # the sidebar's channel switcher (web/index.html) just derives its
+    # list of channels from the distinct channelName values across a
+    # user's own projects, so this must surface the *resolved* name
+    # (the per-project override if one was set at creation, else the
+    # global default) rather than the raw possibly-None plan field.
+    # None here specifically means "no channel name configured anywhere"
+    # (plan override unset AND the global .env default is blank) — the
+    # client buckets that as a single "Default" channel.
+    settings = Settings.load()
+    channel_name = plan.channel_name or settings.channel_name or None
+    tts_voice = plan.tts_voice or settings.tts_voice or None
     perf = _load_performance_view(paths, final_ready, final)
     production_time_sec = (
         perf.completed_at - perf.created_at
@@ -423,6 +435,8 @@ def _project_view(
         "profit": profit,
         "productionTimeSec": production_time_sec,
         "createdAt": perf.created_at,
+        "channelName": channel_name,
+        "ttsVoice": tts_voice,
         "youtube": (
             {
                 "url": youtube.url,
@@ -507,6 +521,18 @@ def _placeholder_view(session: Session, project: Project) -> dict[str, Any]:
     fmt = "landscape"
     if latest is not None and "--format" in latest.argv:
         fmt = latest.argv[latest.argv.index("--format") + 1]
+    # Same reasoning as --format above, for the sidebar channel switcher
+    # (added 2026-09) — a just-clicked video with a channel override
+    # should show up under that channel immediately, not just once
+    # scenes.json exists. Falls back to the global default exactly like
+    # _project_view's resolution when no override was given.
+    settings = Settings.load()
+    channel_name = settings.channel_name or None
+    tts_voice = settings.tts_voice or None
+    if latest is not None and "--channel-name" in latest.argv:
+        channel_name = latest.argv[latest.argv.index("--channel-name") + 1]
+    if latest is not None and "--tts-voice" in latest.argv:
+        tts_voice = latest.argv[latest.argv.index("--tts-voice") + 1]
     return {
         "slug": project.slug,
         "title": project.title,
@@ -536,6 +562,8 @@ def _placeholder_view(session: Session, project: Project) -> dict[str, Any]:
         "profit": None,
         "productionTimeSec": None,
         "createdAt": project.created_at,
+        "channelName": channel_name,
+        "ttsVoice": tts_voice,
     }
 
 
@@ -582,6 +610,36 @@ class TopicIdeaRequest(BaseModel):
     # excludeTitles docstring note below for why this is required, not just
     # the DB's project titles.
     excludeTitles: list[str] = []
+    # The channel this new video will belong to (the New Video modal's
+    # current channel-name field — see web/index.html's openModal/
+    # channelName wiring), added 2026-09 (client request: "the generate
+    # topic must be related with the selected channel"). Blank/omitted =
+    # no channel scoping, same generic trivia behavior as before — correct
+    # for the default/main channel, which has never needed scoping.
+    channelName: str | None = None
+
+
+def _channel_titles(session: Session, user: User, channel_name: str, settings: Settings) -> list[str]:
+    """Titles of the user's own projects that resolve to `channel_name`
+    (added 2026-09 alongside topic-idea channel scoping) — same resolved-
+    name logic as `_project_view`'s `channelName` field (a project's own
+    override, else the global default), just without the rest of that
+    function's heavier per-project computation, since only the title is
+    needed here. A project with no scenes.json yet (a placeholder, still
+    queued) has nothing to resolve and is skipped."""
+    titles = []
+    for project in session.query(Project).filter(Project.owner_id == user.id).all():
+        paths = _project_paths(project)
+        if not paths.scenes_json.exists():
+            continue
+        try:
+            plan = load_plan(paths)
+        except (ValueError, OSError):
+            continue
+        resolved = plan.channel_name or settings.channel_name or None
+        if resolved == channel_name:
+            titles.append(project.title)
+    return titles
 
 
 @app.post("/api/topics/random")
@@ -625,9 +683,15 @@ def random_topic_idea(
         row.title
         for row in session.query(Project).filter(Project.owner_id == user.id).all()
     ] + body.excludeTitles
+    channel_name = (body.channelName or "").strip() or None
+    channel_titles = (
+        _channel_titles(session, user, channel_name, Settings.load())
+        if channel_name
+        else None
+    )
     try:
         llm = build_llm(Settings.load())
-        idea, _ = generate_topic_only(llm, existing_titles)
+        idea, _ = generate_topic_only(llm, existing_titles, channel_name, channel_titles)
     except Exception as exc:  # missing/invalid ANTHROPIC_API_KEY, rate limit, etc.
         log.warning("random topic idea generation failed: %s", exc)
         raise HTTPException(
@@ -694,6 +758,16 @@ class NewProject(BaseModel):
     # "landscape" (default) or "shorts" — see schema.VideoFormat and
     # render.py's format-gating notes for what "shorts" skips (v1 scope).
     format: Literal["landscape", "shorts"] = "landscape"
+    # Per-project overrides of RENDERFLOW_CHANNEL_NAME/RENDERFLOW_TTS_VOICE
+    # (added 2026-09, client request: a second content "channel" — a
+    # distinct branding name and narrator voice for a batch of videos —
+    # without flipping the global .env value back and forth between
+    # creations). Empty/omitted = use the global setting, same as every
+    # project before this feature. See ScenePlan.channel_name/tts_voice's
+    # own docstring for why this is persisted on the plan, not just a
+    # one-off CLI value.
+    channelName: str | None = None
+    ttsVoice: str | None = None
 
 
 @app.post("/api/projects", status_code=201)
@@ -788,6 +862,10 @@ def create_project(
         *source_args, "--style", body.style, "--title", title,
         "--format", body.format,
     ]
+    if (body.channelName or "").strip():
+        create_args += ["--channel-name", body.channelName.strip()]
+    if (body.ttsVoice or "").strip():
+        create_args += ["--tts-voice", body.ttsVoice.strip()]
     if body.format != "shorts":
         create_args.append("--skip-render")
     _enqueue(session, project, "create", create_args)
@@ -1238,6 +1316,109 @@ def _recover_orphaned_jobs_eager(session: Session) -> None:
     session.commit()
 
 
+def _seconds_until_next_run(hour: int, now: datetime | None = None) -> float:
+    """Seconds from `now` (real time if omitted) until the next local
+    `hour:00:00` — today if that hasn't passed yet, else tomorrow. Pure
+    and injectable so the scheduling math is unit-testable without
+    actually waiting; the real trigger (`_auto_publish_scheduler_loop`)
+    is a thin `time.sleep(...)` wrapper around this, same split as
+    `_recover_orphaned_jobs_eager`'s logic-vs-trigger separation."""
+    now = now or datetime.now()
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+def _run_auto_publish_batch(session: Session, settings: Settings) -> list[str]:
+    """Queue up to `settings.auto_publish_max_per_day` Complete-and-
+    unpublished projects for YouTube upload, oldest-finished-first.
+
+    Deliberately reuses `_project_view`'s own `status`/`youtube`
+    resolution (same as `_recover_orphaned_jobs_eager` does) rather than
+    re-deriving "is this done and unpublished" from the filesystem here —
+    this must agree with what the dashboard's own Unpublished filter
+    chip (`web/index.html::projectsGridHtml`) shows, or a video could
+    auto-publish that the UI still called "Failed"/"Generating", or
+    silently skip one the UI clearly shows as Complete.
+
+    Scans every project across every user, same as the manual "Publish
+    to YouTube" button already implicitly does — YouTube publishing is
+    tied to one shared machine-level OAuth connection regardless of
+    which app user clicks the button (see the YouTube publishing note in
+    CLAUDE.md), so a scheduled batch has no narrower scope to apply here
+    than the existing per-click action already has.
+
+    Returns the slugs it queued (for logging/testing) — never raises for
+    a single bad project (a `scenes.json` mid-write, a project missing
+    its directory, etc.), same never-block convention as everything else
+    in this pipeline; one project's problem must not stop the rest of
+    the batch from publishing.
+    """
+    if not youtube_module.is_connected():
+        log.warning("auto-publish: YouTube isn't connected, skipping this run")
+        return []
+
+    candidates: list[tuple[float, Project, ScenePlan, ProjectPaths]] = []
+    for project in session.query(Project).all():
+        try:
+            if _active_job(session, project):
+                continue  # already publishing, still rendering, etc.
+            paths = _project_paths(project)
+            if not paths.scenes_json.exists():
+                continue
+            plan = load_plan(paths)
+            view = _project_view(project, plan, paths, None)
+            if view["status"] != "Complete":
+                continue
+            if load_youtube_publish(paths) is not None:
+                continue  # already published
+            final = paths.output / "final.mp4"
+            candidates.append((final.stat().st_mtime, project, plan, paths))
+        except (ValueError, json.JSONDecodeError, OSError):
+            log.warning("auto-publish: skipping project %s, could not evaluate it", project.slug, exc_info=True)
+
+    candidates.sort(key=lambda c: c[0])  # oldest-finished-first
+    queued: list[str] = []
+    for _mtime, project, plan, paths in candidates[: settings.auto_publish_max_per_day]:
+        argv = [
+            "--title", plan.title,
+            "--description", "",
+            "--tags", "",
+            "--privacy", "public",
+        ]
+        _enqueue(session, project, "youtube_publish", argv)
+        queued.append(project.slug)
+        log.info("auto-publish: queued %s for YouTube upload", project.slug)
+    return queued
+
+
+def _auto_publish_scheduler_loop() -> None:
+    """Background thread for `RENDERFLOW_AUTO_PUBLISH=1` — wakes once a
+    day at `RENDERFLOW_AUTO_PUBLISH_HOUR` and runs `_run_auto_publish_batch`.
+    Re-reads `Settings.load()` on every wake (not just once at thread
+    start), so toggling the feature off in `.env` takes effect on the
+    *next* scheduled wake without needing a full api.py restart — though
+    a change to the hour itself only takes effect the day after, since
+    the sleep duration for the *current* wait was already computed
+    before the edit.
+    """
+    while True:
+        settings = Settings.load()
+        delay = _seconds_until_next_run(settings.auto_publish_hour)
+        time.sleep(delay)
+        settings = Settings.load()
+        if not settings.auto_publish_enabled:
+            continue
+        session = db.new_session()
+        try:
+            _run_auto_publish_batch(session, settings)
+        except Exception:
+            log.exception("auto-publish batch failed")
+        finally:
+            session.close()
+
+
 @app.on_event("startup")
 def startup() -> None:
     settings = Settings.load()
@@ -1282,6 +1463,8 @@ def startup() -> None:
             _recover_orphaned_jobs_eager(session)
         finally:
             session.close()
+    if settings.auto_publish_enabled:
+        threading.Thread(target=_auto_publish_scheduler_loop, daemon=True).start()
 
 
 if __name__ == "__main__":

@@ -166,6 +166,20 @@ class ScenePlan(BaseModel):
     # chosen randomly at first render and persisted so re-renders keep the
     # same track. None = not chosen yet or music disabled.
     music_track: str | None = None
+    # Per-project overrides of RENDERFLOW_CHANNEL_NAME/RENDERFLOW_TTS_VOICE
+    # (added 2026-09, client request: a second content "channel" — a
+    # distinct branding name and narrator voice for a specific batch of
+    # videos — without having to flip the global .env value back and
+    # forth between every creation). None = use the global setting, same
+    # as every project before this feature (old scenes.json files load
+    # fine). Set once at creation (make_video.py's --channel-name/
+    # --tts-voice, only passed by api.py::create_project) and persisted
+    # here so resume/regenerate — which may run in a later process, long
+    # after the global .env could have changed — keep using the exact
+    # same identity the project was created with, not whatever the
+    # global default happens to be at that later time.
+    channel_name: str | None = None
+    tts_voice: str | None = None
 
     def total_asset_cost(self) -> float:
         total = 0.0

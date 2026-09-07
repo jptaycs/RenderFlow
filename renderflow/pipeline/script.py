@@ -135,14 +135,19 @@ def generate_script(
 
 
 TOPIC_ONLY_SYSTEM_PROMPT = """\
-You invent fresh, surprising short-documentary video ideas for a YouTube
-trivia channel ("did you know" style true stories — a war that lasted 38
-minutes, a shark older than the United States, that kind of thing).
+You invent fresh, surprising short-video ideas for a YouTube channel.
+Unless the request below names a specific channel/theme to follow instead,
+default to a "did you know" style trivia channel — a war that lasted 38
+minutes, a shark older than the United States, that kind of thing.
 
 Rules:
 - Invent exactly ONE idea: a punchy, hooky title (under ~9 words — a
   specific factual hook, not a generic clickbait template like "The Truth
   About X").
+- If the request below names a channel and/or shows that channel's
+  existing videos, the idea's SUBJECT MATTER must fit that channel's
+  theme — don't default to unrelated trivia just because that's this
+  generator's most common use case.
 - The underlying fact must be real, specific, and checkable — you're only
   naming the idea here (the narration script is written separately, later,
   only if the user likes this title), but it must describe something a
@@ -163,14 +168,44 @@ def _topic_idea_target_words(length_minutes: float) -> int:
     return max(50, round(length_minutes * 60 * WORDS_PER_SECOND))
 
 
-def build_topic_only_prompt(existing_titles: list[str]) -> str:
+def build_topic_only_prompt(
+    existing_titles: list[str],
+    channel_name: str | None = None,
+    channel_titles: list[str] | None = None,
+) -> str:
+    """`channel_name`/`channel_titles` scope the idea to a specific
+    channel (added 2026-09, client request: "the generate topic must be
+    related with the selected channel") — without them, this generates a
+    plain trivia idea same as before, which stays correct for the default/
+    main channel. `channel_titles` (that channel's own existing videos, if
+    it has any) is the stronger signal — it shows the model concretely
+    what this channel actually makes; `channel_name` alone (a brand new,
+    empty channel) is a weaker fallback that only works if the name itself
+    is descriptive (e.g. "Foods Health" reads as a theme on its own)."""
+    parts = []
+    if channel_name:
+        if channel_titles:
+            taken = "\n".join(f"- {t}" for t in channel_titles)
+            parts.append(
+                f'This idea is for the YouTube channel "{channel_name}". '
+                f"Judge its theme from its existing videos below, and keep "
+                f"the new idea's subject matter consistent with them:\n{taken}"
+            )
+        else:
+            parts.append(
+                f'This idea is for the YouTube channel "{channel_name}" — '
+                f"it has no videos yet, so infer its theme from the name "
+                f"itself and keep the idea on that theme."
+            )
     if existing_titles:
         taken = "\n".join(f"- {t}" for t in existing_titles)
-        return (
+        parts.append(
             "Invent one new short-documentary video idea (title only). "
             f"These titles are already used — invent something different:\n{taken}"
         )
-    return "Invent one new short-documentary video idea (title only)."
+    else:
+        parts.append("Invent one new short-documentary video idea (title only).")
+    return "\n\n".join(parts)
 
 
 def _topic_idea_max_tokens(target_words: int) -> int:
@@ -188,7 +223,10 @@ def _topic_idea_max_tokens(target_words: int) -> int:
 
 
 def generate_topic_only(
-    llm: LLMProvider, existing_titles: list[str]
+    llm: LLMProvider,
+    existing_titles: list[str],
+    channel_name: str | None = None,
+    channel_titles: list[str] | None = None,
 ) -> tuple[GeneratedTopicOnly, LLMResult]:
     """Step 1 of the dashboard's "🎲 Random topic" flow: just a title, no
     script yet (added 2026-09, client request: show the topic first, only
@@ -198,10 +236,15 @@ def generate_topic_only(
     with another click before the user ever read past the title). A tiny,
     fast completion — see generate_topic_script for the (larger, only
     called once the user opts in) script-writing step.
+
+    `channel_name`/`channel_titles` (added 2026-09, see
+    build_topic_only_prompt) scope the idea to whichever channel is
+    currently selected in the dashboard, instead of always inventing
+    generic trivia regardless of context.
     """
     result = llm.complete(
         TOPIC_ONLY_SYSTEM_PROMPT,
-        build_topic_only_prompt(existing_titles),
+        build_topic_only_prompt(existing_titles, channel_name, channel_titles),
         json_schema=GeneratedTopicOnly.model_json_schema(),
         max_tokens=500,
     )

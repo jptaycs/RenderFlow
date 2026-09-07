@@ -109,6 +109,27 @@ class Settings:
     # render latency (~30-60s per card) to render_video(), so it's opt-in
     # rather than a silent default-on upgrade. See pipeline/motion_graphics.py.
     motion_graphics_enabled: bool = False
+    # Auto-publish (added 2026-09, client request: "auto upload the
+    # unpublished at 6pm everyday") — a scheduled thread (api.py's
+    # _auto_publish_scheduler_loop) that queues every Complete +
+    # unpublished project for YouTube upload once a day, up to
+    # auto_publish_max_per_day, oldest-finished-first. Deliberately off
+    # by default: this reverses the original "one-click per video, a
+    # human reviews before it goes out" design (see the YouTube
+    # publishing note in CLAUDE.md) — every video that happens to be
+    # sitting Complete goes live on the real connected channel completely
+    # unattended, whatever it contains. The client explicitly confirmed
+    # they want that reversal; still opt-in in code so a fresh deploy (or
+    # anyone else running this app) doesn't inherit unattended publishing
+    # silently.
+    auto_publish_enabled: bool = False
+    # 24-hour local server time (18 = 6pm).
+    auto_publish_hour: int = 18
+    # Caps a single day's batch — if the feature was off for a while (or
+    # a burst of videos all finished the same day), publishing a dozen at
+    # once reads as a spam dump to subscribers and risks the YouTube Data
+    # API's default daily quota (~6 uploads/day before hitting it).
+    auto_publish_max_per_day: int = 5
     # When both are set, the login page shows a one-click "Developer login"
     # button that prefills these credentials and submits them through the
     # normal password-checked login — there is no bypass endpoint. Local
@@ -195,4 +216,10 @@ class Settings:
             ),
             motion_graphics_enabled=os.getenv("RENDERFLOW_MOTION_GRAPHICS", "").lower()
             in ("1", "true", "yes"),
+            auto_publish_enabled=os.getenv("RENDERFLOW_AUTO_PUBLISH", "").lower()
+            in ("1", "true", "yes"),
+            auto_publish_hour=int(os.getenv("RENDERFLOW_AUTO_PUBLISH_HOUR", "18")),
+            auto_publish_max_per_day=max(
+                1, int(os.getenv("RENDERFLOW_AUTO_PUBLISH_MAX_PER_DAY", "5"))
+            ),
         )

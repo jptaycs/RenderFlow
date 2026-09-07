@@ -151,6 +151,47 @@ def test_topic_only_does_not_request_a_length():
     assert "minute" not in llm.calls[0]["prompt"].lower()
 
 
+def test_topic_only_scopes_to_a_channel_with_existing_videos():
+    # Client request: "the generate topic must be related with the
+    # selected channel" — when a channel and its existing titles are
+    # given, the prompt must name the channel and show those titles so
+    # Claude keeps the new idea's subject matter consistent with them.
+    from renderflow.pipeline.script import generate_topic_only
+
+    llm = _RecordingTopicOnlyLLM()
+    generate_topic_only(
+        llm, [], channel_name="Foods Facts", channel_titles=["Why Honey Never Goes Bad"]
+    )
+
+    prompt = llm.calls[0]["prompt"]
+    assert "Foods Facts" in prompt
+    assert "Why Honey Never Goes Bad" in prompt
+
+
+def test_topic_only_scopes_to_a_channel_with_no_videos_yet():
+    # A brand new channel has no existing titles to show — the prompt must
+    # still name the channel so Claude can infer its theme from the name.
+    from renderflow.pipeline.script import generate_topic_only
+
+    llm = _RecordingTopicOnlyLLM()
+    generate_topic_only(llm, [], channel_name="Foods Health", channel_titles=None)
+
+    prompt = llm.calls[0]["prompt"]
+    assert "Foods Health" in prompt
+
+
+def test_topic_only_without_a_channel_stays_unscoped():
+    # No regression for the default/main channel: no channel_name means
+    # the prompt looks exactly like it did before this feature.
+    from renderflow.pipeline.script import generate_topic_only
+
+    llm = _RecordingTopicOnlyLLM()
+    generate_topic_only(llm, [])
+
+    prompt = llm.calls[0]["prompt"]
+    assert "channel" not in prompt.lower()
+
+
 def test_topic_script_scales_word_target_and_max_tokens_with_length():
     # Regression: the old combined generate_topic_idea used to always
     # request a fixed 60-100 word teaser regardless of the video's actual

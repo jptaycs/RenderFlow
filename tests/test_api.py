@@ -207,6 +207,77 @@ def test_project_view_computes_profit_and_production_time(tmp_path):
     assert view["profit"] == pytest.approx(25.0 - view["cost"])
 
 
+def test_project_view_resolves_channel_override_over_the_global_default(tmp_path, monkeypatch):
+    # Added 2026-09 for the sidebar channel switcher — _project_view must
+    # surface the *resolved* name/voice (the per-project override if one
+    # was set at creation, else the global default), not the raw
+    # possibly-None plan field, so the client can group projects into
+    # channels without re-deriving this fallback itself.
+    from renderflow import api
+    from renderflow.db import Project
+    from renderflow.schema import ScenePlan
+    from renderflow.storage import ProjectPaths, save_plan
+    from tests.conftest import make_settings
+
+    settings = make_settings(channel_name="Cool Facts Daily", tts_voice="default-voice-id")
+    monkeypatch.setattr(api.Settings, "load", classmethod(lambda cls: settings))
+
+    paths = ProjectPaths.create(tmp_path, "override-project")
+    plan = ScenePlan(
+        title="Banana Facts", style="documentary", scenes=[],
+        channel_name="Snack Facts Daily", tts_voice="banana-voice-id",
+    )
+    save_plan(plan, paths)
+    project = Project(owner_id=1, slug="override-project", title="Banana Facts", dir_path=str(paths.root))
+
+    view = api._project_view(project, plan, paths, job=None)
+    assert view["channelName"] == "Snack Facts Daily"
+    assert view["ttsVoice"] == "banana-voice-id"
+
+
+def test_project_view_falls_back_to_the_global_channel_when_no_override(tmp_path, monkeypatch):
+    from renderflow import api
+    from renderflow.db import Project
+    from renderflow.schema import ScenePlan
+    from renderflow.storage import ProjectPaths, save_plan
+    from tests.conftest import make_settings
+
+    settings = make_settings(channel_name="Cool Facts Daily", tts_voice="default-voice-id")
+    monkeypatch.setattr(api.Settings, "load", classmethod(lambda cls: settings))
+
+    paths = ProjectPaths.create(tmp_path, "no-override-project")
+    plan = ScenePlan(title="A History Fact", style="documentary", scenes=[])
+    save_plan(plan, paths)
+    project = Project(owner_id=1, slug="no-override-project", title="A History Fact", dir_path=str(paths.root))
+
+    view = api._project_view(project, plan, paths, job=None)
+    assert view["channelName"] == "Cool Facts Daily"
+    assert view["ttsVoice"] == "default-voice-id"
+
+
+def test_project_view_channel_name_is_none_when_nothing_is_configured(tmp_path, monkeypatch):
+    # Neither a per-project override nor a global default — the client
+    # buckets this as "Default", but the API must report it honestly as
+    # None rather than an empty string (a real, if unlikely, edge case:
+    # RENDERFLOW_CHANNEL_NAME left blank in .env with no override either).
+    from renderflow import api
+    from renderflow.db import Project
+    from renderflow.schema import ScenePlan
+    from renderflow.storage import ProjectPaths, save_plan
+    from tests.conftest import make_settings
+
+    settings = make_settings(channel_name="", tts_voice="default-voice-id")
+    monkeypatch.setattr(api.Settings, "load", classmethod(lambda cls: settings))
+
+    paths = ProjectPaths.create(tmp_path, "blank-channel-project")
+    plan = ScenePlan(title="A History Fact", style="documentary", scenes=[])
+    save_plan(plan, paths)
+    project = Project(owner_id=1, slug="blank-channel-project", title="A History Fact", dir_path=str(paths.root))
+
+    view = api._project_view(project, plan, paths, job=None)
+    assert view["channelName"] is None
+
+
 def test_project_view_cost_by_category_sums_to_the_displayed_total(tmp_path):
     # Regression (full-app scan 2026-09): costByCategory only covered
     # per-scene Images/Voice/Avatar — B-Roll and the plan-level thumbnail/
@@ -258,10 +329,11 @@ run_pipeline; no Postgres, Redis, or subprocess is ever touched."""
 from tests.conftest import register
 
 
-def _create_project(client, title="My First Video"):
-    res = client.post(
-        "/api/projects", json={"title": title, "script": "One sentence of narration."}
-    )
+def _create_project(client, title="My First Video", channelName=None):
+    body = {"title": title, "script": "One sentence of narration."}
+    if channelName:
+        body["channelName"] = channelName
+    res = client.post("/api/projects", json=body)
     assert res.status_code == 201, res.text
     return res.json()["slug"]
 
@@ -469,6 +541,45 @@ def test_create_project_shorts_format_forces_one_minute(client, pipeline_stub, s
         assert float(job.argv[length_index]) == 1.0
 
 
+def test_create_project_passes_channel_name_and_tts_voice_overrides(client, pipeline_stub, saas_env):
+    # Added 2026-09, client request: a second content "channel" (a
+    # distinct branding name/narrator voice for a batch of videos)
+    # without touching the global .env default used by every other video.
+    register(client, "admin@example.com")
+    res = client.post(
+        "/api/projects",
+        json={
+            "title": "Banana Facts",
+            "script": "Hi, I'm a banana.",
+            "channelName": "Snack Facts Daily",
+            "ttsVoice": "some-other-voice-id",
+        },
+    )
+    assert res.status_code == 201, res.text
+
+    from renderflow import db as rdb
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).one()
+        assert job.argv[job.argv.index("--channel-name") + 1] == "Snack Facts Daily"
+        assert job.argv[job.argv.index("--tts-voice") + 1] == "some-other-voice-id"
+
+
+def test_create_project_omits_channel_overrides_when_not_given(client, pipeline_stub, saas_env):
+    # The common case (no override) must not send empty/blank flags that
+    # make_video.py would otherwise have to specially ignore.
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+
+    from renderflow import db as rdb
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).one()
+        assert "--channel-name" not in job.argv
+        assert "--tts-voice" not in job.argv
+    assert slug
+
+
 def test_create_project_rejects_both_script_and_topic(client):
     register(client, "admin@example.com")
     res = client.post(
@@ -516,7 +627,7 @@ def test_random_topic_idea_returns_title_only(client, monkeypatch):
 
     register(client, "admin@example.com")
 
-    def fake_generate_topic_only(llm, existing_titles):
+    def fake_generate_topic_only(llm, existing_titles, channel_name=None, channel_titles=None):
         return (
             GeneratedTopicOnly(title="The Shark Born Before America"),
             LLMResult(text="{}", provider="stub", cost=0.001),
@@ -540,7 +651,7 @@ def test_random_topic_idea_passes_existing_project_titles(client, pipeline_stub,
 
     captured: dict = {}
 
-    def fake_generate_topic_only(llm, existing_titles):
+    def fake_generate_topic_only(llm, existing_titles, channel_name=None, channel_titles=None):
         captured["existing_titles"] = existing_titles
         return (
             GeneratedTopicOnly(title="Something New"),
@@ -568,7 +679,7 @@ def test_random_topic_idea_merges_client_excluded_titles(client, monkeypatch):
 
     captured: dict = {}
 
-    def fake_generate_topic_only(llm, existing_titles):
+    def fake_generate_topic_only(llm, existing_titles, channel_name=None, channel_titles=None):
         captured["existing_titles"] = existing_titles
         return (
             GeneratedTopicOnly(title="Yet Another Idea"),
@@ -586,12 +697,71 @@ def test_random_topic_idea_merges_client_excluded_titles(client, monkeypatch):
     assert captured["existing_titles"] == ["First Suggested Idea", "Second Suggested Idea"]
 
 
+def test_random_topic_idea_scopes_to_the_selected_channel(client, pipeline_stub, saas_env, monkeypatch):
+    # Client request: "the generate topic must be related with the
+    # selected channel" — a channelName in the request body must be
+    # passed through to generate_topic_only, along with that channel's
+    # own existing titles (for theming), scoped separately from the
+    # plain existing_titles duplicate-avoidance list.
+    from renderflow import api
+
+    register(client, "admin@example.com")
+    slug_foods = _create_project(client, title="Why Honey Never Spoils", channelName="Foods")
+    _finish_create_with_plan(saas_env, slug_foods, channel_name="Foods")
+    slug_trivia = _create_project(client, title="A War That Lasted 38 Minutes")
+    _finish_create_with_plan(saas_env, slug_trivia)
+
+    captured: dict = {}
+
+    def fake_generate_topic_only(llm, existing_titles, channel_name=None, channel_titles=None):
+        captured["channel_name"] = channel_name
+        captured["channel_titles"] = channel_titles
+        return (
+            GeneratedTopicOnly(title="Why Onions Make You Cry"),
+            LLMResult(text="{}", provider="stub"),
+        )
+
+    monkeypatch.setattr(api, "build_llm", lambda settings: object())
+    monkeypatch.setattr(api, "generate_topic_only", fake_generate_topic_only)
+
+    res = client.post("/api/topics/random", json={"channelName": "Foods"})
+    assert res.status_code == 200, res.text
+    assert captured["channel_name"] == "Foods"
+    assert captured["channel_titles"] == ["Why Honey Never Spoils"]
+
+
+def test_random_topic_idea_without_a_channel_does_not_scope(client, pipeline_stub, saas_env, monkeypatch):
+    from renderflow import api
+
+    register(client, "admin@example.com")
+    slug = _create_project(client, title="Why Honey Never Spoils", channelName="Foods")
+    _finish_create_with_plan(saas_env, slug, channel_name="Foods")
+
+    captured: dict = {}
+
+    def fake_generate_topic_only(llm, existing_titles, channel_name=None, channel_titles=None):
+        captured["channel_name"] = channel_name
+        captured["channel_titles"] = channel_titles
+        return (
+            GeneratedTopicOnly(title="Something Unrelated"),
+            LLMResult(text="{}", provider="stub"),
+        )
+
+    monkeypatch.setattr(api, "build_llm", lambda settings: object())
+    monkeypatch.setattr(api, "generate_topic_only", fake_generate_topic_only)
+
+    res = client.post("/api/topics/random")
+    assert res.status_code == 200, res.text
+    assert captured["channel_name"] is None
+    assert captured["channel_titles"] is None
+
+
 def test_random_topic_idea_failure_returns_503(client, monkeypatch):
     from renderflow import api
 
     register(client, "admin@example.com")
 
-    def failing_generate_topic_only(llm, existing_titles):
+    def failing_generate_topic_only(llm, existing_titles, channel_name=None, channel_titles=None):
         raise RuntimeError("no ANTHROPIC_API_KEY")
 
     monkeypatch.setattr(api, "build_llm", lambda settings: object())
@@ -748,7 +918,7 @@ def test_admin_is_exempt_from_paywall(client):
         _create_project(client, title=f"Video {i}")  # no 402
 
 
-def _finish_create_with_plan(saas_env, slug: str, owner_dir: str = "u1"):
+def _finish_create_with_plan(saas_env, slug: str, owner_dir: str = "u1", channel_name: str | None = None):
     """Simulate the worker having produced a one-scene plan + final.mp4."""
     from renderflow import db as rdb
     from renderflow.schema import Scene, ScenePlan
@@ -762,6 +932,7 @@ def _finish_create_with_plan(saas_env, slug: str, owner_dir: str = "u1"):
     plan = ScenePlan(
         title="My First Video",
         style="documentary",
+        channel_name=channel_name,
         scenes=[
             Scene(
                 id=1,
@@ -774,6 +945,46 @@ def _finish_create_with_plan(saas_env, slug: str, owner_dir: str = "u1"):
     )
     save_plan(plan, paths)
     (paths.output / "final.mp4").write_bytes(b"video")
+    return paths
+
+
+def _finish_project_as_complete(saas_env, slug: str, owner_dir: str = "u1", title: str = "My First Video"):
+    """Like `_finish_create_with_plan`, but genuinely `_project_view`-
+    "Complete" (every scene asset COMPLETED, final.mp4 newer than
+    scenes.json) — needed for anything that reuses `_project_view`'s own
+    status resolution (e.g. `_run_auto_publish_batch`), unlike the manual
+    publish endpoint's own looser "does final.mp4 exist" check."""
+    import os
+    import time
+
+    from renderflow import db as rdb
+    from renderflow.schema import AssetRef, AssetStatus, Scene, SceneAssets, ScenePlan
+    from renderflow.storage import ProjectPaths, save_plan
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).order_by(rdb.Job.id.desc()).first()
+        job.status = "succeeded"
+        session.commit()
+    paths = ProjectPaths.create(saas_env.projects_dir / owner_dir, slug)
+    plan = ScenePlan(
+        title=title,
+        style="documentary",
+        scenes=[
+            Scene(
+                id=1, type="narration", duration_estimate_sec=5.0,
+                narration="Hello.", image_prompt="A photo.",
+                assets=SceneAssets(
+                    image=AssetRef(status=AssetStatus.COMPLETED, path="scene_001.png"),
+                    voice=AssetRef(status=AssetStatus.COMPLETED, path="scene_001.mp3"),
+                ),
+            )
+        ],
+    )
+    save_plan(plan, paths)
+    final = paths.output / "final.mp4"
+    final.write_bytes(b"video")
+    now = time.time() + 5  # ensure final.mp4 is newer than scenes.json
+    os.utime(final, (now, now))
     return paths
 
 
@@ -942,6 +1153,186 @@ def test_publish_youtube_enqueues_job(client, pipeline_stub, saas_env, monkeypat
             "--privacy", "unlisted",
             "--no-synthetic-disclosure",
         ]
+
+
+"""RENDERFLOW_AUTO_PUBLISH: a daily scheduled batch that queues Complete +
+unpublished projects for YouTube upload with no human review (added 2026-09,
+client request: "auto upload the unpublished at 6pm everyday" — a
+deliberate, confirmed reversal of the original one-click-per-video design).
+"""
+
+
+def test_seconds_until_next_run_before_target_hour_today():
+    from datetime import datetime
+
+    import pytest
+
+    from renderflow.api import _seconds_until_next_run
+
+    now = datetime(2026, 9, 8, 10, 0, 0)  # 10am
+    assert _seconds_until_next_run(18, now=now) == pytest.approx(8 * 3600)
+
+
+def test_seconds_until_next_run_after_target_hour_rolls_to_tomorrow():
+    from datetime import datetime
+
+    import pytest
+
+    from renderflow.api import _seconds_until_next_run
+
+    now = datetime(2026, 9, 8, 19, 0, 0)  # 7pm
+    assert _seconds_until_next_run(18, now=now) == pytest.approx(23 * 3600)
+
+
+def test_seconds_until_next_run_exactly_at_target_hour_rolls_to_tomorrow():
+    # Must not fire immediately at the exact boundary (or the scheduler
+    # loop could spin/re-fire the same minute) — rolls a full day forward.
+    from datetime import datetime
+
+    import pytest
+
+    from renderflow.api import _seconds_until_next_run
+
+    now = datetime(2026, 9, 8, 18, 0, 0)  # exactly 6pm
+    assert _seconds_until_next_run(18, now=now) == pytest.approx(24 * 3600)
+
+
+def test_auto_publish_batch_queues_complete_unpublished_oldest_first(
+    client, pipeline_stub, saas_env, monkeypatch,
+):
+    import dataclasses
+    import os
+    import time as time_module
+
+    from renderflow import api
+    from renderflow import db as rdb
+
+    register(client, "admin@example.com")
+    slug_old = _create_project(client, title="Older Finished Video")
+    paths_old = _finish_project_as_complete(saas_env, slug_old, title="Older Finished Video")
+    slug_new = _create_project(client, title="Newer Finished Video")
+    paths_new = _finish_project_as_complete(saas_env, slug_new, title="Newer Finished Video")
+    # Make "old" genuinely finish earlier on disk than "new" — final.mp4
+    # must stay newer than scenes.json or _project_view stops considering
+    # it "Complete" (the staleness check), so push both back together.
+    old_time = time_module.time() - 3600
+    os.utime(paths_old.output / "final.mp4", (old_time, old_time))
+    os.utime(paths_old.scenes_json, (old_time - 100, old_time - 100))
+
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=5)
+
+    with rdb.new_session() as session:
+        queued = api._run_auto_publish_batch(session, settings)
+
+    assert queued == [slug_old, slug_new]  # oldest-finished-first
+    with rdb.new_session() as session:
+        jobs = session.query(rdb.Job).filter(rdb.Job.kind == "youtube_publish").all()
+        assert {j.project.slug for j in jobs} == {slug_old, slug_new}
+        assert jobs[0].argv == ["--title", jobs[0].project.title, "--description", "", "--tags", "", "--privacy", "public"]
+
+
+def test_auto_publish_batch_respects_the_daily_cap(client, pipeline_stub, saas_env, monkeypatch):
+    import dataclasses
+
+    from renderflow import api
+    from renderflow import db as rdb
+
+    register(client, "admin@example.com")
+    slugs = []
+    for i in range(3):
+        slug = _create_project(client, title=f"Video {i}")
+        _finish_project_as_complete(saas_env, slug, title=f"Video {i}")
+        slugs.append(slug)
+
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=1)
+
+    with rdb.new_session() as session:
+        queued = api._run_auto_publish_batch(session, settings)
+
+    assert len(queued) == 1
+    with rdb.new_session() as session:
+        assert session.query(rdb.Job).filter(rdb.Job.kind == "youtube_publish").count() == 1
+
+
+def test_auto_publish_batch_skips_already_published_projects(client, pipeline_stub, saas_env, monkeypatch):
+    import dataclasses
+
+    from renderflow import api
+    from renderflow import db as rdb
+    from renderflow.schema import YouTubePublish
+    from renderflow.storage import save_youtube_publish
+
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+    paths = _finish_project_as_complete(saas_env, slug)
+    save_youtube_publish(
+        YouTubePublish(
+            video_id="abc123", url="https://youtu.be/abc123",
+            privacy_status="public", contains_synthetic_media=True, published_at=1234.0,
+        ),
+        paths,
+    )
+
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=5)
+
+    with rdb.new_session() as session:
+        queued = api._run_auto_publish_batch(session, settings)
+
+    assert queued == []
+    with rdb.new_session() as session:
+        assert session.query(rdb.Job).filter(rdb.Job.kind == "youtube_publish").count() == 0
+
+
+def test_auto_publish_batch_skips_projects_with_an_active_job(client, pipeline_stub, saas_env, monkeypatch):
+    import dataclasses
+
+    from renderflow import api
+    from renderflow import db as rdb
+
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+    paths = _finish_project_as_complete(saas_env, slug)
+    # Something else is already in flight for this project (e.g. a
+    # regenerate the user queued themselves) — must not also enqueue a
+    # publish job on top of it.
+    with rdb.new_session() as session:
+        project = session.query(rdb.Project).filter(rdb.Project.slug == slug).one()
+        session.add(rdb.Job(project_id=project.id, kind="regenerate", argv=[], status="running"))
+        session.commit()
+
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=5)
+
+    with rdb.new_session() as session:
+        queued = api._run_auto_publish_batch(session, settings)
+
+    assert queued == []
+
+
+def test_auto_publish_batch_does_nothing_when_youtube_not_connected(
+    client, pipeline_stub, saas_env, monkeypatch,
+):
+    import dataclasses
+
+    from renderflow import api
+    from renderflow import db as rdb
+
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+    _finish_project_as_complete(saas_env, slug)
+
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: False)
+    settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=5)
+
+    with rdb.new_session() as session:
+        queued = api._run_auto_publish_batch(session, settings)
+
+    assert queued == []
+    with rdb.new_session() as session:
+        assert session.query(rdb.Job).filter(rdb.Job.kind == "youtube_publish").count() == 0
 
 
 def test_project_view_surfaces_youtube_publish_result(client, saas_env):

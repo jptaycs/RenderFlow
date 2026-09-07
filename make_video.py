@@ -181,6 +181,22 @@ def main() -> int:
         "--title", help="video title (default: LLM-chosen or inferred from the script)"
     )
     parser.add_argument(
+        "--channel-name",
+        help=(
+            "per-project override of RENDERFLOW_CHANNEL_NAME (default: the "
+            "global setting) — persisted on the plan so resume/regenerate "
+            "keep using it regardless of what the global .env says later"
+        ),
+    )
+    parser.add_argument(
+        "--tts-voice",
+        help=(
+            "per-project override of RENDERFLOW_TTS_VOICE (default: the "
+            "global setting) — persisted on the plan, same reasoning as "
+            "--channel-name above"
+        ),
+    )
+    parser.add_argument(
         "--llm-split",
         action="store_true",
         help="use the configured LLM to split --script-file instead of the free local splitter",
@@ -268,6 +284,10 @@ def main() -> int:
 
     if args.title:
         plan.title = args.title
+    if args.channel_name:
+        plan.channel_name = args.channel_name
+    if args.tts_voice:
+        plan.tts_voice = args.tts_voice
     if args.format:
         plan.format = args.format
     # Shorts v1 scope skips cards and the AI clickbait thumbnail entirely
@@ -321,6 +341,12 @@ def main() -> int:
         print(f"      Fetching {'AI-generated' if broll_llm else 'stock'} B-roll ({broll.name})")
         generate_broll(plan, broll, paths, llm=broll_llm, max_concurrency=settings.broll_concurrency)
 
+    # Per-project overrides (added 2026-09, see ScenePlan.channel_name/
+    # tts_voice's own docstring) — fall back to the global .env setting
+    # when the project wasn't created with one.
+    tts_voice = plan.tts_voice or settings.tts_voice
+    channel_name = plan.channel_name or settings.channel_name
+
     print(f"[3/4] Generating {len(plan.scenes)} voice clips ({tts.name})")
     tts_params = {}
     if settings.tts_provider == "piper":
@@ -330,7 +356,7 @@ def main() -> int:
         # Kokoro speed is the inverse of Piper's length_scale (1.0 = natural).
         tts_params["speed"] = 1.0 / settings.tts_length_scale
         tts_params["sentence_pause_sec"] = settings.tts_sentence_pause
-    generate_voice(plan, tts, settings.tts_voice, paths, **tts_params)
+    generate_voice(plan, tts, tts_voice, paths, **tts_params)
 
     if settings.intro_outro:
         # Shorts (added 2026-09, client request: "at the end of video of
@@ -350,7 +376,7 @@ def main() -> int:
         except Exception:
             engagement_llm = None
         generate_branding_audio(
-            plan, tts, settings.tts_voice, settings.channel_name, paths,
+            plan, tts, tts_voice, channel_name, paths,
             llm=engagement_llm, include_intro=not is_shorts, **tts_params
         )
 
@@ -367,7 +393,7 @@ def main() -> int:
             try:
                 motion_graphics = Labs69MotionGraphics()
                 generate_motion_graphics_cards(
-                    plan, motion_graphics, paths, settings.channel_name
+                    plan, motion_graphics, paths, channel_name
                 )
             except Exception as exc:
                 print(f"      Motion Graphics unavailable ({exc}) — using plain cards")
