@@ -12,7 +12,7 @@ Bitwarden **secure note** named `RenderFlow / <path>`:
 On a new machine:
 
 ```bash
-brew install bitwarden-cli             # Windows: winget install Bitwarden.CLI, then use Git Bash
+brew install bitwarden-cli jq          # Windows: winget install Bitwarden.CLI and jqlang.jq, then use Git Bash
 bw login                               # once per machine
 export BW_SESSION="$(bw unlock --raw)"
 scripts/env-pull.sh

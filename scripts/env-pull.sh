@@ -22,6 +22,10 @@ if ! command -v bw >/dev/null 2>&1; then
     echo "    brew install bitwarden-cli        (Windows: winget install Bitwarden.CLI)" >&2
     exit 1
 fi
+if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is not installed. Install it with: brew install jq   (Windows: winget install jqlang.jq)" >&2
+    exit 1
+fi
 if [[ -z "${BW_SESSION:-}" ]] || ! bw status 2>/dev/null | grep -q '"status":"unlocked"'; then
     echo "The Bitwarden vault is locked. Run:" >&2
     echo "    bw login                              (once per machine)" >&2
@@ -34,11 +38,20 @@ bw sync >/dev/null
 umask 077
 failed=0
 
+# Prints a note's contents, matched by exact name. bw's own lookup is a fuzzy
+# search: "app / .env" also matches "app / backend/.env", and a missing note could
+# silently return a similar one. So list the candidates and require an exact match.
+fetch_note() {
+    local id
+    id="$(bw list items --search "$1" | jq -r --arg n "$1" '[.[] | select(.name == $n)] | if length == 1 then .[0].id else empty end')"
+    [[ -n "$id" ]] && bw get notes "$id"
+}
+
 for rel_path in "${ENV_FILES[@]}"; do
     note="$PREFIX / $rel_path"
     target="$REPO/$rel_path"
 
-    if ! contents="$(bw get notes "$note" 2>/dev/null)" || [[ -z "$contents" ]]; then
+    if ! contents="$(fetch_note "$note")" || [[ -z "$contents" ]]; then
         echo "MISSING  \"$note\" (not found, empty, or more than one note matches)"
         failed=1
         continue
