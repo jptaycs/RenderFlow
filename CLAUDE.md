@@ -216,3 +216,24 @@ SaaS layer: `RENDERFLOW_DATABASE_URL` (defaults to the docker-compose Postgres),
 - Don't build auth, billing, publishing, or dashboards before the pipeline they'd serve exists.
 - Don't render synchronously inside API requests once the FastAPI layer exists (Week 2+) — queue it.
 - Don't change the scene schema casually, and don't bypass the provider registry.
+
+## Env files and Bitwarden
+
+Real env files live in Bitwarden secure notes (whole file in the Notes field), never in git:
+
+| Note | File |
+|---|---|
+| `RenderFlow / .env` | `.env` |
+
+- Restore on another machine: `brew install bitwarden-cli` (Windows: `winget install
+  Bitwarden.CLI`, then Git Bash), `bw login`, `export BW_SESSION="$(bw unlock --raw)"`,
+  `scripts/env-pull.sh`, `bw lock`. Or copy the note's Notes field into the file by hand.
+- Never commit an env file, and never print, echo or quote a value from one: refer to
+  key names only, and check values by length or last 4 characters.
+- `bw login` / `bw unlock` prompt for the master password, so the user runs them in their
+  own Terminal window (`!` commands can't answer prompts). To hand Claude a session they
+  run `(umask 077; bw unlock --raw > <scratchpad>/bw_session)`; `bw lock` and deleting the
+  file end it. Claude isn't permitted to write to the vault: give the user a script to run.
+- When a value changes, update both the local file and its note.
+- Don't run `scripts/env-pull.sh` in a working checkout without the user's go-ahead: it can replace
+  live env files.

@@ -15,3 +15,11 @@ dist/
 # user-supplied background music (licensing — never commit audio)
 music/*
 !music/README.md
+
+# Env files: real values live in Bitwarden (see README "Environment setup")
+.env
+.env.*
+*.env
+!.env.example
+!.env.*.example
+!*.env.example
