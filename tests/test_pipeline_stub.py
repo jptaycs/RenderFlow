@@ -151,6 +151,20 @@ def test_topic_only_does_not_request_a_length():
     assert "minute" not in llm.calls[0]["prompt"].lower()
 
 
+def test_topic_only_leaves_real_headroom_for_thinking_tokens():
+    # A flat max_tokens=500 truncated live once the exclusion list grew
+    # (2026-09-25): thinking tokens count against the cap and scale with
+    # prompt size, while the title itself is only ~15 tokens. Pin the
+    # budget well above the old value so it can't quietly regress.
+    from renderflow.pipeline.script import TOPIC_ONLY_MAX_TOKENS, generate_topic_only
+
+    llm = _RecordingTopicOnlyLLM()
+    generate_topic_only(llm, [f"Title {i}" for i in range(80)])
+
+    assert llm.calls[0]["max_tokens"] == TOPIC_ONLY_MAX_TOKENS
+    assert TOPIC_ONLY_MAX_TOKENS >= 4000
+
+
 def test_topic_only_scopes_to_a_channel_with_existing_videos():
     # Client request: "the generate topic must be related with the
     # selected channel" — when a channel and its existing titles are

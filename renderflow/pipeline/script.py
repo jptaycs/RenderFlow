@@ -222,6 +222,16 @@ def _topic_idea_max_tokens(target_words: int) -> int:
     return max(1200, round(target_words * 3) + 1000)
 
 
+# The title itself is ~15 output tokens, but adaptive thinking tokens count
+# against max_tokens too (see _topic_idea_max_tokens), and how much the
+# model thinks grows with the exclusion list it's handed — a flat 500 was
+# fine on an empty library but truncated live (2026-09-25, ~60 existing
+# titles + a same-session exclude list): "Claude response truncated at
+# max_tokens" → the dashboard's 503. 4000 is pure headroom; a title never
+# comes close to it on the output side.
+TOPIC_ONLY_MAX_TOKENS = 4000
+
+
 def generate_topic_only(
     llm: LLMProvider,
     existing_titles: list[str],
@@ -246,7 +256,7 @@ def generate_topic_only(
         TOPIC_ONLY_SYSTEM_PROMPT,
         build_topic_only_prompt(existing_titles, channel_name, channel_titles),
         json_schema=GeneratedTopicOnly.model_json_schema(),
-        max_tokens=500,
+        max_tokens=TOPIC_ONLY_MAX_TOKENS,
     )
     try:
         idea = GeneratedTopicOnly.model_validate_json(result.text)
