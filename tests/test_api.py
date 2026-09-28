@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from renderflow.api import _scene_assets
 from renderflow.schema import AssetStatus, AvatarSpec, Scene
 
@@ -353,7 +355,8 @@ def test_create_project_enqueues_a_job(client, pipeline_stub, saas_env):
         assert pipeline_stub.delayed == [jobs[0].id]
         project = session.query(rdb.Project).one()
     # New projects live in the per-user namespace.
-    assert f"u{1}/{slug}" in project.dir_path
+    # Path-separator agnostic: dir_path is a native path (backslashes on Windows).
+    assert Path(project.dir_path).as_posix().endswith(f"u{1}/{slug}")
     assert (saas_env.projects_dir / "u1" / slug / "script" / "source.txt").exists()
 
 
