@@ -99,6 +99,49 @@ def test_submit_falls_back_to_default_delay_on_http_date_retry_after(monkeypatch
     assert len(calls) == 2
 
 
+def test_submit_keeps_waiting_on_429_within_the_rate_limit_budget(monkeypatch):
+    # Live 2026-09-29: 69labs 429s (CONCURRENCY_LIMIT_REACHED) for as long as
+    # the account's concurrent-video slots are full — 20+ minutes when their
+    # queue backs up. The old 4-attempt cap gave up after ~45s and every
+    # later scene lost its B-roll. A 429 must keep waiting inside the budget
+    # without consuming one of the counted attempts.
+    monkeypatch.setenv("LABS69_API_KEY", "vk_test")
+    slept = []
+    monkeypatch.setattr(labs69_client.time, "sleep", lambda seconds: slept.append(seconds))
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        if len(calls) <= 8:  # well past max_retries=4
+            return _json_response(url, {"error": "busy"}, status=429, headers={"Retry-After": "15"})
+        return _json_response(url, {"id": "job1", "queuePosition": 0}, status=201)
+
+    monkeypatch.setattr(labs69_client.httpx, "post", fake_post)
+    result = Labs69Client().submit("/videos/generate", {"prompt": "x"}, max_retries=4)
+    assert result["id"] == "job1"
+    assert len(calls) == 9
+    assert slept == [15.0] * 8
+
+
+def test_submit_429_budget_is_bounded(monkeypatch):
+    # Once the 429 budget is spent, the counted retries take over and the
+    # submit still fails deterministically instead of waiting forever.
+    monkeypatch.setenv("LABS69_API_KEY", "vk_test")
+    monkeypatch.setattr(labs69_client.time, "sleep", lambda seconds: None)
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        return _json_response(url, {"error": "busy", "code": "CONCURRENCY_LIMIT_REACHED"},
+                              status=429, headers={"Retry-After": "15"})
+
+    monkeypatch.setattr(labs69_client.httpx, "post", fake_post)
+    with pytest.raises(Labs69Error, match="CONCURRENCY_LIMIT_REACHED"):
+        Labs69Client().submit("/videos/generate", {"prompt": "x"}, max_retries=4, rate_limit_wait_sec=60.0)
+    # 4 free waits fit in the 60s budget (4 x 15s), then 4 counted attempts.
+    assert len(calls) == 4 + 4
+
+
 def test_submit_raises_on_non_retryable_error(monkeypatch):
     monkeypatch.setenv("LABS69_API_KEY", "vk_test")
 

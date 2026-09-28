@@ -104,25 +104,41 @@ class Labs69Client:
         *,
         max_retries: int = 4,
         timeout: float = 60.0,
+        rate_limit_wait_sec: float = 600.0,
     ) -> dict[str, Any]:
         """POST a generate request, retrying 429/5xx in place with the same
-        Idempotency-Key so a retried submit can never double-bill."""
+        Idempotency-Key so a retried submit can never double-bill.
+
+        `max_retries` bounds 5xx/transport failures. A 429 is different: it
+        is the API saying "wait", not "broken" — 69labs returns it for
+        CONCURRENCY_LIMIT_REACHED whenever the account's concurrent-video
+        slots are full, and those free up only as in-flight jobs finish
+        (20+ minutes when their queue backs up, seen live 2026-09-29). So a
+        429 keeps waiting, honoring Retry-After, for up to
+        `rate_limit_wait_sec` total without consuming an attempt; only once
+        that budget is spent does it fall through to the counted retries.
+        Before this, 4 x ~15s (~45s) of 429 backoff made every later scene of
+        a Short drop its B-roll to a still the moment the slots filled up.
+        """
         idempotency_key = str(uuid.uuid4())
         headers = self._headers(idempotency_key)
         delay = 2.0
-        for attempt in range(1, max_retries + 1):
+        attempt = 0  # counted (5xx / transport) failures, capped by max_retries
+        waited_on_429 = 0.0  # seconds spent honoring 429 backoff so far
+        while True:
             try:
                 response = httpx.post(
                     f"{API_BASE}{path}", headers=headers, json=body, timeout=timeout
                 )
             except httpx.TransportError as exc:
-                if attempt == max_retries:
+                attempt += 1
+                if attempt >= max_retries:
                     raise Labs69Error(f"69labs POST {path} failed: {exc}") from exc
                 log.warning("69labs POST %s transport error, retrying: %s", path, exc)
                 time.sleep(delay)
                 delay = min(delay * 2, 30.0)
                 continue
-            if response.status_code in _RETRYABLE_STATUS and attempt < max_retries:
+            if response.status_code in _RETRYABLE_STATUS:
                 # Retry-After can legally be an HTTP-date string instead of
                 # delta-seconds (RFC 9110) — bare float() raised an
                 # uncaught ValueError on that form, skipping the backoff
@@ -132,16 +148,31 @@ class Labs69Client:
                     retry_after = float(response.headers.get("Retry-After", delay))
                 except (TypeError, ValueError):
                     retry_after = delay
-                log.warning(
-                    "69labs POST %s -> %d, retrying in %.1fs (attempt %d/%d)",
-                    path, response.status_code, retry_after, attempt, max_retries,
+                within_budget = (
+                    response.status_code == 429
+                    and waited_on_429 + retry_after <= rate_limit_wait_sec
                 )
-                time.sleep(retry_after)
-                delay = min(delay * 2, 30.0)
-                continue
+                if within_budget:
+                    log.warning(
+                        "69labs POST %s -> 429, waiting %.1fs (%.0fs of %.0fs budget used)",
+                        path, retry_after, waited_on_429, rate_limit_wait_sec,
+                    )
+                    time.sleep(retry_after)
+                    # Count at least 1s per round so a Retry-After of 0 can't
+                    # spin forever inside the budget.
+                    waited_on_429 += max(retry_after, 1.0)
+                    continue
+                attempt += 1
+                if attempt < max_retries:
+                    log.warning(
+                        "69labs POST %s -> %d, retrying in %.1fs (attempt %d/%d)",
+                        path, response.status_code, retry_after, attempt, max_retries,
+                    )
+                    time.sleep(retry_after)
+                    delay = min(delay * 2, 30.0)
+                    continue
             self._raise_for_status(response, path)
             return response.json()
-        raise Labs69Error(f"69labs POST {path} exhausted retries")
 
     def poll_until_terminal(
         self, path: str, *, interval: float = 4.0, timeout: float = 600.0

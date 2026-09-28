@@ -38,6 +38,9 @@ log = logging.getLogger("renderflow.providers.labs69_video")
 DEFAULT_ASPECT_RATIO = "16:9"
 
 
+VIDEO_POLL_TIMEOUT_SEC = 1800.0
+
+
 class Labs69Video:
     name = "labs69"
 
@@ -145,8 +148,15 @@ class Labs69Video:
         )
         submitted = self.client.submit("/videos/generate", body)
         job_id = submitted["id"]
+        # 30 minutes, not 15: when 69labs' video queue backs up, a job can
+        # sit PENDING for 20+ minutes and still complete (seen live
+        # 2026-09-29: 22 min). Timing out client-side doesn't cancel the
+        # job server-side — it keeps occupying one of the account's
+        # concurrent-video slots until it finishes, so abandoning it early
+        # is strictly worse than waiting: the clip is paid for and then
+        # discarded, AND the held slot 429s every later scene's submit.
         status = self.client.poll_until_terminal(
-            f"/videos/status/{job_id}", interval=8.0, timeout=900.0
+            f"/videos/status/{job_id}", interval=8.0, timeout=VIDEO_POLL_TIMEOUT_SEC
         )
         require_completed(status, context="69labs video job")
         data = self.client.download(f"/videos/download/{job_id}")
