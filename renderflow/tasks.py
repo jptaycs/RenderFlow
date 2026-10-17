@@ -25,12 +25,15 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from celery import Celery
 from celery.signals import worker_ready
@@ -139,7 +142,12 @@ def _resumable_job_argv(job_argv: list[str], scenes_json: Path) -> list[str]:
 
 _settings = Settings.load()
 celery_app = Celery(
-    "renderflow", broker=_settings.redis_url, backend=_settings.redis_url
+    "renderflow",
+    broker=_settings.redis_url,
+    backend=_settings.redis_url,
+    # Autopilot tasks (daily trend -> video -> YouTube loop) share this
+    # worker; imported lazily by name to avoid a circular import.
+    include=["renderflow.autopilot.jobs"],
 )
 celery_app.conf.update(
     task_track_started=True,
@@ -152,6 +160,58 @@ if _settings.celery_eager:
     # See Settings.celery_eager's docstring: dev/test-only, no Redis or
     # `celery worker` process needed. api.startup refuses this in production.
     celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
+
+
+# Eager mode's single in-process worker. One persistent thread pulling off a
+# queue, never a thread per job: the per-job version let every queued video
+# render at once on one machine, each crawling for CPU (client-reported
+# 2026-09, "why does a Short render too long") — this matches the real
+# worker's --concurrency=1. It lives here rather than in api.py because the
+# autopilot dispatches through it too: an autopilot render must wait its
+# turn behind dashboard renders, never run alongside them.
+_EAGER_QUEUE: "queue.Queue[tuple[Any, tuple]]" = queue.Queue()
+_eager_worker_started = False
+_eager_worker_lock = threading.Lock()
+
+
+def _eager_worker_loop() -> None:
+    while True:
+        task, args = _EAGER_QUEUE.get()
+        try:
+            task.run(*args)
+        except Exception:
+            log.exception("eager-mode worker: %s%r raised", getattr(task, "name", task), args)
+
+
+def _ensure_eager_worker_started() -> None:
+    # Started lazily by submit() rather than at API startup: a bare
+    # TestClient(app) never fires the startup event.
+    global _eager_worker_started
+    if _eager_worker_started:
+        return
+    with _eager_worker_lock:
+        if _eager_worker_started:
+            return
+        threading.Thread(target=_eager_worker_loop, daemon=True).start()
+        _eager_worker_started = True
+
+
+def submit(task: Any, *args: Any, countdown: float = 0) -> str | None:
+    """Dispatch a Celery task: to the broker normally, onto the one eager
+    worker thread under RENDERFLOW_CELERY_EAGER (where `.delay()` would run
+    it synchronously in the caller, blocking an HTTP request or the bot's
+    poll loop for a whole render). Returns the Celery task id, or None in
+    eager mode. `countdown` delays the start in both modes."""
+    if Settings.load().celery_eager:
+        _ensure_eager_worker_started()
+        if countdown:
+            timer = threading.Timer(countdown, _EAGER_QUEUE.put, ((task, args),))
+            timer.daemon = True
+            timer.start()
+        else:
+            _EAGER_QUEUE.put((task, args))
+        return None
+    return task.apply_async(args, countdown=countdown or None).id
 
 
 def pid_is_pipeline(pid: int) -> bool:
@@ -238,6 +298,21 @@ def _log_tail(log_file: Path) -> str | None:
         return None
 
 
+def _notify_autopilot(job_id: int) -> None:
+    """Let the autopilot advance an episode whose render just ended. Never
+    allowed to affect the job's own outcome — it is already committed."""
+    try:
+        from renderflow.autopilot.jobs import on_pipeline_job_finished
+
+        on_pipeline_job_finished(job_id)
+    except Exception:
+        import logging
+
+        logging.getLogger("renderflow.tasks").exception(
+            "autopilot hook failed for job %s", job_id
+        )
+
+
 @celery_app.task(name="renderflow.run_pipeline")
 def run_pipeline(job_id: int) -> None:
     session = new_session()
@@ -308,6 +383,7 @@ def run_pipeline(job_id: int) -> None:
         for attempt in range(1, max_attempts + 1):
             session.refresh(job)  # the API may have cancelled it between attempts
             if job.status == "cancelled":
+                _notify_autopilot(job.id)
                 return
             argv = _argv_for_attempt(attempt)
             with log_path.open("a", encoding="utf-8") as log_file:
@@ -347,6 +423,7 @@ def run_pipeline(job_id: int) -> None:
 
             session.refresh(job)  # the API may have marked it cancelled mid-run
             if job.status == "cancelled":
+                _notify_autopilot(job.id)
                 return
             if returncode == 0:
                 break
@@ -369,6 +446,7 @@ def run_pipeline(job_id: int) -> None:
             )
         job.finished_at = time.time()
         session.commit()
+        _notify_autopilot(job.id)
     except Exception as exc:  # a worker bug must never strand a job as 'running'
         session.rollback()
         job = session.get(Job, job_id)

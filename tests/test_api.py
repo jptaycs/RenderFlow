@@ -1256,6 +1256,35 @@ def test_auto_publish_batch_queues_complete_unpublished_oldest_first(
         assert jobs[0].argv == ["--title", jobs[0].project.title, "--description", "", "--tags", "", "--privacy", "public"]
 
 
+def test_auto_publish_batch_never_publishes_autopilot_videos(
+    client, pipeline_stub, saas_env, monkeypatch,
+):
+    # Autopilot videos go out only on an explicit Approve; a skipped one is
+    # Complete + unpublished, exactly what this batch otherwise picks up.
+    import dataclasses
+
+    from renderflow import api
+    from renderflow import db as rdb
+
+    register(client, "admin@example.com")
+    slug_auto = _create_project(client, title="Autopilot Video")
+    _finish_project_as_complete(saas_env, slug_auto, title="Autopilot Video")
+    slug_manual = _create_project(client, title="Dashboard Video")
+    _finish_project_as_complete(saas_env, slug_manual, title="Dashboard Video")
+    with rdb.new_session() as session:
+        project = session.query(rdb.Project).filter_by(slug=slug_auto).one()
+        channel = rdb.AutopilotChannel(owner_id=project.owner_id, niches=[])
+        session.add(channel)
+        session.flush()
+        session.add(rdb.Episode(channel_id=channel.id, day="2000-01-01", status="skipped", project_id=project.id))
+        session.commit()
+
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda *a, **k: True)
+    settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=5)
+    with rdb.new_session() as session:
+        assert api._run_auto_publish_batch(session, settings) == [slug_manual]
+
+
 def test_auto_publish_batch_respects_the_daily_cap(client, pipeline_stub, saas_env, monkeypatch):
     import dataclasses
 

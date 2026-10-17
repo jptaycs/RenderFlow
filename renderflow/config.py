@@ -159,6 +159,12 @@ class Settings:
     # is fine for a one-off manual test and wrong for anything else. Never
     # set this in production (refused at startup, see api.startup).
     celery_eager: bool = False
+    # --- Autopilot (renderflow/autopilot/) ---
+    # Comma-separated trend sources for the daily topic scan, and the
+    # country they report on. youtube-trending is skipped without
+    # YOUTUBE_API_KEY.
+    trend_sources: str = "google-trends,youtube-trending"
+    trends_geo: str = "US"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -234,4 +240,8 @@ class Settings:
                 for name in os.getenv("RENDERFLOW_SEPARATE_YOUTUBE_CHANNELS", "").split(",")
                 if name.strip()
             ),
+            trend_sources=os.getenv(
+                "RENDERFLOW_TREND_SOURCES", "google-trends,youtube-trending"
+            ),
+            trends_geo=os.getenv("RENDERFLOW_TRENDS_GEO", "US"),
         )

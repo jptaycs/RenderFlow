@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
 import random
 import shutil
 import threading
@@ -33,6 +32,9 @@ from renderflow import db
 from renderflow import youtube as youtube_module
 from renderflow.auth import current_user
 from renderflow.auth import router as auth_router
+from renderflow.autopilot import bot as autopilot_bot
+from renderflow.autopilot import jobs as autopilot_jobs
+from renderflow.autopilot.api import router as autopilot_router
 from renderflow.billing import consume_credit, entitlement
 from renderflow.billing import router as billing_router
 from renderflow.config import Settings
@@ -55,7 +57,14 @@ from renderflow.storage import (
     save_plan,
     slugify,
 )
-from renderflow.tasks import cancel_job, kill_pipeline_pgid, pid_is_pipeline, run_pipeline
+from renderflow.tasks import (
+    cancel_job,
+    kill_pipeline_pgid,
+    pid_is_pipeline,
+    _notify_autopilot,
+    run_pipeline,
+    submit,
+)
 
 log = logging.getLogger("renderflow.api")
 
@@ -65,6 +74,7 @@ WEB_DIR = REPO_ROOT / "web"
 app = FastAPI(title="RenderFlow")
 app.include_router(auth_router)
 app.include_router(billing_router)
+app.include_router(autopilot_router)
 
 
 def _created_label(dt: datetime) -> str:
@@ -82,96 +92,25 @@ def _active_job(session: Session, project: Project) -> Job | None:
     return db.active_job(session, project.id)
 
 
-_EAGER_JOB_QUEUE: "queue.Queue[int]" = queue.Queue()
-_eager_worker_started = False
-_eager_worker_lock = threading.Lock()
-
-
-def _eager_worker_loop() -> None:
-    """The single persistent worker thread for `RENDERFLOW_CELERY_EAGER=1`
-    (added 2026-09) — pulls job ids off `_EAGER_JOB_QUEUE` and runs them
-    strictly one at a time, matching the real production Celery worker's
-    `--concurrency=1` (see the Commands section of CLAUDE.md).
-
-    Before this, `_enqueue`'s eager branch spawned a brand-new background
-    thread per job with no limit at all, so every queued video ran (and
-    CPU-contended for FFmpeg encoding, plus the concurrent broll/image/
-    voice HTTP calls) at once regardless of how many were already in
-    flight. Client-reported (after investigating "why does a Short render
-    too long"): four Shorts and several landscape videos were all
-    rendering simultaneously on this single dev machine, each one
-    crawling because it was sharing CPU with the others instead of
-    running at full speed. A single serialized worker (this loop) instead
-    of an unbounded thread-per-job gives the same one-at-a-time behavior
-    the real deployed worker already has.
-
-    `run_pipeline.run(job_id)` opens its own DB session internally (never
-    shares the enqueuing request's `session`), so calling it from this
-    one long-lived thread — instead of the caller's request thread, or a
-    fresh thread per job — is safe the same way it always was.
-    """
-    while True:
-        job_id = _EAGER_JOB_QUEUE.get()
-        try:
-            run_pipeline.run(job_id)
-        except Exception:
-            log.exception("eager-mode pipeline worker: job %d raised", job_id)
-
-
-def _ensure_eager_worker_started() -> None:
-    """Lazily starts the one `_eager_worker_loop` thread, exactly once.
-
-    Double-checked locking (same pattern as `Labs69Video._lookup_model`)
-    rather than starting it in `startup()`: a bare `TestClient(app)` (used
-    throughout this test suite) doesn't fire FastAPI's startup event
-    unless entered as a context manager, so tying worker startup to
-    `_enqueue` itself — the thing that actually needs it — works
-    regardless of how the app was booted.
-    """
-    global _eager_worker_started
-    if _eager_worker_started:
-        return
-    with _eager_worker_lock:
-        if _eager_worker_started:
-            return
-        threading.Thread(target=_eager_worker_loop, daemon=True).start()
-        _eager_worker_started = True
-
-
 def _enqueue(session: Session, project: Project, kind: str, argv: list[str]) -> Job:
     """Queue a pipeline run for the Celery worker.
 
     The Job row must be committed *before* dispatch — the worker (or, in
-    eager dev mode, `_eager_worker_loop` below) can start faster than
+    eager dev mode, the in-process worker thread) can start faster than
     this request finishes, and an uncommitted job id would look like a
     stale delivery and be dropped.
     """
     job = Job(project_id=project.id, kind=kind, argv=argv)
     session.add(job)
     session.commit()
-    if Settings.load().celery_eager:
-        # task_always_eager makes .delay() execute the *entire* pipeline
-        # synchronously in the calling thread before returning — correct
-        # for a one-off manual CLI-style test, but it means this HTTP
-        # request doesn't return until a real render finishes, which can
-        # be many minutes. Client-reported: creating a new Short showed
-        # "Starting…" and never resolved while an unrelated 11-minute
-        # video was still generating — not actually stuck, just blocked
-        # behind that other request's full pipeline run on whichever
-        # thread picked it up. Dispatching onto the single persistent
-        # `_eager_worker_loop` (via a queue, not a thread spawned here)
-        # keeps that "request returns immediately" property while also
-        # processing jobs one at a time, matching the real worker's
-        # `--concurrency=1` — see `_eager_worker_loop`'s docstring.
-        # celery_task_id stays unset on this path; cancellation already
-        # works off job.pid, not the task id, so nothing else depends on
-        # it being set here.
-        _ensure_eager_worker_started()
-        _EAGER_JOB_QUEUE.put(job.id)
-    else:
-        result = run_pipeline.delay(job.id)
-        job.celery_task_id = result.id
-        session.commit()
+    # tasks.submit: Celery normally; under RENDERFLOW_CELERY_EAGER, the one
+    # in-process worker thread, so this request still returns immediately
+    # (with .delay() it would block until the whole render finished —
+    # client-reported as a new Short stuck on "Starting…" behind an
+    # 11-minute video). celery_task_id stays unset in eager mode;
+    # cancellation works off job.pid, not the task id.
+    job.celery_task_id = submit(run_pipeline, job.id)
+    session.commit()
     return job
 
 
@@ -1382,7 +1321,9 @@ def _recover_orphaned_jobs_eager(session: Session) -> None:
     Only runs when `settings.celery_eager` — a real Celery worker already
     reconciles its own orphans via `recover_orphaned_jobs`.
     """
+    recovered: list[int] = []
     for job in session.query(Job).filter(Job.status.in_(["running", "queued"])).all():
+        recovered.append(job.id)
         if job.pid and pid_is_pipeline(job.pid):
             kill_pipeline_pgid(job.pid)
         project = session.get(Project, job.project_id)
@@ -1405,6 +1346,11 @@ def _recover_orphaned_jobs_eager(session: Session) -> None:
             job.id, job.kind, project.slug if project else "?", job.status,
         )
     session.commit()
+    # The autopilot advances its episodes off job outcomes (a finished
+    # render gets packaged, a failed one auto-resumed) — tell it, or an
+    # episode whose job was orphaned would sit at 'generating' forever.
+    for job_id in recovered:
+        _notify_autopilot(job_id)
 
 
 def _seconds_until_next_run(hour: int, now: datetime | None = None) -> float:
@@ -1447,8 +1393,16 @@ def _run_auto_publish_batch(session: Session, settings: Settings) -> list[str]:
     the batch from publishing.
     """
     candidates: list[tuple[float, Project, ScenePlan, ProjectPaths]] = []
+    # Autopilot videos are uploaded only on an explicit Approve (Telegram or
+    # the Autopilot tab) — a skipped or not-yet-reviewed one looks exactly
+    # like a Complete, unpublished project, and must never go out from here.
+    autopilot_project_ids = {
+        pid for (pid,) in session.query(db.Episode.project_id).filter(db.Episode.project_id.isnot(None))
+    }
     for project in session.query(Project).all():
         try:
+            if project.id in autopilot_project_ids:
+                continue
             if _active_job(session, project):
                 continue  # already publishing, still rendering, etc.
             paths = _project_paths(project)
@@ -1578,8 +1532,13 @@ def startup() -> None:
         session = db.new_session()
         try:
             _recover_orphaned_jobs_eager(session)
+            autopilot_jobs.recover_interrupted_episodes(session)
         finally:
             session.close()
+        # No Celery worker or separate bot process in eager mode: the
+        # autopilot's scheduler + Telegram loop live in this process so its
+        # renders go through the same one-at-a-time queue (tasks.submit).
+        threading.Thread(target=autopilot_bot.run_loop, daemon=True).start()
     if settings.auto_publish_enabled:
         threading.Thread(target=_auto_publish_scheduler_loop, daemon=True).start()
 

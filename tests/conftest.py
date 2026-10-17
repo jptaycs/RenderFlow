@@ -81,6 +81,10 @@ class StubPipeline:
         self.delayed.append(job_id)
         return SimpleNamespace(id=f"stub-task-{job_id}")
 
+    def apply_async(self, args: tuple, countdown: int | None = None):
+        # tasks.submit's non-eager path.
+        return self.delay(*args)
+
 
 @pytest.fixture
 def pipeline_stub(saas_env, monkeypatch) -> StubPipeline:

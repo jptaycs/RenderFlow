@@ -331,6 +331,10 @@ const state = {
   // them to finish it manually instead of the video silently sitting there
   // un-rendered with no visible explanation.
   resumeNeeded: null,
+  // GET /api/autopilot payload — fetched only while the Autopilot screen
+  // is open: {channel, botOnline, connections, episodes, today}.
+  autopilot: null,
+  autopilotMsg: '',
 };
 
 function findProject(slug) { return state.projects.find(p => p.slug === slug); }
@@ -338,6 +342,7 @@ function findProject(slug) { return state.projects.find(p => p.slug === slug); }
 /* ── server sync ─────────────────────────────────────────────────────── */
 
 let lastStateJson = '';
+let lastAutopilotJson = '';
 
 async function refresh() {
   if (!state.authChecked) return;
@@ -366,7 +371,23 @@ async function refresh() {
     changed = state.connected;
     state.connected = false;
   }
+  if (state.screen === 'autopilot' && state.user) {
+    try {
+      const res = await fetch('/api/autopilot');
+      if (res.ok) {
+        const text = await res.text();
+        if (text !== lastAutopilotJson) {
+          state.autopilot = JSON.parse(text);
+          lastAutopilotJson = text;
+          changed = true;
+        }
+      }
+    } catch (err) { /* connection state already handled above */ }
+  }
   drainActionQueues();
+  // Don't wipe the Autopilot settings form while the user is typing in it.
+  const active = document.activeElement;
+  if (changed && active && active.closest && active.closest('#rf-ap-settings')) changed = false;
   // Re-render only when the server state actually changed — a poll must
   // never blow away the DOM (and the user's scroll position) for nothing.
   if (changed && !state.modalOpen) render();
@@ -733,6 +754,10 @@ function sidebarHtml() {
         '<span style="font-size:14px;width:16px;text-align:center;color:' + (state.screen === 'reporting' ? '#FF0000' : 'inherit') + '">$</span>' +
         '<span>Reporting</span>' +
       '</div>' +
+      '<div data-act="goAutopilot" style="' + navItemStyle(state.screen === 'autopilot') + '">' +
+        '<span style="font-size:14px;width:16px;text-align:center;color:' + (state.screen === 'autopilot' ? '#FF0000' : 'inherit') + '">✈</span>' +
+        '<span>Autopilot</span>' +
+      '</div>' +
     '</div>' +
     '<div style="margin-top:auto;padding-top:16px;border-top:1px solid #212124;display:flex;flex-direction:column;gap:10px">' +
       '<div style="display:flex;justify-content:space-between;align-items:baseline;padding:0 8px">' +
@@ -1058,6 +1083,132 @@ function stackScreenHtml() {
         '<div style="font-size:13px;font-weight:600;margin-bottom:6px">Manual / one-time</div>' +
         '<div style="font-size:11.5px;color:#7a7a81;margin-bottom:10px">Setup done once, or a judgment call per video</div>' +
         manualList +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+
+/* ── autopilot ───────────────────────────────────────────────────────── */
+
+const EPISODE_STATUS = {
+  planning:   { label: 'Picking topic',     color: '#3b82f6' },
+  generating: { label: 'Rendering',         color: '#3b82f6' },
+  ready:      { label: 'Awaiting approval', color: '#f59e0b' },
+  uploading:  { label: 'Uploading',         color: '#a855f7' },
+  uploaded:   { label: 'Uploaded',          color: '#22c55e' },
+  skipped:    { label: 'Skipped',           color: '#5a5a60' },
+  failed:     { label: 'Failed',            color: '#ef4444' },
+};
+
+function confirmAction(text) { return window.confirm(text); }
+
+function apStatusTile(label, ok, okText, badText, hint) {
+  return '' +
+  '<div style="background:#161618;border:1px solid #26262a;border-radius:10px;padding:14px 16px">' +
+    '<div style="font-size:11.5px;color:#8a8a91;margin-bottom:6px">' + esc(label) + '</div>' +
+    '<div style="display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600;color:' + (ok ? '#22c55e' : '#f59e0b') + '">' +
+      '<span style="width:7px;height:7px;border-radius:50%;background:' + (ok ? '#22c55e' : '#f59e0b') + '"></span>' + esc(ok ? okText : badText) +
+    '</div>' +
+    (!ok && hint ? '<div style="font-size:11px;color:#7a7a81;margin-top:6px">' + hint + '</div>' : '') +
+  '</div>';
+}
+
+function apButton(label, act, arg, primary) {
+  return '<span data-act="' + act + '"' + (arg != null ? ' data-arg="' + esc(String(arg)) + '"' : '') +
+    ' style="display:inline-block;cursor:pointer;font-size:12.5px;font-weight:600;padding:7px 12px;border-radius:7px;word-spacing:2px;' +
+    (primary ? 'background:#FF0000;color:#fff' : 'background:#1f1f23;color:#c8c8cc;border:1px solid #2e2e33') + '">' + esc(label) + '</span>';
+}
+
+function episodeCardHtml(ep) {
+  const meta = EPISODE_STATUS[ep.status] || { label: ep.status, color: '#8a8a91' };
+  const actions = [];
+  if (ep.status === 'ready') {
+    actions.push(apButton('✅ Approve & upload', 'autopilotEpisode', ep.id + ':approve', true));
+    actions.push(apButton('🖼 New thumbnail', 'autopilotEpisode', ep.id + ':thumb'));
+  }
+  if (ep.status === 'failed' && ep.projectSlug && !ep.youtubeVideoId) actions.push(apButton('Retry upload', 'autopilotEpisode', ep.id + ':approve'));
+  if (['ready', 'failed', 'skipped'].includes(ep.status)) actions.push(apButton('🔁 New topic', 'autopilotEpisode', ep.id + ':newtopic'));
+  if (['planning', 'generating', 'ready', 'failed'].includes(ep.status)) actions.push(apButton('⏭ Skip', 'autopilotEpisode', ep.id + ':skip'));
+  if (ep.projectSlug) actions.push(apButton('Open project', 'openProject', ep.projectSlug));
+  if (ep.youtubeUrl) actions.push('<a href="' + esc(ep.youtubeUrl) + '" target="_blank" rel="noopener" style="font-size:12.5px;color:#FF0000;font-weight:600;align-self:center">Watch on YouTube ↗</a>');
+
+  const seo = ep.description
+    ? '<details style="margin-top:12px"><summary style="cursor:pointer;font-size:12.5px;color:#c8c8cc">SEO: title, description, tags</summary>' +
+        '<div style="margin-top:10px;background:#0f0f11;border:1px solid #232327;border-radius:8px;padding:12px;font-size:12.5px;color:#c8c8cc;white-space:pre-wrap;line-height:1.5">' +
+          '<b>' + esc(ep.title) + '</b>\n\n' + esc(ep.description) + '\n\nTags: ' + esc((ep.tags || []).join(', ')) +
+        '</div>' +
+        '<div style="margin-top:8px">' + apButton('Copy all', 'copyEpisodeSeo', ep.id) + '</div>' +
+      '</details>'
+    : '';
+  const cands = (ep.candidates || []).length
+    ? '<details style="margin-top:8px"><summary style="cursor:pointer;font-size:12.5px;color:#8a8a91">Why this topic (' + ep.candidates.length + ' candidates)</summary>' +
+        ep.candidates.map(c => '<div style="font-size:12px;color:#9a9aa1;padding:6px 0;border-top:1px solid #1f1f23"><span style="font-family:\'JetBrains Mono\',monospace;color:#c8c8cc">' + esc(String(c.score)) + '</span> · <b style="color:#c8c8cc">' + esc(c.working_title) + '</b> — ' + esc(c.niche) + ' · trend: ' + esc(c.trend) + '<br>' + esc(c.reason) + '</div>').join('') +
+      '</details>'
+    : '';
+  return '' +
+  '<div style="background:#161618;border:1px solid #26262a;border-radius:12px;padding:18px 20px">' +
+    '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px">' +
+      '<span style="font-size:11.5px;color:#7a7a81;font-family:\'JetBrains Mono\',monospace">#' + ep.id + ' · ' + esc(ep.day) + '</span>' +
+      '<span style="font-size:11.5px;font-weight:600;color:' + meta.color + ';background:#1f1f23;padding:3px 9px;border-radius:9px">' + esc(meta.label) + '</span>' +
+    '</div>' +
+    '<div style="font-size:15px;font-weight:600;margin-bottom:6px">' + esc(ep.title || (ep.status === 'planning' ? 'Scanning today\'s trends…' : '(no title)')) + '</div>' +
+    (ep.niche ? '<div style="font-size:12.5px;color:#8a8a91">' + esc(ep.niche) + ' · ' + (ep.kind === 'howto' ? 'how-to' : 'fact story') + ' · trend: ' + esc(ep.trend) + ' · ' + money(ep.cost) + '</div>' : '') +
+    (ep.error ? '<div style="font-size:12px;color:#ef4444;margin-top:8px;white-space:pre-wrap;max-height:120px;overflow:auto">' + esc(ep.error) + '</div>' : '') +
+    (actions.length ? '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px">' + actions.join('') + '</div>' : '') +
+    seo + cands +
+  '</div>';
+}
+
+function autopilotScreenHtml() {
+  const ap = state.autopilot;
+  const head = '' +
+    '<div style="font-size:22px;font-weight:600;letter-spacing:-0.01em;margin-bottom:4px">Autopilot</div>' +
+    '<div style="font-size:13px;color:#8a8a91;margin-bottom:26px">One video a day from today\'s trends. It sends you the finished video on Telegram, and when you approve it, it uploads to YouTube marked as AI content.</div>';
+  if (!ap) return '<div style="padding:32px 40px">' + head + '<div style="color:#8a8a91;font-size:13px">Loading…</div></div>';
+  const c = ap.channel, k = ap.connections;
+  const hours = Array.from({ length: 24 }, (_, h) => '<option value="' + h + '"' + (h === c.runHour ? ' selected' : '') + '>' + pad2(h) + ':00</option>').join('');
+  const privacy = ['private', 'unlisted', 'public'].map(p => '<option value="' + p + '"' + (p === c.privacy ? ' selected' : '') + '>' + p + '</option>').join('');
+  const nicheText = (c.niches || []).map(n => n.name + ' | ' + n.kind + ' | ' + (n.description || '')).join('\n');
+  const input = 'background:#0f0f11;border:1px solid #2a2a2e;border-radius:7px;color:#f2f2f4;font-size:13px;padding:8px 10px;font-family:inherit';
+  const label = 'display:block;font-size:11.5px;color:#8a8a91;margin-bottom:6px';
+  const todayEp = ap.episodes.find(e => e.day === ap.today);
+  const episodes = ap.episodes.length
+    ? ap.episodes.map(episodeCardHtml).join('')
+    : '<div style="padding:28px;text-align:center;color:#8a8a91;font-size:13px;border:1px dashed #2a2a2e;border-radius:12px">No episodes yet — press "Make today\'s video now", or switch the schedule on.</div>';
+
+  return '' +
+  '<div style="padding:32px 40px 60px 40px;max-width:1280px">' + head +
+    '<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:26px">' +
+      apStatusTile('Bot (scheduler)', ap.botOnline, 'Online', 'Offline', 'Run <code>python -m renderflow.autopilot.bot</code>') +
+      apStatusTile('Telegram', k.telegram && k.telegramChat, 'Connected', k.telegram ? 'Needs chat id' : 'Not set up', k.telegram ? 'Message your bot. It replies with TELEGRAM_CHAT_ID' : 'Add TELEGRAM_BOT_TOKEN to .env') +
+      apStatusTile('YouTube upload', k.youtube, 'Connected', 'Not connected', 'Run <code>scripts/setup_youtube.py</code>') +
+      apStatusTile('AI script writer', k.llm, 'Ready', 'Missing key', 'Add ANTHROPIC_API_KEY to .env') +
+      apStatusTile('Trend sources', true, k.youtubeTrending ? 'Google + YouTube' : 'Google Trends', '', '') +
+    '</div>' +
+
+    '<div style="display:grid;grid-template-columns:1.5fr 1fr;gap:20px;align-items:start">' +
+      '<div>' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">' +
+          '<div style="font-size:14px;font-weight:600">Episodes</div>' +
+          (todayEp && ['planning', 'generating', 'uploading'].includes(todayEp.status) ? '' : apButton('Make today\'s video now', 'autopilotRunNow', null, true)) +
+        '</div>' +
+        '<div style="display:flex;flex-direction:column;gap:12px">' + episodes + '</div>' +
+      '</div>' +
+
+      '<div id="rf-ap-settings" style="background:#161618;border:1px solid #26262a;border-radius:14px;padding:22px">' +
+        '<div style="font-size:14px;font-weight:600;margin-bottom:16px">Channel settings</div>' +
+        '<label style="' + label + '">YouTube channel</label>' +
+        '<input id="rf-ap-name" value="' + esc(c.name) + '" style="' + input + ';width:100%;box-sizing:border-box;margin-bottom:14px">' +
+        '<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:14px;cursor:pointer"><input id="rf-ap-enabled" type="checkbox"' + (c.enabled ? ' checked' : '') + '> Make a video automatically every day</label>' +
+        '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px">' +
+          '<div><label style="' + label + '">Start at</label><select id="rf-ap-hour" style="' + input + ';width:100%">' + hours + '</select></div>' +
+          '<div><label style="' + label + '">Length (min)</label><input id="rf-ap-length" type="number" min="1" max="30" step="1" value="' + esc(String(c.lengthMinutes)) + '" style="' + input + ';width:100%;box-sizing:border-box"></div>' +
+          '<div><label style="' + label + '">Upload as</label><select id="rf-ap-privacy" style="' + input + ';width:100%">' + privacy + '</select></div>' +
+        '</div>' +
+        '<label style="' + label + '">Niches. One per line: name | fact or howto | description. The AI picks whichever is trending hardest today, never the same niche two days running.</label>' +
+        '<textarea id="rf-ap-niches" rows="12" wrap="off" style="' + input + ';width:100%;box-sizing:border-box;font-size:12px;line-height:1.6;resize:vertical;margin-bottom:14px;white-space:pre;overflow-x:auto">' + esc(nicheText) + '</textarea>' +
+        apButton('Save settings', 'autopilotSave', null, true) +
+        '<div style="font-size:11px;color:#5a5a60;margin-top:14px;line-height:1.5">YouTube keeps uploads <b>private</b> until Google audits your API project, whatever you choose here. Make them public in YouTube Studio. Every upload is marked as altered or synthetic content, and the description says the host is AI-generated.</div>' +
       '</div>' +
     '</div>' +
   '</div>';
@@ -1724,6 +1875,7 @@ function render() {
   if (state.screen === 'activity') main = activityScreenHtml();
   else if (state.screen === 'stack') main = stackScreenHtml();
   else if (state.screen === 'reporting') main = reportingScreenHtml();
+  else if (state.screen === 'autopilot') main = autopilotScreenHtml();
   else if (state.screen === 'detail') main = detailScreenHtml();
   else if (state.screen === 'shorts') main = shortsScreenHtml();
   else main = projectsScreenHtml();
@@ -1837,6 +1989,42 @@ const actions = {
   goActivity() { state.screen = 'activity'; render(); },
   goStack() { state.screen = 'stack'; render(); },
   goReporting() { state.screen = 'reporting'; render(); },
+  goAutopilot() { state.screen = 'autopilot'; lastAutopilotJson = ''; render(); refresh(); },
+  async autopilotRunNow() {
+    if (!confirmAction('Start today\'s video now? It scans trends, writes the script, and renders — about an hour on a PC.')) return;
+    await post('/api/autopilot/run-now');
+  },
+  async autopilotEpisode(arg) {
+    const [id, action] = String(arg).split(':');
+    const labels = { approve: 'Upload this video to YouTube?', skip: 'Skip this video? Nothing will be uploaded today.', newtopic: 'Throw this one away and make a different topic?', thumb: 'Make a new thumbnail?' };
+    if (labels[action] && !confirmAction(labels[action])) return;
+    await post('/api/autopilot/episodes/' + Number(id) + '/' + action);
+  },
+  async autopilotSave() {
+    const val = id => document.getElementById(id).value;
+    const niches = val('rf-ap-niches').split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+      const parts = line.split('|').map(x => x.trim());
+      return { name: parts[0] || '', kind: (parts[1] || 'fact').toLowerCase() === 'howto' ? 'howto' : 'fact', description: parts.slice(2).join(' | ') };
+    });
+    await post('/api/autopilot/channel', {
+      name: val('rf-ap-name'),
+      enabled: document.getElementById('rf-ap-enabled').checked,
+      runHour: Number(val('rf-ap-hour')),
+      lengthMinutes: Number(val('rf-ap-length')),
+      privacy: val('rf-ap-privacy'),
+      niches,
+    }, 'PUT');
+    if (document.activeElement) document.activeElement.blur();
+    lastAutopilotJson = '';
+    await refresh();
+  },
+  async copyEpisodeSeo(id) {
+    const ep = state.autopilot && state.autopilot.episodes.find(e => e.id === Number(id));
+    if (!ep) return;
+    const text = ep.title + '\n\n' + ep.description + '\n\nTags: ' + (ep.tags || []).join(', ');
+    try { await navigator.clipboard.writeText(text); alert('Title, description and tags copied.'); }
+    catch (err) { alert('Copy failed — select the text in the SEO box instead.'); }
+  },
   openProject(slug) { state.screen = 'detail'; state.selectedSlug = slug; state.detailTab = 'pipeline'; render(); },
   openProjectRevenue(slug) { state.screen = 'detail'; state.selectedSlug = slug; state.detailTab = 'revenue'; render(); },
   setTabPipeline() { state.detailTab = 'pipeline'; render(); },
