@@ -103,6 +103,71 @@ class Job(Base):
 
 
 # ---------------------------------------------------------------------------
+# Autopilot (renderflow/autopilot/): one YouTube channel, one video a day.
+# ---------------------------------------------------------------------------
+
+
+class AutopilotChannel(Base):
+    """Settings for the daily trend-to-YouTube loop. One row per owner (the
+    user runs a single channel covering every niche)."""
+
+    __tablename__ = "autopilot_channels"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True)
+    name: Mapped[str] = mapped_column(String(255), default="Underrated Facts")
+    enabled: Mapped[bool] = mapped_column(default=False)
+    # Local hour (0-23, the worker PC's clock) the daily episode starts.
+    run_hour: Mapped[int] = mapped_column(default=6)
+    length_minutes: Mapped[float] = mapped_column(default=10.0)
+    # YouTube privacy on upload. Unaudited API projects are forced private
+    # by YouTube regardless — see providers/publish/youtube.py.
+    privacy: Mapped[str] = mapped_column(String(16), default="private")
+    # [{"name", "kind": "fact"|"howto", "description"}] — see
+    # autopilot.core.DEFAULT_NICHES.
+    niches: Mapped[list] = mapped_column(JSON, default=list)
+    # Last time the bot daemon checked in (dashboard shows online/offline).
+    heartbeat_at: Mapped[float | None] = mapped_column(default=None)
+    created_at: Mapped[float] = mapped_column(default=time.time)
+
+
+# planning -> generating -> ready -> uploading -> uploaded
+#                                 ↘ skipped        ↘ failed (retry = approve again)
+# Any step can land on failed; "generating" is re-entered for a thumbnail redo.
+EPISODE_ACTIVE_STATUSES = ("planning", "generating", "uploading")
+
+
+class Episode(Base):
+    """One day's video: the trend it came from, its project, SEO, upload."""
+
+    __tablename__ = "autopilot_episodes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("autopilot_channels.id"), index=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), default=None)
+    day: Mapped[str] = mapped_column(String(10), index=True)  # YYYY-MM-DD, local
+    status: Mapped[str] = mapped_column(String(16), default="planning", index=True)
+    niche: Mapped[str] = mapped_column(String(255), default="")
+    kind: Mapped[str] = mapped_column(String(16), default="")  # fact|howto
+    trend: Mapped[str] = mapped_column(String(512), default="")
+    topic: Mapped[str] = mapped_column(String(512), default="")
+    angle: Mapped[str] = mapped_column(Text, default="")
+    title: Mapped[str] = mapped_column(String(512), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    tags: Mapped[list] = mapped_column(JSON, default=list)
+    # Every scored candidate from the picker — shown in the dashboard so
+    # the choice is reviewable, and used by "new topic" to try the next one.
+    candidates: Mapped[list] = mapped_column(JSON, default=list)
+    llm_cost: Mapped[float] = mapped_column(default=0.0)
+    youtube_video_id: Mapped[str | None] = mapped_column(String(32), default=None)
+    youtube_url: Mapped[str | None] = mapped_column(String(255), default=None)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[float] = mapped_column(default=time.time)
+    updated_at: Mapped[float] = mapped_column(default=time.time)
+    uploaded_at: Mapped[float | None] = mapped_column(default=None)
+
+
+# ---------------------------------------------------------------------------
 # Engine / session plumbing
 # ---------------------------------------------------------------------------
 

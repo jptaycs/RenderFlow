@@ -78,3 +78,76 @@ class LLMProvider(Protocol):
     name: str
 
     def complete(self, system: str, prompt: str, **params: Any) -> LLMResult: ...
+
+
+# ---------------------------------------------------------------------------
+# Autopilot (renderflow/autopilot/): trend discovery, publishing, messaging.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TrendItem:
+    """One trending search/video, normalized across trend sources."""
+
+    title: str
+    source: str  # e.g. "google-trends", "youtube-trending"
+    # Rough popularity signal as the source reports it ("200K+" searches,
+    # view count, ...) — for the LLM picker and the dashboard, not math.
+    traffic: str = ""
+    # Related headlines / video description snippets: context for finding
+    # an evergreen angle without the picker inventing what the trend is.
+    context: list[str] = field(default_factory=list)
+    url: str = ""
+
+
+@runtime_checkable
+class TrendProvider(Protocol):
+    name: str
+
+    def fetch(self, **params: Any) -> list[TrendItem]: ...
+
+
+@dataclass
+class PublishResult:
+    video_id: str
+    url: str
+    provider: str
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class VideoPublisher(Protocol):
+    name: str
+
+    def upload(
+        self,
+        video: Path,
+        title: str,
+        description: str,
+        tags: list[str],
+        thumbnail: Path | None = None,
+        **params: Any,
+    ) -> PublishResult: ...
+
+
+@runtime_checkable
+class Messenger(Protocol):
+    """Approval channel (Telegram today). Buttons are (label, callback_data)
+    rows; callback_data comes back verbatim when a button is tapped."""
+
+    name: str
+
+    def send_text(
+        self, text: str, buttons: list[list[tuple[str, str]]] | None = None
+    ) -> None: ...
+
+    def send_photo(
+        self,
+        photo: Path,
+        caption: str,
+        buttons: list[list[tuple[str, str]]] | None = None,
+    ) -> None: ...
+
+    def send_video(self, video: Path, caption: str) -> None: ...
+
+    def poll(self, timeout: int = 30) -> list[dict[str, Any]]: ...

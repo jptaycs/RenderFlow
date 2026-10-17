@@ -7,8 +7,11 @@ from renderflow.providers.base import (
     AvatarProvider,
     ImageProvider,
     LLMProvider,
+    Messenger,
+    TrendProvider,
     TTSProvider,
     VideoProvider,
+    VideoPublisher,
 )
 
 
@@ -87,3 +90,41 @@ def build_avatar(settings: Settings) -> AvatarProvider:
 
         return Wav2LipLocal()
     raise ValueError(f"unknown avatar provider: {settings.avatar_provider}")
+
+
+def build_trend_sources(settings: Settings) -> list[TrendProvider]:
+    """Every configured trend source that can actually run.
+
+    A source missing its key (youtube-trending without YOUTUBE_API_KEY) is
+    skipped with a log line rather than failing the daily run — Google
+    Trends alone is enough to pick a topic."""
+    import logging
+
+    sources: list[TrendProvider] = []
+    for name in [n.strip() for n in settings.trend_sources.split(",") if n.strip()]:
+        try:
+            if name == "google-trends":
+                from renderflow.providers.trends.google_trends import GoogleTrendsRSS
+
+                sources.append(GoogleTrendsRSS(geo=settings.trends_geo))
+            elif name == "youtube-trending":
+                from renderflow.providers.trends.youtube_trending import YouTubeTrending
+
+                sources.append(YouTubeTrending(region=settings.trends_geo))
+            else:
+                raise ValueError(f"unknown trend source: {name}")
+        except ValueError as exc:
+            logging.getLogger("renderflow.providers").warning("skipping trend source: %s", exc)
+    return sources
+
+
+def build_publisher(settings: Settings) -> VideoPublisher:
+    from renderflow.providers.publish.youtube import YouTubePublisher
+
+    return YouTubePublisher()
+
+
+def build_messenger(settings: Settings) -> Messenger:
+    from renderflow.providers.messaging.telegram import TelegramMessenger
+
+    return TelegramMessenger()

@@ -43,7 +43,12 @@ ERROR_TAIL_CHARS = 2000
 
 _settings = Settings.load()
 celery_app = Celery(
-    "renderflow", broker=_settings.redis_url, backend=_settings.redis_url
+    "renderflow",
+    broker=_settings.redis_url,
+    backend=_settings.redis_url,
+    # Autopilot tasks (daily trend -> video -> YouTube loop) share this
+    # worker; imported lazily by name to avoid a circular import.
+    include=["renderflow.autopilot.jobs"],
 )
 celery_app.conf.update(
     task_track_started=True,
@@ -104,6 +109,21 @@ def _log_tail(log_file: Path) -> str | None:
         return log_file.read_text(errors="replace")[-ERROR_TAIL_CHARS:]
     except OSError:
         return None
+
+
+def _notify_autopilot(job_id: int) -> None:
+    """Let the autopilot advance an episode whose render just ended. Never
+    allowed to affect the job's own outcome — it is already committed."""
+    try:
+        from renderflow.autopilot.jobs import on_pipeline_job_finished
+
+        on_pipeline_job_finished(job_id)
+    except Exception:
+        import logging
+
+        logging.getLogger("renderflow.tasks").exception(
+            "autopilot hook failed for job %s", job_id
+        )
 
 
 @celery_app.task(name="renderflow.run_pipeline")
@@ -168,6 +188,7 @@ def run_pipeline(job_id: int) -> None:
 
         session.refresh(job)  # the API may have marked it cancelled mid-run
         if job.status == "cancelled":
+            _notify_autopilot(job.id)
             return
         job.status = "succeeded" if returncode == 0 else "failed"
         if returncode != 0:
@@ -177,6 +198,7 @@ def run_pipeline(job_id: int) -> None:
             )
         job.finished_at = time.time()
         session.commit()
+        _notify_autopilot(job.id)
     except Exception as exc:  # a worker bug must never strand a job as 'running'
         session.rollback()
         job = session.get(Job, job_id)

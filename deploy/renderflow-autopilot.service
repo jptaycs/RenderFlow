@@ -1,0 +1,16 @@
+[Unit]
+Description=RenderFlow autopilot (daily trend scan + Telegram approval bot)
+After=network-online.target docker.service renderflow-worker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=renderflow
+Group=renderflow
+WorkingDirectory=/opt/renderflow
+ExecStart=/opt/renderflow/.venv/bin/python -m renderflow.autopilot.bot
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

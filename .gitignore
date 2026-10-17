@@ -23,3 +23,7 @@ music/*
 !.env.example
 !.env.*.example
 !*.env.example
+
+# YouTube OAuth refresh token (scripts/youtube_auth.py) and OAuth client JSON
+.youtube_token.json
+client_secret*.json

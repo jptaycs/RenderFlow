@@ -74,6 +74,12 @@ class Settings:
     # Stripe/Paddle plugs in later; leave unset on a deployed instance —
     # without it the endpoint returns 503 "payments not configured".
     dev_checkout: bool = False
+    # --- Autopilot (renderflow/autopilot/) ---
+    # Comma-separated trend sources for the daily topic scan, and the
+    # country they report on. youtube-trending is skipped without
+    # YOUTUBE_API_KEY.
+    trend_sources: str = "google-trends,youtube-trending"
+    trends_geo: str = "US"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -118,4 +124,8 @@ class Settings:
             intro_outro=os.getenv("RENDERFLOW_INTRO_OUTRO", "1").lower()
             in ("1", "true", "yes"),
             channel_name=os.getenv("RENDERFLOW_CHANNEL_NAME", ""),
+            trend_sources=os.getenv(
+                "RENDERFLOW_TREND_SOURCES", "google-trends,youtube-trending"
+            ),
+            trends_geo=os.getenv("RENDERFLOW_TRENDS_GEO", "US"),
         )

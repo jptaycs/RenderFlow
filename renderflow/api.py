@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 from renderflow import db
 from renderflow.auth import current_user
 from renderflow.auth import router as auth_router
+from renderflow.autopilot.api import router as autopilot_router
 from renderflow.billing import consume_credit, entitlement
 from renderflow.billing import router as billing_router
 from renderflow.config import Settings
@@ -55,6 +56,7 @@ WEB_DIR = REPO_ROOT / "web"
 app = FastAPI(title="RenderFlow")
 app.include_router(auth_router)
 app.include_router(billing_router)
+app.include_router(autopilot_router)
 
 
 def _projects_dir() -> Path:
