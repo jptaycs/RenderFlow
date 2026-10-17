@@ -183,7 +183,13 @@ class Settings:
             avatar_provider=os.getenv("RENDERFLOW_AVATAR_PROVIDER", "ffmpeg-still"),
             local_avatar_enabled=os.getenv("RENDERFLOW_LOCAL_AVATAR", "1").lower()
             in ("1", "true", "yes"),
-            llm_model=os.getenv("RENDERFLOW_LLM_MODEL", "claude-opus-4-8"),
+            # Empty = the provider's own default model.
+            llm_model=os.getenv("RENDERFLOW_LLM_MODEL")
+            or (
+                "gpt-6-sol"
+                if os.getenv("RENDERFLOW_LLM_PROVIDER", "claude") == "openai"
+                else "claude-opus-4-8"
+            ),
             tts_voice=os.getenv("RENDERFLOW_TTS_VOICE", "21m00Tcm4TlvDq8ikWAM"),
             tts_length_scale=float(os.getenv("RENDERFLOW_TTS_LENGTH_SCALE", "1.4")),
             tts_sentence_pause=float(os.getenv("RENDERFLOW_TTS_SENTENCE_PAUSE", "0.45")),

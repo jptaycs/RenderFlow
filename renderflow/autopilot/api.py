@@ -38,7 +38,9 @@ def _jobs():
 def _connections(channel_name: str) -> dict[str, bool]:
     settings = Settings.load()  # load_dotenv populates os.environ with .env values
     return {
-        "llm": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "llm": bool(
+            os.environ.get("OPENAI_API_KEY" if settings.llm_provider == "openai" else "ANTHROPIC_API_KEY")
+        ),
         "telegram": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
         "telegramChat": bool(os.environ.get("TELEGRAM_CHAT_ID")),
         "youtube": youtube_module.is_connected(channel_name, settings.separate_youtube_channels),

@@ -22,6 +22,10 @@ def build_llm(settings: Settings) -> LLMProvider:
         from renderflow.providers.llm.claude import ClaudeLLM
 
         return ClaudeLLM(model=settings.llm_model)
+    if settings.llm_provider == "openai":
+        from renderflow.providers.llm.openai_llm import OpenAILLM
+
+        return OpenAILLM(model=settings.llm_model)
     raise ValueError(f"unknown LLM provider: {settings.llm_provider}")
 
 

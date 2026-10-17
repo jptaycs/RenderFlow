@@ -1182,7 +1182,7 @@ function autopilotScreenHtml() {
       apStatusTile('Bot (scheduler)', ap.botOnline, 'Online', 'Offline', 'Run <code>python -m renderflow.autopilot.bot</code>') +
       apStatusTile('Telegram', k.telegram && k.telegramChat, 'Connected', k.telegram ? 'Needs chat id' : 'Not set up', k.telegram ? 'Message your bot. It replies with TELEGRAM_CHAT_ID' : 'Add TELEGRAM_BOT_TOKEN to .env') +
       apStatusTile('YouTube upload', k.youtube, 'Connected', 'Not connected', 'Run <code>scripts/setup_youtube.py</code>') +
-      apStatusTile('AI script writer', k.llm, 'Ready', 'Missing key', 'Add ANTHROPIC_API_KEY to .env') +
+      apStatusTile('AI script writer', k.llm, 'Ready', 'Missing key', 'Add the LLM key (OPENAI_API_KEY or ANTHROPIC_API_KEY) to .env') +
       apStatusTile('Trend sources', true, k.youtubeTrending ? 'Google + YouTube' : 'Google Trends', '', '') +
     '</div>' +
 

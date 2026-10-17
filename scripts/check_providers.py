@@ -24,7 +24,7 @@ OK = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
 
 
-def check_claude(settings: Settings) -> str:
+def check_llm(settings: Settings) -> str:
     llm = build_llm(settings)
     result = llm.complete(
         "You are a health check. Reply with exactly the word: pong",
@@ -84,13 +84,14 @@ def check_avatar(settings: Settings) -> str:
 
 
 CHECKS: dict[str, Callable[[Settings], str]] = {
-    "claude": check_claude,
+    "llm": check_llm,
+    "claude": check_llm,  # old name, kept for muscle memory
     "image": check_image,
     "tts": check_tts,
     "avatar": check_avatar,
 }
 # The avatar check spends real GPU money (~$0.09); run it only when asked.
-DEFAULT_CHECKS = ["claude", "image", "tts"]
+DEFAULT_CHECKS = ["llm", "image", "tts"]
 
 
 def main() -> int:
