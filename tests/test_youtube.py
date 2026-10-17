@@ -105,7 +105,7 @@ def test_upload_video_builds_correct_request_body(tmp_path, monkeypatch):
     from renderflow import youtube as yt
 
     fake_client = _FakeYouTubeClient({"id": "vid123"})
-    monkeypatch.setattr(yt, "_client", lambda: fake_client)
+    monkeypatch.setattr(yt, "_client", lambda token_path=None: fake_client)
 
     video_path = tmp_path / "final.mp4"
     video_path.write_bytes(b"fake video bytes")
@@ -136,7 +136,7 @@ def test_upload_video_sets_thumbnail_when_given(tmp_path, monkeypatch):
     from renderflow import youtube as yt
 
     fake_client = _FakeYouTubeClient({"id": "vid456"})
-    monkeypatch.setattr(yt, "_client", lambda: fake_client)
+    monkeypatch.setattr(yt, "_client", lambda token_path=None: fake_client)
 
     video_path = tmp_path / "final.mp4"
     video_path.write_bytes(b"fake video bytes")
@@ -165,7 +165,7 @@ def test_upload_video_survives_a_thumbnail_set_failure(tmp_path, monkeypatch):
 
     fake_client = _FakeYouTubeClient({"id": "vid456"})
     fake_client.thumbnails_resource = _FailingThumbnailsResource()
-    monkeypatch.setattr(yt, "_client", lambda: fake_client)
+    monkeypatch.setattr(yt, "_client", lambda token_path=None: fake_client)
 
     video_path = tmp_path / "final.mp4"
     video_path.write_bytes(b"fake video bytes")
@@ -183,7 +183,7 @@ def test_upload_video_skips_thumbnail_when_path_missing(tmp_path, monkeypatch):
     from renderflow import youtube as yt
 
     fake_client = _FakeYouTubeClient({"id": "vid789"})
-    monkeypatch.setattr(yt, "_client", lambda: fake_client)
+    monkeypatch.setattr(yt, "_client", lambda token_path=None: fake_client)
 
     video_path = tmp_path / "final.mp4"
     video_path.write_bytes(b"fake video bytes")
@@ -199,7 +199,7 @@ def test_upload_video_defaults_contains_synthetic_media_true(tmp_path, monkeypat
     from renderflow import youtube as yt
 
     fake_client = _FakeYouTubeClient({"id": "vid999"})
-    monkeypatch.setattr(yt, "_client", lambda: fake_client)
+    monkeypatch.setattr(yt, "_client", lambda token_path=None: fake_client)
 
     video_path = tmp_path / "final.mp4"
     video_path.write_bytes(b"fake video bytes")
@@ -225,3 +225,26 @@ def test_youtube_publish_storage_round_trip(tmp_path):
 
     reloaded = load_youtube_publish(paths)
     assert reloaded == result
+
+
+def test_resolve_token_path_per_channel(tmp_path, monkeypatch):
+    # Added 2026-10: separate YouTube channels per content channel.
+    from renderflow import youtube as yt
+
+    monkeypatch.setattr(yt, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(yt, "TOKEN_PATH", tmp_path / ".youtube_token.json")
+    separate = ("How-To Hacks",)
+
+    # Ordinary channels (and no channel) keep using the main account.
+    assert yt.resolve_token_path(None, separate) == yt.TOKEN_PATH
+    assert yt.resolve_token_path("Underrated Facts", separate) == yt.TOKEN_PATH
+    # A separate channel with no login yet resolves to nothing — never the
+    # main account.
+    assert yt.resolve_token_path("How-To Hacks", separate) is None
+    assert yt.is_connected("How-To Hacks", separate) is False
+    # Once its own login exists, that is what it uses.
+    own = yt.channel_token_path("How-To Hacks")
+    own.write_text("{}")
+    assert own.name == ".youtube_token.how-to-hacks.json"
+    assert yt.resolve_token_path("How-To Hacks", separate) == own
+    assert yt.is_connected("How-To Hacks", separate) is True

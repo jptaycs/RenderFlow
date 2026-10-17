@@ -845,6 +845,7 @@ def _branding_clips(plan: ScenePlan, paths: ProjectPaths) -> tuple[list[Path], l
             outro_png = branding.build_outro_card(
                 plan.channel_name or settings.channel_name,
                 paths.output / "outro_card.png", message=plan.outro_text,
+                cta=plan.outro_cta,
             )
             outro = _render_card_clip(
                 outro_png, outro_duration, paths.output / "outro.mp4", audio_path=outro_audio
@@ -910,6 +911,7 @@ def _shorts_outro_clip(plan: ScenePlan, paths: ProjectPaths) -> Path | None:
             plan.channel_name or settings.channel_name,
             paths.output / "outro_card.png",
             message=plan.outro_text, width=width, height=height,
+            cta=plan.outro_cta,
         )
         return _render_card_clip(
             outro_png, duration, paths.output / "outro.mp4", audio_path=outro_audio,

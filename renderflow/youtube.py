@@ -47,33 +47,69 @@ class YouTubeNotConnected(RuntimeError):
     """No valid token file — run scripts/setup_youtube.py first."""
 
 
-def is_connected() -> bool:
-    return TOKEN_PATH.exists()
+def channel_token_path(channel_name: str) -> Path:
+    """Where a content channel's *own* YouTube login is stored (added
+    2026-10, client request: a separate YouTube channel for the How-To
+    Hacks content channel). `scripts/setup_youtube.py --channel NAME`
+    writes it; `.youtube_token.json` stays the main account's."""
+    from renderflow.storage import slugify
+
+    return REPO_ROOT / f".youtube_token.{slugify(channel_name)}.json"
 
 
-def _credentials():
+def resolve_token_path(
+    channel_name: str | None = None, separate_channels: tuple[str, ...] = ()
+) -> Path | None:
+    """The token a video from `channel_name` must be uploaded with.
+
+    A channel with its own token file always uses it. A channel listed in
+    `separate_channels` (RENDERFLOW_SEPARATE_YOUTUBE_CHANNELS) but not yet
+    connected resolves to None, never to the main account — falling back
+    would publish its videos to the wrong YouTube channel. Everything else
+    uses the main `.youtube_token.json`, exactly as before.
+    """
+    if channel_name:
+        own = channel_token_path(channel_name)
+        if own.exists():
+            return own
+        if channel_name in separate_channels:
+            return None
+    return TOKEN_PATH
+
+
+def is_connected(
+    channel_name: str | None = None, separate_channels: tuple[str, ...] = ()
+) -> bool:
+    token = resolve_token_path(channel_name, separate_channels)
+    return token is not None and token.exists()
+
+
+def _credentials(token_path: Path | None = None):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
-    if not TOKEN_PATH.exists():
+    token_path = token_path or TOKEN_PATH
+    if not token_path.exists():
         raise YouTubeNotConnected(
-            "no YouTube credentials — run `python scripts/setup_youtube.py` "
-            "once (see CLAUDE.md for the one-time Google Cloud OAuth setup)"
+            f"no YouTube credentials at {token_path.name} — run "
+            "`python scripts/setup_youtube.py` once (add `--channel NAME` "
+            "for a separate channel; see CLAUDE.md for the one-time Google "
+            "Cloud OAuth setup)"
         )
-    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+    creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        TOKEN_PATH.write_text(creds.to_json())
+        token_path.write_text(creds.to_json())
     return creds
 
 
-def _client():
+def _client(token_path: Path | None = None):
     from googleapiclient.discovery import build
 
-    return build("youtube", "v3", credentials=_credentials())
+    return build("youtube", "v3", credentials=_credentials(token_path))
 
 
-def channel_title() -> str:
+def channel_title(token_path: Path | None = None) -> str:
     """The connected channel's display name — used by setup_youtube.py to
     confirm which account got authorized, and available for a dashboard
     "Connected as X" indicator later.
@@ -88,7 +124,7 @@ def channel_title() -> str:
     access than the app needs. Callers (setup_youtube.py) must treat this
     as best-effort and keep working if it raises.
     """
-    response = _client().channels().list(part="snippet", mine=True).execute()
+    response = _client(token_path).channels().list(part="snippet", mine=True).execute()
     items = response.get("items", [])
     if not items:
         raise YouTubeNotConnected(
@@ -107,6 +143,7 @@ def upload_video(
     made_for_kids: bool = False,
     thumbnail_path: Path | None = None,
     category_id: str = DEFAULT_CATEGORY_ID,
+    token_path: Path | None = None,
 ) -> dict[str, Any]:
     """Upload video_path, optionally set a custom thumbnail, return
     {"video_id": ..., "url": "https://youtu.be/..."}.
@@ -119,7 +156,7 @@ def upload_video(
     """
     from googleapiclient.http import MediaFileUpload
 
-    youtube = _client()
+    youtube = _client(token_path)
     body = {
         "snippet": {
             "title": title,

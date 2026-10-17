@@ -180,6 +180,13 @@ class ScenePlan(BaseModel):
     # global default happens to be at that later time.
     channel_name: str | None = None
     tts_voice: str | None = None
+    # Per-project closing line (added 2026-10, client request: a how-to
+    # channel whose Shorts end on "subscribe for Part 2"). When set, it is
+    # narrated verbatim as the outro and shown as the end card's accent
+    # line, replacing the default "subscribe for more trivia" close and the
+    # LLM engagement question. None = the default outro, as before. Set
+    # once at creation (make_video.py's --outro-cta), same as channel_name.
+    outro_cta: str | None = None
 
     def total_asset_cost(self) -> float:
         total = 0.0

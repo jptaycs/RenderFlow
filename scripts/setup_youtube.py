@@ -13,6 +13,15 @@ Opens your browser to Google's consent screen once; sign in and approve
 as the Google account whose YouTube channel you want RenderFlow to
 publish to. Saves a refresh token to .youtube_token.json — every future
 upload reuses it silently, no repeated consent needed.
+
+    .venv/bin/python scripts/setup_youtube.py --channel "How-To Hacks"
+
+connects a *separate* YouTube channel for one content channel instead
+(added 2026-10), saved to .youtube_token.<channel-slug>.json. On Google's
+account chooser, pick that YouTube channel (a Brand Account shows up as
+its own entry under your Google account). Also list the channel name in
+RENDERFLOW_SEPARATE_YOUTUBE_CHANNELS so it never falls back to the main
+account while disconnected.
 """
 
 from __future__ import annotations
@@ -31,10 +40,27 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
-from renderflow.youtube import CLIENT_SECRET_PATH, SCOPES, TOKEN_PATH, channel_title
+import argparse
+
+from renderflow.youtube import (
+    CLIENT_SECRET_PATH,
+    SCOPES,
+    TOKEN_PATH,
+    channel_title,
+    channel_token_path,
+)
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="One-time YouTube OAuth setup")
+    parser.add_argument(
+        "--channel",
+        help="content channel name to connect a separate YouTube channel for "
+        "(default: the main account, .youtube_token.json)",
+    )
+    args = parser.parse_args()
+    token_path = channel_token_path(args.channel) if args.channel else TOKEN_PATH
+
     if not CLIENT_SECRET_PATH.exists():
         print(
             f"missing {CLIENT_SECRET_PATH} — create an OAuth 2.0 Client ID "
@@ -48,8 +74,8 @@ def main() -> int:
 
     flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET_PATH), SCOPES)
     creds = flow.run_local_server(port=0)
-    TOKEN_PATH.write_text(creds.to_json())
-    print(f"Saved {TOKEN_PATH}")
+    token_path.write_text(creds.to_json())
+    print(f"Saved {token_path}")
     # Best-effort only: channels.list needs a broader scope (youtube.readonly
     # or full youtube) than the youtube.upload scope this app actually
     # requests — SCOPES is intentionally kept to the minimum videos.insert/
@@ -57,7 +83,7 @@ def main() -> int:
     # authentication scopes" right after a real, successful token save, so
     # don't let it make the whole setup look like it failed.
     try:
-        print(f"Connected as: {channel_title()}")
+        print(f"Connected as: {channel_title(token_path)}")
     except Exception as exc:
         print(
             "(Could not confirm the channel name — this doesn't affect "

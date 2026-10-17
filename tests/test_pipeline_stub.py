@@ -296,6 +296,20 @@ def test_generate_branding_audio_outro_mentions_channel_name(paths: ProjectPaths
     assert "Cool Facts Daily" in tts.calls[1][0]
 
 
+def test_generate_branding_audio_uses_project_outro_cta(paths: ProjectPaths):
+    # Added 2026-10: a per-project closing line replaces the default
+    # subscribe-for-trivia outro, verbatim, and skips the LLM question.
+    plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
+    plan.outro_cta = "Subscribe to How-To Hacks so you don't miss Part 2!"
+    save_plan(plan, paths)
+    tts = _TrackingTTS()
+
+    generate_branding_audio(plan, tts, "voice-id", "How-To Hacks", paths, llm=StubLLM())
+
+    assert tts.calls[1][0] == plan.outro_cta
+    assert load_plan(paths).outro_text == plan.outro_cta
+
+
 def test_generate_branding_audio_failure_is_optional(paths: ProjectPaths):
     plan, _ = generate_script(StubLLM(), "test topic", 1, "documentary")
     save_plan(plan, paths)

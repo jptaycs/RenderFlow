@@ -115,7 +115,9 @@ def build_intro_card(title: str, channel_name: str, out: Path) -> Path:
 CTA_LINE = "Let us know in the comments!"
 
 
-def outro_lines(message: str | None) -> list[tuple[str, int, tuple]]:
+def outro_lines(
+    message: str | None, cta: str | None = None
+) -> list[tuple[str, int, tuple]]:
     """Pick the two headline lines for the outro card from the full
     narrated outro sentence (assets._outro_line).
 
@@ -135,7 +137,17 @@ def outro_lines(message: str | None) -> list[tuple[str, int, tuple]]:
     for watching" / "Subscribe for more trivia" copy whenever there's no
     real question (LLM unset/failed, or an old project predating this
     feature).
+
+    `cta` (added 2026-10) is the project's own closing line
+    (`ScenePlan.outro_cta`, e.g. "Subscribe so you don't miss Part 2!"):
+    when set it replaces the generic "Subscribe for more trivia" accent
+    line, since that is exactly what was narrated.
     """
+    if cta:
+        return [
+            ("Thanks for watching", TITLE_SIZE, TEXT),
+            (cta, SUBTITLE_SIZE, ACCENT),
+        ]
     if message and CTA_LINE in message:
         headline = message.split(CTA_LINE, 1)[0].strip()
         return [
@@ -150,7 +162,7 @@ def outro_lines(message: str | None) -> list[tuple[str, int, tuple]]:
 
 def build_outro_card(
     channel_name: str, out: Path, message: str | None = None,
-    width: int = WIDTH, height: int = HEIGHT,
+    width: int = WIDTH, height: int = HEIGHT, cta: str | None = None,
 ) -> Path:
     """`message` (added 2026-09, client request: "leave the viewer a
     message") is the actual outro line generate_branding_audio narrated
@@ -167,7 +179,7 @@ def build_outro_card(
     same card for Shorts, which have no landscape intro/outro cards at
     all in v1 scope but still get a closing message card of their own.
     """
-    lines = outro_lines(message)
+    lines = outro_lines(message, cta)
     if channel_name:
         lines.append((channel_name.upper(), SUBTITLE_SIZE, MUTED))
     return _card(lines, out, width, height)

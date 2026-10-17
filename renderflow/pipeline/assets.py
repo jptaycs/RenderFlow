@@ -379,7 +379,12 @@ def generate_branding_audio(
     # would desync the caption/card text from what's actually spoken).
     if not _skip(plan.outro_audio):
         outro_text = _outro_line(channel_name)
-        if llm is not None:
+        if plan.outro_cta:
+            # A channel-specific closing line wins outright — no LLM
+            # question in front of it, so "Subscribe for Part 2" stays the
+            # last thing the viewer hears.
+            outro_text = plan.outro_cta
+        elif llm is not None:
             try:
                 question, _ = generate_engagement_question(llm, plan)
                 outro_text = _outro_line(channel_name, question)
@@ -496,7 +501,7 @@ def generate_motion_graphics_cards(
             (WIDTH, HEIGHT), _duration_for(plan.intro_audio, INTRO_SEC),
         )
 
-    outro_headline = branding.outro_lines(plan.outro_text)
+    outro_headline = branding.outro_lines(plan.outro_text, plan.outro_cta)
     outro_title = outro_headline[0][0]
     outro_subtitle = outro_headline[1][0] if len(outro_headline) > 1 else ""
     _render(

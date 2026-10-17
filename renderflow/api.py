@@ -449,7 +449,9 @@ def _project_view(
         ),
         # final_ready gates the button client-side; youtube.is_connected()
         # is cheap (a file-exists check) so it's fine to call on every poll.
-        "youtubeConnected": youtube_module.is_connected(),
+        "youtubeConnected": youtube_module.is_connected(
+            channel_name, settings.separate_youtube_channels
+        ),
     }
 
 
@@ -768,6 +770,9 @@ class NewProject(BaseModel):
     # one-off CLI value.
     channelName: str | None = None
     ttsVoice: str | None = None
+    # Per-project closing line (ScenePlan.outro_cta), e.g. "Subscribe so
+    # you don't miss Part 2!". Empty/omitted = the default outro.
+    outroCta: str | None = None
 
 
 @app.post("/api/projects", status_code=201)
@@ -866,10 +871,24 @@ def create_project(
         create_args += ["--channel-name", body.channelName.strip()]
     if (body.ttsVoice or "").strip():
         create_args += ["--tts-voice", body.ttsVoice.strip()]
+    if (body.outroCta or "").strip():
+        create_args += ["--outro-cta", " ".join(body.outroCta.split())]
     if body.format != "shorts":
         create_args.append("--skip-render")
     _enqueue(session, project, "create", create_args)
     return {"slug": slug}
+
+
+def _resolved_channel_name(paths: ProjectPaths, settings: Settings) -> str | None:
+    """The project's content channel (its own override, else the global
+    default) — decides which YouTube account it publishes to."""
+    plan_channel = None
+    if paths.scenes_json.exists():
+        try:
+            plan_channel = load_plan(paths).channel_name
+        except (ValueError, OSError):
+            pass
+    return plan_channel or settings.channel_name or None
 
 
 def _owned_project(session: Session, user: User, slug: str) -> Project:
@@ -933,9 +952,74 @@ def resume_project(
     project = _owned_project(session, user, slug)
     if _active_job(session, project):
         raise HTTPException(409, "run already in progress")
-    paths = _project_paths(project)
-    _enqueue(session, project, "resume", ["--scenes-file", str(paths.scenes_json)])
+    resume = _resume_job(session, project)
+    if resume is None:
+        raise HTTPException(409, "nothing to resume — the project was never started")
+    _enqueue(session, project, *resume)
     return {"slug": slug}
+
+
+def _resume_job(session: Session, project: Project) -> tuple[str, list[str]] | None:
+    """(kind, argv) that picks a stopped project back up, or None.
+
+    A project with a scenes.json resumes from it. One without (its create
+    job died before writing it, e.g. an api restart while it sat queued)
+    has nothing to resume from, so its last create job is re-run as-is:
+    source.txt/topic are still on disk and the plan is built fresh."""
+    paths = _project_paths(project)
+    if paths.scenes_json.exists():
+        return "resume", ["--scenes-file", str(paths.scenes_json)]
+    create = (
+        session.query(Job)
+        .filter(Job.project_id == project.id, Job.kind == "create")
+        .order_by(Job.created_at.desc())
+        .first()
+    )
+    if create is None:
+        return None
+    return "create", list(create.argv)
+
+
+RESUMABLE_STATUSES = {"Failed", "Paused", "Draft"}
+
+
+class ResumeAll(BaseModel):
+    # The slugs the dashboard is showing (tab + channel scoped); None = all.
+    slugs: list[str] | None = None
+
+
+@app.post("/api/projects/resume-all")
+def resume_all_projects(
+    body: ResumeAll,
+    user: User = Depends(current_user),
+    session: Session = Depends(get_db),
+) -> dict[str, list[str]]:
+    """Resume every stopped (Failed/Paused/Draft) project at once. The eager
+    worker and the real Celery worker both run jobs one at a time, so this
+    queues them rather than starting them all together."""
+    query = session.query(Project).filter(Project.owner_id == user.id)
+    if body.slugs is not None:
+        query = query.filter(Project.slug.in_(body.slugs))
+    resumed: list[str] = []
+    for project in query.order_by(Project.created_at).all():
+        if _active_job(session, project):
+            continue
+        paths = _project_paths(project)
+        if paths.scenes_json.exists():
+            try:
+                status = _project_view(project, load_plan(paths), paths, None)["status"]
+            except (ValueError, OSError):
+                continue
+        else:
+            status = _placeholder_view(session, project)["status"]
+        if status not in RESUMABLE_STATUSES:
+            continue
+        resume = _resume_job(session, project)
+        if resume is None:
+            continue
+        _enqueue(session, project, *resume)
+        resumed.append(project.slug)
+    return {"resumed": resumed}
 
 
 class PerformanceUpdate(BaseModel):
@@ -1085,18 +1169,23 @@ def publish_to_youtube(
     Requires the one-time OAuth setup (scripts/setup_youtube.py) — 503s
     rather than queueing a job that can only fail immediately.
     """
-    if not youtube_module.is_connected():
-        raise HTTPException(
-            503,
-            "YouTube isn't connected yet — run scripts/setup_youtube.py "
-            "once (see CLAUDE.md)",
-        )
     if body.privacyStatus not in ("public", "unlisted", "private"):
         raise HTTPException(422, "privacyStatus must be public, unlisted, or private")
     project = _owned_project(session, user, slug)
     if _active_job(session, project):
         raise HTTPException(409, "run already in progress")
     paths = _project_paths(project)
+    settings = Settings.load()
+    channel_name = _resolved_channel_name(paths, settings)
+    if not youtube_module.is_connected(channel_name, settings.separate_youtube_channels):
+        raise HTTPException(
+            503,
+            f"YouTube isn't connected for {channel_name!r} yet — run "
+            f"scripts/setup_youtube.py --channel {channel_name!r} once (see CLAUDE.md)"
+            if channel_name in settings.separate_youtube_channels
+            else "YouTube isn't connected yet — run scripts/setup_youtube.py "
+            "once (see CLAUDE.md)",
+        )
     if not (paths.output / "final.mp4").exists():
         raise HTTPException(422, "render the video before publishing")
     title = " ".join(body.title.split())
@@ -1111,6 +1200,8 @@ def publish_to_youtube(
     ]
     if not body.containsSyntheticMedia:
         argv.append("--no-synthetic-disclosure")
+    if channel_name:
+        argv += ["--channel-name", channel_name]
     _enqueue(session, project, "youtube_publish", argv)
     return {"slug": slug}
 
@@ -1355,10 +1446,6 @@ def _run_auto_publish_batch(session: Session, settings: Settings) -> list[str]:
     in this pipeline; one project's problem must not stop the rest of
     the batch from publishing.
     """
-    if not youtube_module.is_connected():
-        log.warning("auto-publish: YouTube isn't connected, skipping this run")
-        return []
-
     candidates: list[tuple[float, Project, ScenePlan, ProjectPaths]] = []
     for project in session.query(Project).all():
         try:
@@ -1368,6 +1455,11 @@ def _run_auto_publish_batch(session: Session, settings: Settings) -> list[str]:
             if not paths.scenes_json.exists():
                 continue
             plan = load_plan(paths)
+            if not youtube_module.is_connected(
+                plan.channel_name or settings.channel_name or None,
+                settings.separate_youtube_channels,
+            ):
+                continue  # its YouTube account isn't connected (see resolve_token_path)
             view = _project_view(project, plan, paths, None)
             if view["status"] != "Complete":
                 continue
@@ -1378,15 +1470,40 @@ def _run_auto_publish_batch(session: Session, settings: Settings) -> list[str]:
         except (ValueError, json.JSONDecodeError, OSError):
             log.warning("auto-publish: skipping project %s, could not evaluate it", project.slug, exc_info=True)
 
-    candidates.sort(key=lambda c: c[0])  # oldest-finished-first
+    if not candidates:
+        log.warning("auto-publish: nothing publishable (none Complete+unpublished, or YouTube not connected)")
+        return []
+    # Oldest-finished-first *within* each YouTube account, then taken in
+    # turn across accounts (added 2026-10 with separate per-channel
+    # accounts): the daily cap stays one shared number — the Data API
+    # upload quota belongs to the one Google Cloud project, not to each
+    # channel — and a new channel shouldn't wait behind another channel's
+    # whole backlog for its first slot.
+    candidates.sort(key=lambda c: c[0])
+    by_account: dict[str, list[tuple[float, Project, ScenePlan, ProjectPaths]]] = {}
+    for cand in candidates:
+        token = youtube_module.resolve_token_path(
+            cand[2].channel_name or settings.channel_name or None,
+            settings.separate_youtube_channels,
+        )
+        by_account.setdefault(str(token), []).append(cand)
+    ordered: list[tuple[float, Project, ScenePlan, ProjectPaths]] = []
+    queues = list(by_account.values())
+    while any(queues):
+        for q in queues:
+            if q:
+                ordered.append(q.pop(0))
     queued: list[str] = []
-    for _mtime, project, plan, paths in candidates[: settings.auto_publish_max_per_day]:
+    for _mtime, project, plan, paths in ordered[: settings.auto_publish_max_per_day]:
         argv = [
             "--title", plan.title,
             "--description", "",
             "--tags", "",
             "--privacy", "public",
         ]
+        channel_name = plan.channel_name or settings.channel_name or None
+        if channel_name:
+            argv += ["--channel-name", channel_name]
         _enqueue(session, project, "youtube_publish", argv)
         queued.append(project.slug)
         log.info("auto-publish: queued %s for YouTube upload", project.slug)

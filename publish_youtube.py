@@ -29,9 +29,10 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+from renderflow.config import Settings
 from renderflow.schema import YouTubePublish
 from renderflow.storage import ProjectPaths, save_youtube_publish
-from renderflow.youtube import upload_video
+from renderflow.youtube import resolve_token_path, upload_video
 
 
 def main() -> int:
@@ -53,7 +54,23 @@ def main() -> int:
         help="omit status.containsSyntheticMedia — only for content that "
         "genuinely isn't AI-altered/generated",
     )
+    parser.add_argument(
+        "--channel-name",
+        help="the project's content channel — picks which YouTube account "
+        "uploads it (see youtube.resolve_token_path); omitted = main account",
+    )
     args = parser.parse_args()
+
+    token_path = resolve_token_path(
+        args.channel_name, Settings.load().separate_youtube_channels
+    )
+    if token_path is None:
+        print(
+            f"{args.channel_name!r} publishes to its own YouTube channel, which "
+            "isn't connected yet — run `python scripts/setup_youtube.py "
+            f"--channel {args.channel_name!r}` once"
+        )
+        return 1
 
     paths = ProjectPaths.create(args.projects_dir, args.slug)
     video_path = paths.output / "final.mp4"
@@ -73,6 +90,7 @@ def main() -> int:
         privacy_status=args.privacy,
         contains_synthetic_media=contains_synthetic_media,
         thumbnail_path=thumb_path if thumb_path.exists() else None,
+        token_path=token_path,
     )
 
     save_youtube_publish(

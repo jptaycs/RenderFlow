@@ -294,6 +294,11 @@ const state = {
   // submitNewVideo/api.py::NewProject).
   newChannelName: '',
   newTtsVoice: '',
+  // Optional closing line (added 2026-10, ScenePlan.outro_cta) — narrated
+  // and shown on the end card instead of the default subscribe line.
+  // Reset on every New Video/Short, since it usually differs per video
+  // (a Part 1 says "subscribe for Part 2", its Part 2 doesn't).
+  newOutroCta: '',
   busy: false,
   // True only while the "🎲 Random topic" button's Claude call is in
   // flight — separate from state.busy so it doesn't gray out the rest of
@@ -752,6 +757,9 @@ function sidebarHtml() {
 // preview so a vertical thumbnail doesn't look squashed), screenKey
 // ('projects' | 'shorts' — which of state.{screenKey}Sort/Filter this grid
 // reads/writes, added so the two tabs keep independent sort/filter state).
+const RESUMABLE_STATUSES = ['Failed', 'Paused', 'Draft'];
+const resumableSlugs = { projects: [], shorts: [] };
+
 function projectsGridHtml(allProjects, opts) {
   const sortKey = state[opts.screenKey + 'Sort'] || 'newest';
   const filterKey = state[opts.screenKey + 'Filter'] || 'All';
@@ -778,6 +786,14 @@ function projectsGridHtml(allProjects, opts) {
     (active ? '#2a2a2e' : 'transparent') + ';color:' + (active ? '#f2f2f4' : '#8a8a91') + ';border:1px solid ' + (active ? '#3a3a3f' : '#26262a') + '">' + esc(label) + '</div>';
 
   const publishedCount = allProjects.filter(p => !!p.youtube).length;
+  // Resume all: every stopped project this tab is showing (channel-scoped
+  // like the grid). Remembered for the click handler, which has no grid.
+  const resumable = allProjects.filter(p => !p.running && RESUMABLE_STATUSES.includes(p.status));
+  resumableSlugs[opts.screenKey] = resumable.map(p => p.slug);
+  const resumeAllBtn = resumable.length === 0 ? '' :
+    '<div data-act="resumeAll" data-arg="' + opts.screenKey + '" title="Queue every failed, paused or draft project here — they run one at a time" style="background:#232327;color:#f2f2f4;border:1px solid #3a3a3f;font-weight:600;font-size:13.5px;padding:10px 18px;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:7px">' +
+      '<span style="font-size:14px;line-height:1">↻</span><span>Resume all (' + resumable.length + ')</span>' +
+    '</div>';
   const toolbar = allProjects.length === 0 ? '' : (
     '<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px;flex-wrap:wrap">' +
       '<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">' +
@@ -858,9 +874,11 @@ function projectsGridHtml(allProjects, opts) {
         '<div style="font-size:22px;font-weight:600;letter-spacing:-0.01em">' + opts.headerTitle + '</div>' +
         '<div style="font-size:13px;color:#8a8a91;margin-top:4px">' + opts.headerSubtitle + '</div>' +
       '</div>' +
+      '<div style="display:flex;align-items:center;gap:10px">' + resumeAllBtn +
       '<div data-act="openModal" data-arg="' + opts.newFormat + '" style="background:#FF0000;color:#ffffff;font-weight:600;font-size:13.5px;padding:10px 18px;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:7px">' +
         '<span style="font-size:15px;line-height:1">+</span>' +
         '<span>' + opts.newLabel + '</span>' +
+      '</div>' +
       '</div>' +
     '</div>' + toolbar + body +
   '</div>';
@@ -1589,7 +1607,11 @@ function modalHtml() {
           '<input id="rf-tts-voice" value="' + esc(state.newTtsVoice) + '" placeholder="Uses your default voice" style="width:100%;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:8px;padding:10px 12px;color:#f2f2f4;font-size:13px;font-family:\'Inter\',sans-serif">' +
         '</div>' +
       '</div>' +
-      '<div style="font-size:11.5px;color:#5a5a60;line-height:1.4;margin-bottom:22px">Running a second content channel? Set a distinct name/voice here just for this video — leave blank to use your usual one. Sticks for the rest of this session so you don\'t have to retype it each time.</div>' +
+      '<div style="font-size:11.5px;color:#5a5a60;line-height:1.4;margin-bottom:14px">Running a second content channel? Set a distinct name/voice here just for this video — leave blank to use your usual one. Sticks for the rest of this session so you don\'t have to retype it each time.</div>' +
+      '<div style="margin-bottom:22px">' +
+        '<div style="font-size:12px;color:#9a9aa1;margin-bottom:6px">Closing line (optional)</div>' +
+        '<input id="rf-outro-cta" value="' + esc(state.newOutroCta) + '" placeholder="e.g. Subscribe so you don\'t miss Part 2!" style="width:100%;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:8px;padding:10px 12px;color:#f2f2f4;font-size:13px;font-family:\'Inter\',sans-serif">' +
+      '</div>' +
       '<div style="display:flex;gap:10px;justify-content:flex-end">' +
         '<div data-act="closeModal" style="padding:9px 16px;border-radius:8px;font-size:13px;color:#c8c8cc;cursor:pointer">Cancel</div>' +
         '<div data-act="submitNewVideo" id="rf-submit" style="' + submitStyle + '">' + (state.busy ? 'Starting…' : 'Start generating') + '</div>' +
@@ -1753,6 +1775,8 @@ function render() {
   if (channelName) channelName.addEventListener('input', () => { state.newChannelName = channelName.value; });
   const ttsVoice = document.getElementById('rf-tts-voice');
   if (ttsVoice) ttsVoice.addEventListener('input', () => { state.newTtsVoice = ttsVoice.value; });
+  const outroCta = document.getElementById('rf-outro-cta');
+  if (outroCta) outroCta.addEventListener('input', () => { state.newOutroCta = outroCta.value; });
 
   const ytTitle = document.getElementById('rf-yt-title');
   const ytSyncSubmit = () => {
@@ -1855,7 +1879,7 @@ const actions = {
       state.newChannelName = '';
       state.newTtsVoice = '';
     }
-    state.modalOpen = true; state.newTitle = ''; state.newScript = ''; state.newTopic = ''; state.newLength = 10; state.newFormat = format === 'shorts' ? 'shorts' : 'landscape'; state.newGenMode = 'script'; state.newTopicBase = null; state.randomTopicLoading = false; state.randomTopicScriptPending = false; state.topicScriptLoading = false; suggestedTopicTitles = []; clickbaitIndex = 0; render(); const t = document.getElementById('rf-title'); if (t) t.focus();
+    state.modalOpen = true; state.newTitle = ''; state.newScript = ''; state.newOutroCta = ''; state.newTopic = ''; state.newLength = 10; state.newFormat = format === 'shorts' ? 'shorts' : 'landscape'; state.newGenMode = 'script'; state.newTopicBase = null; state.randomTopicLoading = false; state.randomTopicScriptPending = false; state.topicScriptLoading = false; suggestedTopicTitles = []; clickbaitIndex = 0; render(); const t = document.getElementById('rf-title'); if (t) t.focus();
   },
   setGenMode(mode) { state.newGenMode = mode; state.randomTopicScriptPending = false; render(); },
   openYoutubeModal(slug) {
@@ -2027,6 +2051,7 @@ const actions = {
     const overrides = {};
     if (state.newChannelName.trim()) overrides.channelName = state.newChannelName.trim();
     if (state.newTtsVoice.trim()) overrides.ttsVoice = state.newTtsVoice.trim();
+    if (state.newOutroCta.trim()) overrides.outroCta = state.newOutroCta.trim();
     if (isTopic) {
       post('/api/projects', { title, topic: body, lengthMinutes: state.newLength, style: state.newStyle, format: state.newFormat, ...overrides });
     } else {
@@ -2034,6 +2059,12 @@ const actions = {
     }
   },
   resumeProject(slug) { post('/api/projects/' + encodeURIComponent(slug) + '/resume'); },
+  resumeAll(screenKey) {
+    const slugs = resumableSlugs[screenKey] || [];
+    if (!slugs.length) return;
+    if (!confirm('Resume ' + slugs.length + ' stopped project' + (slugs.length === 1 ? '' : 's') + '? They queue up and run one at a time.')) return;
+    post('/api/projects/resume-all', { slugs });
+  },
   cancelProject(slug) {
     const p = findProject(slug);
     if (!confirm('Cancel the run for "' + ((p && p.title) || slug) + '"? Finished scenes are kept — you can resume later.')) return;

@@ -197,6 +197,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--outro-cta",
+        help=(
+            "per-project closing line, narrated verbatim as the outro and "
+            "shown on the end card instead of the default 'subscribe for "
+            "more trivia' close — persisted on the plan, same as --channel-name"
+        ),
+    )
+    parser.add_argument(
         "--llm-split",
         action="store_true",
         help="use the configured LLM to split --script-file instead of the free local splitter",
@@ -288,6 +296,8 @@ def main() -> int:
         plan.channel_name = args.channel_name
     if args.tts_voice:
         plan.tts_voice = args.tts_voice
+    if args.outro_cta:
+        plan.outro_cta = args.outro_cta
     if args.format:
         plan.format = args.format
     # Shorts v1 scope skips cards and the AI clickbait thumbnail entirely

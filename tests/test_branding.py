@@ -45,3 +45,14 @@ def test_outro_lines_none_message_uses_the_same_plain_fallback():
     assert outro_lines(None) == outro_lines(
         "Thanks for watching! Please subscribe for more trivia like this."
     )
+
+
+def test_outro_lines_project_cta_replaces_the_trivia_line():
+    # Added 2026-10: ScenePlan.outro_cta (e.g. a how-to channel's "Part 2"
+    # hook) is what was narrated, so the card must show it, not the
+    # generic trivia subscribe copy.
+    cta = "Subscribe so you don't miss Part 2!"
+    texts = [text for text, _, _ in outro_lines(cta, cta)]
+
+    assert cta in texts
+    assert not any("trivia" in t.lower() for t in texts)

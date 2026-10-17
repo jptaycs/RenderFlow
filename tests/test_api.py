@@ -568,6 +568,27 @@ def test_create_project_passes_channel_name_and_tts_voice_overrides(client, pipe
         assert job.argv[job.argv.index("--tts-voice") + 1] == "some-other-voice-id"
 
 
+def test_create_project_passes_outro_cta(client, pipeline_stub, saas_env):
+    # Added 2026-10: per-project closing line (ScenePlan.outro_cta).
+    register(client, "admin@example.com")
+    res = client.post(
+        "/api/projects",
+        json={
+            "title": "Unclog A Drain Part 1",
+            "script": "Here is how.",
+            "format": "shorts",
+            "outroCta": "  Subscribe so you   don't miss Part 2! ",
+        },
+    )
+    assert res.status_code == 201, res.text
+
+    from renderflow import db as rdb
+
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).one()
+        assert job.argv[job.argv.index("--outro-cta") + 1] == "Subscribe so you don't miss Part 2!"
+
+
 def test_create_project_omits_channel_overrides_when_not_given(client, pipeline_stub, saas_env):
     # The common case (no override) must not send empty/blank flags that
     # make_video.py would otherwise have to specially ignore.
@@ -1081,7 +1102,7 @@ def test_publish_youtube_requires_connection(client, saas_env, monkeypatch):
 
     from renderflow import api
 
-    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: False)
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda *a, **k: False)
     res = client.post(
         f"/api/projects/{slug}/youtube/publish", json={"title": "A Video"}
     )
@@ -1103,7 +1124,7 @@ def test_publish_youtube_requires_rendered_video(client, saas_env, monkeypatch):
         job.status = "succeeded"
         session.commit()
 
-    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda *a, **k: True)
     res = client.post(
         f"/api/projects/{slug}/youtube/publish", json={"title": "A Video"}
     )
@@ -1118,7 +1139,7 @@ def test_publish_youtube_rejects_invalid_privacy(client, saas_env, monkeypatch):
 
     from renderflow import api
 
-    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda *a, **k: True)
     res = client.post(
         f"/api/projects/{slug}/youtube/publish",
         json={"title": "A Video", "privacyStatus": "extremely-public"},
@@ -1134,7 +1155,7 @@ def test_publish_youtube_enqueues_job(client, pipeline_stub, saas_env, monkeypat
     from renderflow import api
     from renderflow import db as rdb
 
-    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda *a, **k: True)
     res = client.post(
         f"/api/projects/{slug}/youtube/publish",
         json={
@@ -1222,7 +1243,7 @@ def test_auto_publish_batch_queues_complete_unpublished_oldest_first(
     os.utime(paths_old.output / "final.mp4", (old_time, old_time))
     os.utime(paths_old.scenes_json, (old_time - 100, old_time - 100))
 
-    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda *a, **k: True)
     settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=5)
 
     with rdb.new_session() as session:
@@ -1248,7 +1269,7 @@ def test_auto_publish_batch_respects_the_daily_cap(client, pipeline_stub, saas_e
         _finish_project_as_complete(saas_env, slug, title=f"Video {i}")
         slugs.append(slug)
 
-    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda *a, **k: True)
     settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=1)
 
     with rdb.new_session() as session:
@@ -1278,7 +1299,7 @@ def test_auto_publish_batch_skips_already_published_projects(client, pipeline_st
         paths,
     )
 
-    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda *a, **k: True)
     settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=5)
 
     with rdb.new_session() as session:
@@ -1287,6 +1308,59 @@ def test_auto_publish_batch_skips_already_published_projects(client, pipeline_st
     assert queued == []
     with rdb.new_session() as session:
         assert session.query(rdb.Job).filter(rdb.Job.kind == "youtube_publish").count() == 0
+
+
+def _separate_channel_env(saas_env, monkeypatch, tmp_path, own_token: bool):
+    """Main account connected; "How-To Hacks" is a separate YouTube
+    channel, connected only when `own_token`."""
+    import dataclasses
+
+    from renderflow import youtube as yt
+
+    monkeypatch.setattr(yt, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(yt, "TOKEN_PATH", tmp_path / ".youtube_token.json")
+    yt.TOKEN_PATH.write_text("{}")
+    if own_token:
+        yt.channel_token_path("How-To Hacks").write_text("{}")
+    return dataclasses.replace(
+        saas_env.settings, auto_publish_max_per_day=5,
+        channel_name="How-To Hacks", separate_youtube_channels=("How-To Hacks",),
+    )
+
+
+def test_auto_publish_never_sends_a_separate_channel_to_the_main_account(
+    client, pipeline_stub, saas_env, monkeypatch, tmp_path
+):
+    # Added 2026-10: a channel in RENDERFLOW_SEPARATE_YOUTUBE_CHANNELS with
+    # no login of its own must be skipped, not uploaded with the main token.
+    from renderflow import api
+    from renderflow import db as rdb
+
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+    _finish_project_as_complete(saas_env, slug)
+    settings = _separate_channel_env(saas_env, monkeypatch, tmp_path, own_token=False)
+
+    with rdb.new_session() as session:
+        assert api._run_auto_publish_batch(session, settings) == []
+
+
+def test_auto_publish_uses_a_separate_channels_own_login(
+    client, pipeline_stub, saas_env, monkeypatch, tmp_path
+):
+    from renderflow import api
+    from renderflow import db as rdb
+
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+    _finish_project_as_complete(saas_env, slug)
+    settings = _separate_channel_env(saas_env, monkeypatch, tmp_path, own_token=True)
+
+    with rdb.new_session() as session:
+        assert api._run_auto_publish_batch(session, settings) == [slug]
+    with rdb.new_session() as session:
+        job = session.query(rdb.Job).filter(rdb.Job.kind == "youtube_publish").one()
+        assert job.argv[job.argv.index("--channel-name") + 1] == "How-To Hacks"
 
 
 def test_auto_publish_batch_skips_projects_with_an_active_job(client, pipeline_stub, saas_env, monkeypatch):
@@ -1306,7 +1380,7 @@ def test_auto_publish_batch_skips_projects_with_an_active_job(client, pipeline_s
         session.add(rdb.Job(project_id=project.id, kind="regenerate", argv=[], status="running"))
         session.commit()
 
-    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: True)
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda *a, **k: True)
     settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=5)
 
     with rdb.new_session() as session:
@@ -1327,7 +1401,7 @@ def test_auto_publish_batch_does_nothing_when_youtube_not_connected(
     slug = _create_project(client)
     _finish_project_as_complete(saas_env, slug)
 
-    monkeypatch.setattr(api.youtube_module, "is_connected", lambda: False)
+    monkeypatch.setattr(api.youtube_module, "is_connected", lambda *a, **k: False)
     settings = dataclasses.replace(saas_env.settings, auto_publish_max_per_day=5)
 
     with rdb.new_session() as session:
@@ -1501,3 +1575,65 @@ def test_recover_orphaned_jobs_eager_never_marks_youtube_publish_succeeded(saas_
 
     with rdb.new_session() as session:
         assert session.get(rdb.Job, job_id).status == "failed"
+
+
+def _fail_latest_job(slug: str) -> None:
+    from renderflow import db as rdb
+
+    with rdb.new_session() as session:
+        project = session.query(rdb.Project).filter_by(slug=slug).one()
+        job = (
+            session.query(rdb.Job).filter_by(project_id=project.id)
+            .order_by(rdb.Job.id.desc()).first()
+        )
+        job.status = "failed"
+        session.commit()
+
+
+def test_resume_reruns_the_create_job_when_no_plan_was_written(client):
+    """A create job that died before writing scenes.json (e.g. an api
+    restart while it sat queued) has no plan to resume from — resume must
+    re-run the original create argv, not point --scenes-file at nothing."""
+    from renderflow import db as rdb
+
+    register(client, "admin@example.com")
+    slug = _create_project(client)
+    _fail_latest_job(slug)
+
+    assert client.post(f"/api/projects/{slug}/resume").status_code == 200
+    with rdb.new_session() as session:
+        create, retry = session.query(rdb.Job).order_by(rdb.Job.id).all()
+        assert retry.kind == "create"
+        assert retry.argv == create.argv
+        assert "--scenes-file" not in retry.argv
+
+
+def test_resume_all_queues_only_stopped_projects_in_scope(client, saas_env):
+    from renderflow import db as rdb
+
+    register(client, "admin@example.com")
+    failed = _create_project(client, title="Failed One")
+    _fail_latest_job(failed)
+    draft = _create_project(client, title="Draft One")
+    _finish_create_with_plan(saas_env, draft)  # plan written, no assets yet
+    done = _create_project(client, title="Done One")
+    _finish_project_as_complete(saas_env, done, title="Done One")
+    running = _create_project(client, title="Running One")  # create job still queued
+    out_of_scope = _create_project(client, title="Other Channel")
+    _fail_latest_job(out_of_scope)
+
+    res = client.post(
+        "/api/projects/resume-all",
+        json={"slugs": [failed, draft, done, running]},
+    )
+    assert res.status_code == 200
+    assert sorted(res.json()["resumed"]) == sorted([failed, draft])
+
+    with rdb.new_session() as session:
+        kinds = {
+            session.get(rdb.Project, j.project_id).slug: j.kind
+            for j in session.query(rdb.Job).filter_by(status="queued").all()
+        }
+    assert kinds[failed] == "create"
+    assert kinds[draft] == "resume"
+    assert out_of_scope not in kinds

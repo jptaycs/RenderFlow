@@ -130,6 +130,13 @@ class Settings:
     # once reads as a spam dump to subscribers and risks the YouTube Data
     # API's default daily quota (~6 uploads/day before hitting it).
     auto_publish_max_per_day: int = 5
+    # Content channels that publish to their *own* YouTube channel (added
+    # 2026-10: RENDERFLOW_SEPARATE_YOUTUBE_CHANNELS, comma-separated). Each
+    # one uploads with its own `.youtube_token.<channel>.json`
+    # (`scripts/setup_youtube.py --channel NAME`) and never falls back to
+    # the main account's token: until its own login exists, its videos are
+    # simply not publishable (the 6pm batch skips them, the button 503s).
+    separate_youtube_channels: tuple[str, ...] = ()
     # When both are set, the login page shows a one-click "Developer login"
     # button that prefills these credentials and submits them through the
     # normal password-checked login — there is no bypass endpoint. Local
@@ -221,5 +228,10 @@ class Settings:
             auto_publish_hour=int(os.getenv("RENDERFLOW_AUTO_PUBLISH_HOUR", "18")),
             auto_publish_max_per_day=max(
                 1, int(os.getenv("RENDERFLOW_AUTO_PUBLISH_MAX_PER_DAY", "5"))
+            ),
+            separate_youtube_channels=tuple(
+                name.strip()
+                for name in os.getenv("RENDERFLOW_SEPARATE_YOUTUBE_CHANNELS", "").split(",")
+                if name.strip()
             ),
         )
