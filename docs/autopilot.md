@@ -51,7 +51,6 @@ WSL2, not on native Windows.
    sudo apt update && sudo apt install -y python3.12-venv ffmpeg git fonts-dejavu docker.io docker-compose-v2
    sudo usermod -aG docker $USER   # then close and reopen Ubuntu
    git clone https://github.com/jptaycs/RenderFlow.git ~/RenderFlow && cd ~/RenderFlow
-   git checkout autopilot          # until it's merged to main
    python3.12 -m venv .venv
    .venv/bin/pip install -e '.[web,kokoro,wav2lip,parallax]'
    .venv/bin/python scripts/setup_kokoro.py && .venv/bin/python scripts/setup_wav2lip.py
