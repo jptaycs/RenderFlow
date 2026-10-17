@@ -111,7 +111,7 @@ def start_episode(episode_id: int, exclude_topics: list[str] | None = None) -> N
             _fail(session, episode, f"planning failed: {exc}")
             return
         notify(
-            f"🎬 <b>Making today's video</b> (#{episode.id})\n"
+            f"🎬 <b>Making today's Short</b> (#{episode.id})\n"
             f"<b>{escape(episode.title)}</b>\n"
             f"Niche: {escape(episode.niche)} · trend: {escape(episode.trend)}\n"
             "I'll send it here for approval when the render finishes."
@@ -211,7 +211,7 @@ def package_episode(episode_id: int) -> None:
             )
             messenger.send_text(seo)
             preview = core.build_preview(final, paths.output / "preview.mp4")
-            messenger.send_video(preview, f"Preview: first {core.PREVIEW_SECONDS}s of #{episode.id}")
+            messenger.send_video(preview, f"The whole Short (#{episode.id}), at preview quality")
         except Exception as exc:
             log.warning("telegram review message failed for episode %s: %s", episode.id, exc)
     finally:
@@ -283,8 +283,8 @@ def upload_episode(episode_id: int) -> None:
             )
         if result.meta.get("thumbnail_error"):
             lines.append(
-                "⚠️ Custom thumbnail not set (the channel may need phone "
-                "verification) — upload output/thumbnail.jpg in Studio."
+                "ℹ️ YouTube didn't take the custom thumbnail. That's normal "
+                "for Shorts: pick a cover frame in the YouTube app if you like."
             )
         notify("\n".join(lines))
     finally:

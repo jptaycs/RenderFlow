@@ -206,9 +206,10 @@ def test_plan_episode_creates_a_full_render_project(saas_env, captured):
     assert job.kind == "create"
     assert "--skip-render" not in job.argv  # nobody reviews scenes: render straight through
     assert "--script-file" in job.argv and "documentary" in job.argv
-    # Lands under its channel in the dashboard switcher, as a landscape video.
+    # Always a Short, under its channel in the dashboard switcher.
     assert job.argv[job.argv.index("--channel-name") + 1] == channel.name
-    assert job.argv[job.argv.index("--format") + 1] == "landscape"
+    assert job.argv[job.argv.index("--format") + 1] == "shorts"
+    assert episode.description.rstrip().endswith("#Shorts #gardening #frost #tomatoes")
     assert captured.pipeline == [(job.id,)]
     assert "first frost" in llm.calls[0]  # trends reach the picker
 

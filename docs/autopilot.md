@@ -1,4 +1,4 @@
-# Autopilot: one YouTube video a day, approved on Telegram
+# Autopilot: one YouTube Short a day, approved on Telegram
 
 The **Autopilot** tab runs the Underrated Facts channel on its own:
 
@@ -9,13 +9,15 @@ The **Autopilot** tab runs the Underrated Facts channel on its own:
    niche two days in a row, and finds an evergreen angle aimed at viewers 55+.
    It always skips sports, politics, tragedies, gossip, and health, legal or
    investing advice.
-3. Claude writes the narration script plus the SEO title, description and
-   tags. The video is then made **exactly like a dashboard video**
-   (`make_video.py --script-file`: same host, voice, images, captions,
-   music and thumbnail), but it renders straight through to the final MP4.
-4. Telegram gets the thumbnail, the SEO text (ready to copy) and a 75-second
-   preview, with buttons: **Approve & upload · New thumbnail · New topic ·
-   Skip today**.
+3. Claude writes a one-minute **Short** script (about 130 words, one fact or
+   one quick trick) plus the SEO title, description and tags (`#Shorts` is
+   always added). The Short is then made **exactly like a dashboard Short**
+   (`make_video.py --script-file --format shorts`: same voice, visuals,
+   captions, music and closing clip) and renders straight through.
+4. Telegram gets the thumbnail, the SEO text (ready to copy) and the whole
+   Short at preview quality, with buttons: **Approve & upload · New topic ·
+   Skip today** (`/thumb` still makes a new thumbnail, but YouTube mostly
+   ignores custom thumbnails on Shorts).
 5. **Approve** uploads it to YouTube with "altered or synthetic content"
    switched on and an AI-host disclosure line in the description.
 
@@ -126,10 +128,11 @@ inside Ubuntu on WSL2.
 - While the OAuth consent screen is in **Testing**, Google expires the
   connection after 7 days. Set it to **In production** to keep it.
 
-## Length and rate limits
+## Length and cost
 
-The default is 10 minutes (about 1,200 words, ~100 five-second scenes).
-Pexels allows 200 image searches an hour, and a 20-minute video needs
-~240 scene images plus face-check retries. Longer videos usually still finish,
-because the auto-resume (30 minutes apart) retries what the rate limit
-skipped, but expect them to take a few hours.
+Every episode is a Short of about a minute (decided 2026-10-17; the old
+Length setting is gone). Your dashboard Shorts have cost about $0.09 of
+Claude each (median of 60), mostly the per-scene video-prompt rewrites; an
+Autopilot Short adds two small calls (topic pick and script) on top. If a
+render stops on a provider limit, the auto-resume (30 minutes apart) picks
+it up.

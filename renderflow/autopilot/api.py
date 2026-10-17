@@ -112,7 +112,9 @@ class ChannelUpdate(BaseModel):
     name: str
     enabled: bool
     runHour: int
-    lengthMinutes: float
+    # Ignored: every episode is a Short (see core's module docstring). Still
+    # accepted so an open dashboard tab from before the change can save.
+    lengthMinutes: float | None = None
     privacy: str
     niches: list[Niche]
 
@@ -128,8 +130,6 @@ def update_channel(
         raise HTTPException(422, "channel name must not be empty")
     if not 0 <= body.runHour <= 23:
         raise HTTPException(422, "run hour must be 0-23")
-    if not 1 <= body.lengthMinutes <= 30:
-        raise HTTPException(422, "video length must be 1-30 minutes")
     if body.privacy not in ("private", "unlisted", "public"):
         raise HTTPException(422, "privacy must be private, unlisted, or public")
     niches = []
@@ -146,7 +146,6 @@ def update_channel(
     channel.name = name
     channel.enabled = body.enabled
     channel.run_hour = body.runHour
-    channel.length_minutes = body.lengthMinutes
     channel.privacy = body.privacy
     channel.niches = niches
     return {"ok": "saved"}

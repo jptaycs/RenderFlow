@@ -1163,7 +1163,7 @@ function autopilotScreenHtml() {
   const ap = state.autopilot;
   const head = '' +
     '<div style="font-size:22px;font-weight:600;letter-spacing:-0.01em;margin-bottom:4px">Autopilot</div>' +
-    '<div style="font-size:13px;color:#8a8a91;margin-bottom:26px">One video a day from today\'s trends. It sends you the finished video on Telegram, and when you approve it, it uploads to YouTube marked as AI content.</div>';
+    '<div style="font-size:13px;color:#8a8a91;margin-bottom:26px">One YouTube Short a day from today\'s trends. It sends you the finished Short on Telegram, and when you approve it, it uploads to YouTube marked as AI content.</div>';
   if (!ap) return '<div style="padding:32px 40px">' + head + '<div style="color:#8a8a91;font-size:13px">Loading…</div></div>';
   const c = ap.channel, k = ap.connections;
   const hours = Array.from({ length: 24 }, (_, h) => '<option value="' + h + '"' + (h === c.runHour ? ' selected' : '') + '>' + pad2(h) + ':00</option>').join('');
@@ -1202,7 +1202,7 @@ function autopilotScreenHtml() {
         '<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:14px;cursor:pointer"><input id="rf-ap-enabled" type="checkbox"' + (c.enabled ? ' checked' : '') + '> Make a video automatically every day</label>' +
         '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px">' +
           '<div><label style="' + label + '">Start at</label><select id="rf-ap-hour" style="' + input + ';width:100%">' + hours + '</select></div>' +
-          '<div><label style="' + label + '">Length (min)</label><input id="rf-ap-length" type="number" min="1" max="30" step="1" value="' + esc(String(c.lengthMinutes)) + '" style="' + input + ';width:100%;box-sizing:border-box"></div>' +
+          '<div><label style="' + label + '">Format</label><div style="' + input + ';width:100%;box-sizing:border-box;color:#8a8a90">Short · ~1 min</div></div>' +
           '<div><label style="' + label + '">Upload as</label><select id="rf-ap-privacy" style="' + input + ';width:100%">' + privacy + '</select></div>' +
         '</div>' +
         '<label style="' + label + '">Niches. One per line: name | fact or howto | description. The AI picks whichever is trending hardest today, never the same niche two days running.</label>' +
@@ -2010,7 +2010,6 @@ const actions = {
       name: val('rf-ap-name'),
       enabled: document.getElementById('rf-ap-enabled').checked,
       runHour: Number(val('rf-ap-hour')),
-      lengthMinutes: Number(val('rf-ap-length')),
       privacy: val('rf-ap-privacy'),
       niches,
     }, 'PUT');

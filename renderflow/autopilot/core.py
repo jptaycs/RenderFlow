@@ -8,9 +8,11 @@ The video itself is made exactly the way the dashboard makes one: the LLM
 writes a plain narration script, it is saved as the project's source.txt,
 and a `make_video.py --script-file` job is queued — same local splitter,
 same host on every scene, same voice/images/captions/music/thumbnail. The
-only difference from a dashboard create is no --skip-render: nobody is
-sitting at the scene grid, so the run goes straight through to final.mp4
-and the review happens in Telegram instead.
+Every episode is a YouTube Short (client decision 2026-10-17: Shorts
+only — about a fifth of the cost of a 10-minute video, and the Windows PC
+already makes and publishes Shorts daily). Like a dashboard Short it renders
+straight through to final.mp4 (no --skip-render), and the review happens in
+Telegram.
 """
 
 from __future__ import annotations
@@ -75,6 +77,10 @@ KINDS = ("fact", "howto")
 # Kokoro speed 1/1.4 (the calm documentary pace older viewers prefer), which
 # lands well under a normal 150 wpm read.
 WORDS_PER_MINUTE = 120
+# ~65s of narration at the host's calm 120 wpm, before the Shorts closing
+# clip — inside YouTube's 3-minute Shorts limit with room to spare.
+SHORTS_WORDS = 130
+# Longer than any Short, so the "preview" is the whole video at 480p.
 PREVIEW_SECONDS = 75
 STUCK_RESUME_LIMIT = 2
 
@@ -167,22 +173,23 @@ Accuracy (this matters more than anything):
   professional.
 
 Format:
+- This is a YouTube Short: a vertical video of about one minute.
 - The script is spoken text only: no headings, no markdown, no bullet
   points, no stage directions, no [music] cues, no scene labels.
-- About {words} words (a {minutes:g}-minute video). Fact stories: a story
-  arc with several surprising turns. How-tos: why it matters, what you
-  need, step by step, common mistakes, a final tip.
-- End with one gentle line inviting viewers to subscribe for more
-  underrated facts.
+- About {words} words, and never more than {max_words}. One idea only:
+  a fact story is one surprising true thing with a satisfying payoff; a
+  how-to is one quick trick in two or three clear steps.
+- The first sentence is the hook. No greeting, no "in this video".
+- Do not end with a subscribe line; the video's closing clip adds one.
 
-SEO (for the same video):
-- title: under 70 characters, curiosity-driven, honest — the video must
+SEO (for the same Short):
+- title: under 60 characters, curiosity-driven, honest — the video must
   deliver exactly what it promises. At most one word in capitals.
-- description: first two lines restate the hook with the main search
-  keywords; then a 3-5 sentence summary; then "In this video:" followed by
-  4-6 short lines starting with "• ". No links, no timestamps.
-- tags: 12-20 search phrases people would actually type.
-- hashtags: exactly 3, each starting with "#".
+- description: one or two lines restating the hook with the main search
+  keywords, then two or three short sentences. No links, no timestamps.
+- tags: 8-15 search phrases people would actually type.
+- hashtags: exactly 3, each starting with "#" (not #Shorts; it is added
+  automatically).
 """
 
 DISCLOSURE = (
@@ -379,15 +386,11 @@ def pick_topic(
 # ---------------------------------------------------------------------------
 
 
-def target_words(length_minutes: float) -> int:
-    return max(150, round(length_minutes * WORDS_PER_MINUTE))
-
-
 def write_episode(
-    llm: LLMProvider, channel_name: str, candidate: dict[str, Any], length_minutes: float
+    llm: LLMProvider, channel_name: str, candidate: dict[str, Any]
 ) -> tuple[GeneratedEpisode, float]:
     system = EPISODE_SYSTEM.format(
-        channel=channel_name, words=target_words(length_minutes), minutes=length_minutes
+        channel=channel_name, words=SHORTS_WORDS, max_words=round(SHORTS_WORDS * 1.3)
     )
     kind_label = "how-to" if candidate["kind"] == "howto" else "fact story"
     prompt = (
@@ -405,15 +408,18 @@ def write_episode(
     except ValidationError:
         log.error("episode writer returned JSON that does not match the schema")
         raise
-    if len(episode.script.split()) < 80:
+    if len(episode.script.split()) < 60:
         raise ValueError("episode writer returned a script that is far too short")
     return episode, result.cost or 0.0
 
 
 def full_description(generated: GeneratedEpisode) -> str:
-    hashtags = " ".join(
+    tags = [
         h if h.startswith("#") else f"#{h}" for h in (x.strip().replace(" ", "") for x in generated.hashtags) if h
-    )
+    ]
+    # Every episode is a Short; #Shorts helps YouTube file it on the Shorts shelf.
+    tags = ["#Shorts"] + [t for t in tags if t.lower() != "#shorts"]
+    hashtags = " ".join(tags)
     parts = [generated.description.strip(), DISCLOSURE]
     if hashtags:
         parts.append(hashtags)
@@ -472,7 +478,7 @@ def create_project_for_episode(
         "create",
         [
             "--script-file", str(source), "--style", "documentary", "--title", title,
-            "--format", "landscape", "--channel-name", channel_name,
+            "--format", "shorts", "--channel-name", channel_name,
         ],
     )
     return project
@@ -512,7 +518,7 @@ def plan_episode(
     episode.updated_at = time.time()
     session.commit()
 
-    generated, write_cost = write_episode(llm, channel.name, chosen, channel.length_minutes)
+    generated, write_cost = write_episode(llm, channel.name, chosen)
     episode.llm_cost += write_cost
     episode.title = " ".join(generated.title.split())[:512]
     episode.description = full_description(generated)
@@ -580,7 +586,9 @@ def video_duration_label(path: Path) -> str:
 
 def episode_buttons(episode: Episode) -> list[list[tuple[str, str]]]:
     return [
-        [("✅ Approve & upload", f"approve:{episode.id}"), ("🖼 New thumbnail", f"thumb:{episode.id}")],
+        # No "New thumbnail": YouTube mostly ignores custom thumbnails on
+        # Shorts (see renderflow/youtube.py). /thumb still works.
+        [("✅ Approve & upload", f"approve:{episode.id}")],
         [("🔁 New topic", f"newtopic:{episode.id}"), ("⏭ Skip today", f"skip:{episode.id}")],
     ]
 
