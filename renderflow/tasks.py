@@ -313,6 +313,22 @@ def _notify_autopilot(job_id: int) -> None:
         )
 
 
+def _notify_autopilot_starting(job_id: int) -> None:
+    """Counterpart of _notify_autopilot, before the job's first attempt
+    (snapshots 69labs balances for the episode's usage line). Same rule:
+    never allowed to affect the job."""
+    try:
+        from renderflow.autopilot.jobs import on_pipeline_job_starting
+
+        on_pipeline_job_starting(job_id)
+    except Exception:
+        import logging
+
+        logging.getLogger("renderflow.tasks").exception(
+            "autopilot start hook failed for job %s", job_id
+        )
+
+
 @celery_app.task(name="renderflow.run_pipeline")
 def run_pipeline(job_id: int) -> None:
     session = new_session()
@@ -380,6 +396,7 @@ def run_pipeline(job_id: int) -> None:
         # "Failed" status and clicking Resume by hand.
         max_attempts = MAX_RUN_ATTEMPTS if script == "make_video.py" else 1
         returncode = 1
+        _notify_autopilot_starting(job.id)
         for attempt in range(1, max_attempts + 1):
             session.refresh(job)  # the API may have cancelled it between attempts
             if job.status == "cancelled":

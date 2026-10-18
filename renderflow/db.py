@@ -119,6 +119,9 @@ class AutopilotChannel(Base):
     enabled: Mapped[bool] = mapped_column(default=False)
     # Local hour (0-23, the worker PC's clock) the daily episode starts.
     run_hour: Mapped[int] = mapped_column(default=6)
+    # Shorts per day (1-5). They run one after another: the next starts once
+    # the previous is waiting for approval.
+    episodes_per_day: Mapped[int] = mapped_column(default=1)
     length_minutes: Mapped[float] = mapped_column(default=10.0)
     # YouTube privacy on upload. Unaudited API projects are forced private
     # by YouTube regardless — see providers/publish/youtube.py.
@@ -134,6 +137,7 @@ class AutopilotChannel(Base):
 # planning -> generating -> ready -> uploading -> uploaded
 #                                 ↘ skipped        ↘ failed (retry = approve again)
 # Any step can land on failed; "generating" is re-entered for a thumbnail redo.
+# "replaced" = the user asked for a new topic; it doesn't use up a daily slot.
 EPISODE_ACTIVE_STATUSES = ("planning", "generating", "uploading")
 
 
@@ -159,6 +163,13 @@ class Episode(Base):
     # the choice is reviewable, and used by "new topic" to try the next one.
     candidates: Mapped[list] = mapped_column(JSON, default=list)
     llm_cost: Mapped[float] = mapped_column(default=0.0)
+    # 69labs credits, measured as balance deltas around each of the
+    # episode's render jobs (exact: jobs run one at a time). credits_before
+    # is the snapshot taken when a job starts; used/left are
+    # {"images", "videos", "motion", "tools"} -> int. NULL on old rows.
+    credits_before: Mapped[dict | None] = mapped_column(JSON, default=None)
+    credits_used: Mapped[dict | None] = mapped_column(JSON, default=None)
+    credits_left: Mapped[dict | None] = mapped_column(JSON, default=None)
     youtube_video_id: Mapped[str | None] = mapped_column(String(32), default=None)
     youtube_url: Mapped[str | None] = mapped_column(String(255), default=None)
     error: Mapped[str | None] = mapped_column(Text, default=None)
@@ -219,9 +230,9 @@ def init_db() -> None:
     migrations (Alembic deferred until post-launch — see CLAUDE.md).
 
     create_all never alters existing tables, so columns added after a table
-    first shipped need explicit idempotent ALTERs. Postgres only: the test
-    suite always creates a fresh SQLite schema, which create_all fully
-    covers (and SQLite lacks ADD COLUMN IF NOT EXISTS anyway)."""
+    first shipped need explicit idempotent ALTERs. The users ones are
+    Postgres only (the test suite always creates a fresh SQLite schema);
+    _LATE_COLUMNS runs on both, since the Windows PC's live DB is SQLite."""
     engine = get_engine()
     Base.metadata.create_all(engine)
     if engine.dialect.name == "postgresql":
@@ -237,6 +248,29 @@ def init_db() -> None:
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
                 "subscription_expires_at DOUBLE PRECISION"
             ))
+    _add_missing_columns(engine)
+
+
+# Columns added to autopilot tables after they shipped. Checked by
+# inspection rather than IF NOT EXISTS so they also reach the Windows PC's
+# SQLite database (SQLite has no ADD COLUMN IF NOT EXISTS).
+_LATE_COLUMNS = (
+    ("autopilot_channels", "episodes_per_day", "INTEGER NOT NULL DEFAULT 1"),
+    ("autopilot_episodes", "credits_before", "JSON"),
+    ("autopilot_episodes", "credits_used", "JSON"),
+    ("autopilot_episodes", "credits_left", "JSON"),
+)
+
+
+def _add_missing_columns(engine: Engine) -> None:
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table, column, ddl in _LATE_COLUMNS:
+            existing = {c["name"] for c in inspector.get_columns(table)}
+            if column not in existing:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
 
 
 # ---------------------------------------------------------------------------

@@ -1097,8 +1097,16 @@ const EPISODE_STATUS = {
   uploading:  { label: 'Uploading',         color: '#a855f7' },
   uploaded:   { label: 'Uploaded',          color: '#22c55e' },
   skipped:    { label: 'Skipped',           color: '#5a5a60' },
+  replaced:   { label: 'Replaced',          color: '#5a5a60' },
   failed:     { label: 'Failed',            color: '#ef4444' },
 };
+
+// 69labs credits the episode's renders used (measured server-side as balance drops).
+function episodeCreditsText(used) {
+  const parts = [['images', 'images'], ['videos', 'video'], ['motion', 'motion'], ['tools', 'tool']]
+    .filter(([k]) => used && used[k]).map(([k, label]) => used[k].toLocaleString() + ' ' + label);
+  return parts.length ? ' · 💳 ' + parts.join(' · ') : '';
+}
 
 function confirmAction(text) { return window.confirm(text); }
 
@@ -1152,7 +1160,7 @@ function episodeCardHtml(ep) {
       '<span style="font-size:11.5px;font-weight:600;color:' + meta.color + ';background:#1f1f23;padding:3px 9px;border-radius:9px">' + esc(meta.label) + '</span>' +
     '</div>' +
     '<div style="font-size:15px;font-weight:600;margin-bottom:6px">' + esc(ep.title || (ep.status === 'planning' ? 'Scanning today\'s trends…' : '(no title)')) + '</div>' +
-    (ep.niche ? '<div style="font-size:12.5px;color:#8a8a91">' + esc(ep.niche) + ' · ' + (ep.kind === 'howto' ? 'how-to' : 'fact story') + ' · trend: ' + esc(ep.trend) + ' · ' + money(ep.cost) + '</div>' : '') +
+    (ep.niche ? '<div style="font-size:12.5px;color:#8a8a91">' + esc(ep.niche) + ' · ' + (ep.kind === 'howto' ? 'how-to' : 'fact story') + ' · trend: ' + esc(ep.trend) + ' · ' + money(ep.cost) + esc(episodeCreditsText(ep.creditsUsed)) + '</div>' : '') +
     (ep.error ? '<div style="font-size:12px;color:#ef4444;margin-top:8px;white-space:pre-wrap;max-height:120px;overflow:auto">' + esc(ep.error) + '</div>' : '') +
     (actions.length ? '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px">' + actions.join('') + '</div>' : '') +
     seo + cands +
@@ -1163,10 +1171,11 @@ function autopilotScreenHtml() {
   const ap = state.autopilot;
   const head = '' +
     '<div style="font-size:22px;font-weight:600;letter-spacing:-0.01em;margin-bottom:4px">Autopilot</div>' +
-    '<div style="font-size:13px;color:#8a8a91;margin-bottom:26px">One YouTube Short a day from today\'s trends. It sends you the finished Short on Telegram, and when you approve it, it uploads to YouTube marked as AI content.</div>';
+    '<div style="font-size:13px;color:#8a8a91;margin-bottom:26px">YouTube Shorts from today\'s trends, as many a day as you set. It sends you the finished Short on Telegram, and when you approve it, it uploads to YouTube marked as AI content.</div>';
   if (!ap) return '<div style="padding:32px 40px">' + head + '<div style="color:#8a8a91;font-size:13px">Loading…</div></div>';
   const c = ap.channel, k = ap.connections;
   const hours = Array.from({ length: 24 }, (_, h) => '<option value="' + h + '"' + (h === c.runHour ? ' selected' : '') + '>' + pad2(h) + ':00</option>').join('');
+  const perDay = [1, 2, 3, 4, 5].map(n => '<option value="' + n + '"' + (n === (c.episodesPerDay || 1) ? ' selected' : '') + '>' + n + '</option>').join('');
   const privacy = ['private', 'unlisted', 'public'].map(p => '<option value="' + p + '"' + (p === c.privacy ? ' selected' : '') + '>' + p + '</option>').join('');
   const nicheText = (c.niches || []).map(n => n.name + ' | ' + n.kind + ' | ' + (n.description || '')).join('\n');
   const input = 'background:#0f0f11;border:1px solid #2a2a2e;border-radius:7px;color:#f2f2f4;font-size:13px;padding:8px 10px;font-family:inherit';
@@ -1202,10 +1211,10 @@ function autopilotScreenHtml() {
         '<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:14px;cursor:pointer"><input id="rf-ap-enabled" type="checkbox"' + (c.enabled ? ' checked' : '') + '> Make a video automatically every day</label>' +
         '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px">' +
           '<div><label style="' + label + '">Start at</label><select id="rf-ap-hour" style="' + input + ';width:100%">' + hours + '</select></div>' +
-          '<div><label style="' + label + '">Format</label><div style="' + input + ';width:100%;box-sizing:border-box;color:#8a8a90">Short · ~1 min</div></div>' +
+          '<div><label style="' + label + '">Shorts per day</label><select id="rf-ap-perday" style="' + input + ';width:100%">' + perDay + '</select></div>' +
           '<div><label style="' + label + '">Upload as</label><select id="rf-ap-privacy" style="' + input + ';width:100%">' + privacy + '</select></div>' +
         '</div>' +
-        '<label style="' + label + '">Niches. One per line: name | fact or howto | description. The AI picks whichever is trending hardest today, never the same niche two days running.</label>' +
+        '<label style="' + label + '">Niches. One per line: name | fact or howto | description. The AI picks whichever is trending hardest today, never the same niche twice in a row. Several Shorts a day are made one after another, each sent to you for approval.</label>' +
         '<textarea id="rf-ap-niches" rows="12" wrap="off" style="' + input + ';width:100%;box-sizing:border-box;font-size:12px;line-height:1.6;resize:vertical;margin-bottom:14px;white-space:pre;overflow-x:auto">' + esc(nicheText) + '</textarea>' +
         apButton('Save settings', 'autopilotSave', null, true) +
         '<div style="font-size:11px;color:#5a5a60;margin-top:14px;line-height:1.5">YouTube keeps uploads <b>private</b> until Google audits your API project, whatever you choose here. Make them public in YouTube Studio. Every upload is marked as altered or synthetic content, and the description says the host is AI-generated.</div>' +
@@ -2010,6 +2019,7 @@ const actions = {
       name: val('rf-ap-name'),
       enabled: document.getElementById('rf-ap-enabled').checked,
       runHour: Number(val('rf-ap-hour')),
+      episodesPerDay: Number(val('rf-ap-perday')),
       privacy: val('rf-ap-privacy'),
       niches,
     }, 'PUT');

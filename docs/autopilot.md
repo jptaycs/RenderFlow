@@ -1,12 +1,14 @@
-# Autopilot: one YouTube Short a day, approved on Telegram
+# Autopilot: YouTube Shorts every day, approved on Telegram
 
 The **Autopilot** tab runs the Underrated Facts channel on its own:
 
 1. Every day at the start hour (default 06:00, on the worker PC's clock), it
    scans **Google Trends** (plus YouTube's trending chart if
-   `YOUTUBE_API_KEY` is set).
+   `YOUTUBE_API_KEY` is set). With **Shorts per day** above 1 (up to 5), it
+   makes them one after another: the next starts once the previous one is
+   waiting for your approval.
 2. Claude picks the niche that's **trending hardest today**, never the same
-   niche two days in a row, and finds an evergreen angle aimed at viewers 55+.
+   niche twice in a row, and finds an evergreen angle aimed at viewers 55+.
    It always skips sports, politics, tragedies, gossip, and health, legal or
    investing advice.
 3. Claude writes a one-minute **Short** script (about 130 words, one fact or
@@ -17,7 +19,10 @@ The **Autopilot** tab runs the Underrated Facts channel on its own:
 4. Telegram gets the thumbnail, the SEO text (ready to copy) and the whole
    Short at preview quality, with buttons: **Approve & upload · New topic ·
    Skip today** (`/thumb` still makes a new thumbnail, but YouTube mostly
-   ignores custom thumbnails on Shorts).
+   ignores custom thumbnails on Shorts). The message also shows the 69labs
+   credits the Short used and what's left this month (TTS has no balance on
+   a credit plan, so it shows the characters sent instead). **New topic**
+   replaces the Short without using up another of the day's slots.
 5. **Approve** uploads it to YouTube with "altered or synthetic content"
    switched on and an AI-host disclosure line in the description.
 

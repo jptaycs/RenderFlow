@@ -318,16 +318,126 @@ def test_actions_approve_thumb_skip(saas_env, captured):
         jobs.perform_action(session, episode, "skip")
 
 
-def test_new_topic_skips_and_excludes_the_old_topic(saas_env, captured):
+def test_new_topic_replaces_and_excludes_the_old_topic(saas_env, captured):
     session = rdb.new_session()
     episode, _ = _generating_episode(session, saas_env)
     episode.status = "ready"
     session.commit()
     jobs.perform_action(session, episode, "newtopic")
-    assert episode.status == "skipped"
+    assert episode.status == "replaced"
     new_id, exclude = captured.start[0]
     assert exclude == ["t"]
     assert session.get(rdb.Episode, new_id).status == "planning"
+    with pytest.raises(jobs.ActionError):
+        jobs.perform_action(session, episode, "newtopic")  # already replaced
+
+
+def test_several_episodes_per_day_and_replaced_ones_dont_count(saas_env):
+    session = rdb.new_session()
+    _, channel = _admin_channel(session, run_hour=6)
+    channel.episodes_per_day = 3
+    later = datetime.now().replace(hour=15)
+    for status in ("uploaded", "skipped"):
+        session.add(rdb.Episode(channel_id=channel.id, day=core.today(), status=status))
+    session.add(rdb.Episode(channel_id=channel.id, day=core.today(), status="replaced"))
+    session.commit()
+    assert core.is_due(session, channel, later)  # 2 of 3 slots used; replaced is free
+    session.add(rdb.Episode(channel_id=channel.id, day=core.today(), status="failed"))
+    session.commit()
+    assert not core.is_due(session, channel, later)
+    channel.episodes_per_day = 99  # clamped to MAX_EPISODES_PER_DAY
+    assert core.is_due(session, channel, later)
+
+
+def test_same_day_episodes_never_share_a_niche(saas_env, captured):
+    session = rdb.new_session()
+    _, channel = _admin_channel(session)
+    session.add(rdb.Episode(channel_id=channel.id, day=core.today(), status="ready",
+                            niche="Garden & backyard", topic="this morning's topic"))
+    session.commit()
+    episode = core.new_episode(session, channel)
+    core.plan_episode(session, episode, ScriptedLLM(PICK, EPISODE), [], jobs.enqueue_pipeline)
+    assert episode.niche == "Forgotten history"
+
+
+def test_credit_delta_and_usage_lines():
+    used = core.add_credit_delta(
+        {"images": 5}, {"images": 100, "videos": 50, "tools": 9}, {"images": 88, "videos": 41, "motion": 3}
+    )
+    assert used == {"images": 17, "videos": 9}  # motion/tools only in one snapshot: skipped
+    assert core.add_credit_delta(None, {"images": 1}, {"images": 500}) == {"images": 0}  # renewal
+    ep = rdb.Episode(credits_used={"images": 12, "videos": 9, "motion": 0},
+                     credits_left={"images": 9360, "videos": 1497, "motion": 360, "tools": 1000})
+    lines = core.usage_lines(ep, 812)
+    assert lines[0] == "💳 69labs this Short: 12 images · 9 video · ~812 TTS chars"
+    assert lines[1] == "Left this month: 9,360 images · 1,497 video · 360 motion · 1,000 tool"
+    assert core.usage_lines(rdb.Episode(), 0) == []
+
+
+def test_job_hooks_measure_the_episodes_credits(saas_env, captured, monkeypatch):
+    session = rdb.new_session()
+    episode, project = _generating_episode(session, saas_env)
+    balances = iter([
+        {"images": 100, "videos": 50}, {"images": 90, "videos": 45},  # create job
+        {"images": 90, "videos": 45}, {"images": 89, "videos": 45},   # thumbnail job
+    ])
+    monkeypatch.setattr(jobs, "labs69_balances", lambda: next(balances))
+    for kind in ("create", "thumbnail"):
+        job = _job(session, project, "running", kind=kind)
+        jobs.on_pipeline_job_starting(job.id)
+        job.status = "succeeded"
+        session.commit()
+        jobs.on_pipeline_job_finished(job.id)
+    session.refresh(episode)
+    assert episode.credits_used == {"images": 11, "videos": 5}
+    assert episode.credits_left == {"images": 89, "videos": 45}
+    assert episode.credits_before is None
+
+
+def test_job_hooks_skip_balance_checks_for_normal_projects(saas_env, captured, monkeypatch):
+    session = rdb.new_session()
+    user = rdb.User(email="x@example.com", password_hash="x")
+    session.add(user)
+    session.flush()
+    project = rdb.Project(owner_id=user.id, slug="p", title="P", dir_path="/tmp/nope-p", created_at=0)
+    session.add(project)
+    session.commit()
+    monkeypatch.setattr(jobs, "labs69_balances", lambda: pytest.fail("no 69labs call for a normal project"))
+    job = _job(session, project, "succeeded")
+    jobs.on_pipeline_job_starting(job.id)
+    jobs.on_pipeline_job_finished(job.id)
+
+
+def test_labs69_fetch_balances_reads_limits_models_and_tools(monkeypatch):
+    from renderflow.providers.labs69_client import Labs69Client
+
+    responses = {
+        "/limits": {"images": {"monthlyUsage": {"remaining": 9372}},
+                    "videos": {"monthlyUsage": {"remaining": 1506}}},
+        "/models": {"motionGraphics": {"monthlyUsage": {"remaining": 360}}, "tts": {}},
+        "/tools": {"toolCredits": {"remaining": 1000, "total": 1000}},
+    }
+    client = Labs69Client(api_key="vk_test")
+    monkeypatch.setattr(client, "get_json", lambda path: responses[path])
+    assert client.fetch_balances() == {"images": 9372, "videos": 1506, "motion": 360, "tools": 1000}
+    responses["/tools"] = {}
+    assert "tools" not in client.fetch_balances()
+
+
+def test_late_columns_are_added_to_an_existing_sqlite_db(tmp_path):
+    from sqlalchemy import create_engine, inspect, text
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'old.db'}")
+    with engine.begin() as conn:  # the autopilot tables as they first shipped
+        conn.execute(text("CREATE TABLE autopilot_channels (id INTEGER PRIMARY KEY, run_hour INTEGER)"))
+        conn.execute(text("INSERT INTO autopilot_channels (id, run_hour) VALUES (1, 6)"))
+        conn.execute(text("CREATE TABLE autopilot_episodes (id INTEGER PRIMARY KEY)"))
+    rdb._add_missing_columns(engine)
+    rdb._add_missing_columns(engine)  # idempotent
+    cols = {c["name"] for c in inspect(engine).get_columns("autopilot_episodes")}
+    assert {"credits_before", "credits_used", "credits_left"} <= cols
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT episodes_per_day FROM autopilot_channels")).scalar() == 1
 
 
 def test_cannot_start_two_episodes_at_once(saas_env, captured):
@@ -416,6 +526,11 @@ def test_api_update_validates_and_saves(client, captured):
     bad = {**body, "niches": [{"name": "A", "kind": "fact"}]}
     assert client.put("/api/autopilot/channel", json=bad).status_code == 422
     assert client.put("/api/autopilot/channel", json={**body, "runHour": 30}).status_code == 422
+    assert client.get("/api/autopilot").json()["channel"]["episodesPerDay"] == 1
+    assert client.put("/api/autopilot/channel", json={**body, "episodesPerDay": 3}).status_code == 200
+    assert client.put("/api/autopilot/channel", json=body).status_code == 200  # omitted = unchanged
+    assert client.get("/api/autopilot").json()["channel"]["episodesPerDay"] == 3
+    assert client.put("/api/autopilot/channel", json={**body, "episodesPerDay": 6}).status_code == 422
 
 
 def test_api_run_now_and_conflict(client, captured):

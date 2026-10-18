@@ -15,6 +15,7 @@ Approve -> upload_episode.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -120,6 +121,60 @@ def start_episode(episode_id: int, exclude_topics: list[str] | None = None) -> N
         session.close()
 
 
+def labs69_balances() -> dict[str, int] | None:
+    """Current 69labs balances, or None without a key or on any error —
+    usage tracking is a nice-to-have and must never touch a render."""
+    Settings.load()  # load_dotenv puts LABS69_API_KEY into os.environ
+    if not os.environ.get("LABS69_API_KEY"):
+        return None
+    try:
+        from renderflow.providers.labs69_client import Labs69Client
+
+        return Labs69Client().fetch_balances() or None
+    except Exception as exc:
+        log.warning("69labs balance check failed: %s", exc)
+        return None
+
+
+def _episode_for_job(session: Session, job: Job) -> Episode | None:
+    return (
+        session.query(Episode)
+        .filter(Episode.project_id == job.project_id)
+        .order_by(Episode.created_at.desc())
+        .first()
+    )
+
+
+def on_pipeline_job_starting(job_id: int) -> None:
+    """Called by tasks.run_pipeline before an autopilot episode's job runs:
+    snapshot the 69labs balances so the finish hook can measure the job."""
+    session = new_session()
+    try:
+        job = session.get(Job, job_id)
+        episode = _episode_for_job(session, job) if job else None
+        if episode is None:
+            return
+        episode.credits_before = labs69_balances()
+        session.commit()
+    finally:
+        session.close()
+
+
+def _settle_credits(session: Session, job: Job) -> None:
+    """Add the job's balance drop to its episode's credits_used. Exact
+    because the worker runs one job at a time (eager mode and
+    --concurrency=1); only spending on the 69labs website meanwhile leaks in."""
+    episode = _episode_for_job(session, job)
+    if episode is None or not episode.credits_before:
+        return
+    after = labs69_balances()
+    if after:
+        episode.credits_used = core.add_credit_delta(episode.credits_used, episode.credits_before, after)
+        episode.credits_left = after
+    episode.credits_before = None
+    session.commit()
+
+
 def on_pipeline_job_finished(job_id: int) -> None:
     """Called by tasks.run_pipeline after every job. Moves an autopilot
     episode forward when its project's run ends; no-op for normal projects."""
@@ -128,6 +183,7 @@ def on_pipeline_job_finished(job_id: int) -> None:
         job = session.get(Job, job_id)
         if job is None:
             return
+        _settle_credits(session, job)
         episode = (
             session.query(Episode)
             .filter(Episode.project_id == job.project_id, Episode.status == "generating")
@@ -195,9 +251,12 @@ def package_episode(episode_id: int) -> None:
             f"<b>{escape(episode.title)}</b>\n"
             f"Niche: {escape(episode.niche)} ({kind_label})\n"
             f"Trend: {escape(episode.trend)}\n"
-            f"Length: {core.video_duration_label(final)} · cost ${cost:.2f}\n\n"
-            "Watch the preview below, then tap a button."
+            f"Length: {core.video_duration_label(final)} · cost ${cost:.2f}\n"
         )
+        usage = core.usage_lines(episode, core.tts_characters(paths))
+        if usage:
+            caption += "\n".join(usage) + "\n"
+        caption += "\nWatch the preview below, then tap a button."
         buttons = core.episode_buttons(episode)
         try:
             if thumb.exists():
@@ -376,14 +435,16 @@ def perform_action(session: Session, episode: Episode, action: str) -> str:
         return "Making a new thumbnail — I'll resend the video when it's done."
 
     if action == "newtopic":
-        if episode.status in ("uploading", "uploaded"):
+        if episode.status in ("uploading", "uploaded", "replaced"):
             raise ActionError(f"episode #{episode.id} is already {episode.status}")
         if episode.status in core.EPISODE_ACTIVE_STATUSES:
             raise ActionError("this episode is still being made — skip it first, then ask for a new topic")
         channel = session.get(AutopilotChannel, episode.channel_id)
-        if episode.status != "skipped":
-            episode.status = "skipped"
-            session.commit()
+        # "replaced", not "skipped": the new episode takes over this one's
+        # daily slot, so with several Shorts a day the count stays right.
+        episode.status = "replaced"
+        episode.updated_at = time.time()
+        session.commit()
         new = start_new_episode(session, channel, exclude=[episode.topic] if episode.topic else [])
         return f"Picking a different topic (episode #{new.id})…"
 

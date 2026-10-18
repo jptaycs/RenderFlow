@@ -231,6 +231,28 @@ class Labs69Client:
             return response.content
         raise Labs69Error(f"69labs GET {path} exhausted retries")
 
+    def fetch_balances(self) -> dict[str, int]:
+        """Monthly credits left per product: images, videos, motion, tools.
+
+        Read-only GETs, verified live on a credit-plan account 2026-10-18:
+        /limits has images/videos monthlyUsage, /models has the motion
+        graphics one, /tools has toolCredits. There is no TTS-character
+        balance for credit accounts (only pay-per-use keys get one), so it
+        is absent here. A missing field is left out, never guessed."""
+        balances: dict[str, int] = {}
+
+        def put(name: str, value: Any) -> None:
+            if isinstance(value, int):
+                balances[name] = value
+
+        limits = self.get_json("/limits")
+        for product in ("images", "videos"):
+            put(product, ((limits.get(product) or {}).get("monthlyUsage") or {}).get("remaining"))
+        motion = (self.get_json("/models").get("motionGraphics") or {}).get("monthlyUsage") or {}
+        put("motion", motion.get("remaining"))
+        put("tools", (self.get_json("/tools").get("toolCredits") or {}).get("remaining"))
+        return balances
+
     def get_json(self, path: str) -> dict[str, Any]:
         response = httpx.get(
             f"{API_BASE}{path}", headers=self._headers(), timeout=30.0

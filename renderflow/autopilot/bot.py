@@ -64,8 +64,15 @@ STATUS_LABELS = {
     "uploading": "⬆️ uploading to YouTube",
     "uploaded": "✅ uploaded",
     "skipped": "⏭ skipped",
+    "replaced": "🔁 replaced by a new topic",
     "failed": "⚠️ failed",
 }
+
+
+def schedule_label(channel: AutopilotChannel) -> str:
+    per_day = channel.episodes_per_day or 1
+    shorts = "1 Short" if per_day == 1 else f"{per_day} Shorts"
+    return f"{shorts} daily from {channel.run_hour:02d}:00"
 
 
 def the_channel(session: Session) -> AutopilotChannel | None:
@@ -84,9 +91,7 @@ def latest_episode(session: Session, channel: AutopilotChannel) -> Episode | Non
 
 def status_text(session: Session, channel: AutopilotChannel) -> str:
     episode = latest_episode(session, channel)
-    schedule = (
-        f"Daily at {channel.run_hour:02d}:00" if channel.enabled else "Schedule paused"
-    )
+    schedule = schedule_label(channel) if channel.enabled else "Schedule paused"
     if episode is None:
         return f"<b>{escape(channel.name)}</b> · {schedule}\nNo episodes yet. Send /today to make one."
     line = STATUS_LABELS.get(episode.status, episode.status)
@@ -144,7 +149,7 @@ def handle_command(session: Session, channel: AutopilotChannel, text: str) -> st
         if action == "resume":
             channel.enabled = True
             session.commit()
-            return f"▶️ Daily schedule on — next video at {channel.run_hour:02d}:00."
+            return f"▶️ Daily schedule on — {schedule_label(channel)}."
         if action == "trends":
             trends = core.gather_trends(build_trend_sources(Settings.load()), Settings.load().trends_geo)
             if not trends:

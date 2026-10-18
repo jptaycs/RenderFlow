@@ -66,6 +66,7 @@ def _episode_view(session: Session, episode: Episode) -> dict[str, Any]:
         "candidates": episode.candidates,
         "projectSlug": project.slug if project else None,
         "cost": round(episode.llm_cost + core.project_cost(paths), 4),
+        "creditsUsed": episode.credits_used or {},
         "youtubeUrl": episode.youtube_url,
         "youtubeVideoId": episode.youtube_video_id,
         "error": episode.error,
@@ -91,6 +92,7 @@ def autopilot_state(
             "name": channel.name,
             "enabled": channel.enabled,
             "runHour": channel.run_hour,
+            "episodesPerDay": channel.episodes_per_day or 1,
             "lengthMinutes": channel.length_minutes,
             "privacy": channel.privacy,
             "niches": channel.niches or list(core.DEFAULT_NICHES),
@@ -114,6 +116,9 @@ class ChannelUpdate(BaseModel):
     name: str
     enabled: bool
     runHour: int
+    # None = unchanged, so a dashboard tab opened before this field existed
+    # can't silently reset it to 1 on save.
+    episodesPerDay: int | None = None
     # Ignored: every episode is a Short (see core's module docstring). Still
     # accepted so an open dashboard tab from before the change can save.
     lengthMinutes: float | None = None
@@ -132,6 +137,8 @@ def update_channel(
         raise HTTPException(422, "channel name must not be empty")
     if not 0 <= body.runHour <= 23:
         raise HTTPException(422, "run hour must be 0-23")
+    if body.episodesPerDay is not None and not 1 <= body.episodesPerDay <= core.MAX_EPISODES_PER_DAY:
+        raise HTTPException(422, f"Shorts per day must be 1-{core.MAX_EPISODES_PER_DAY}")
     if body.privacy not in ("private", "unlisted", "public"):
         raise HTTPException(422, "privacy must be private, unlisted, or public")
     niches = []
@@ -148,6 +155,8 @@ def update_channel(
     channel.name = name
     channel.enabled = body.enabled
     channel.run_hour = body.runHour
+    if body.episodesPerDay is not None:
+        channel.episodes_per_day = body.episodesPerDay
     channel.privacy = body.privacy
     channel.niches = niches
     return {"ok": "saved"}

@@ -83,6 +83,9 @@ SHORTS_WORDS = 130
 # Longer than any Short, so the "preview" is the whole video at 480p.
 PREVIEW_SECONDS = 75
 STUCK_RESUME_LIMIT = 2
+# Shorts per day the channel setting allows. Each one is reviewed by hand in
+# Telegram, so more than this is a chore, not a schedule.
+MAX_EPISODES_PER_DAY = 5
 
 
 # ---------------------------------------------------------------------------
@@ -218,15 +221,6 @@ def get_or_create_channel(session: Session, user: User) -> AutopilotChannel:
     return channel
 
 
-def episode_for_day(session: Session, channel: AutopilotChannel, day: str) -> Episode | None:
-    return (
-        session.query(Episode)
-        .filter(Episode.channel_id == channel.id, Episode.day == day)
-        .order_by(Episode.created_at.desc())
-        .first()
-    )
-
-
 def active_episode(session: Session, channel: AutopilotChannel) -> Episode | None:
     return (
         session.query(Episode)
@@ -236,15 +230,28 @@ def active_episode(session: Session, channel: AutopilotChannel) -> Episode | Non
     )
 
 
+def episodes_counted_today(session: Session, channel: AutopilotChannel, day: str) -> int:
+    """Episodes that used up one of the day's slots: every status except
+    "replaced" (a "new topic" swap makes its own replacement episode)."""
+    return (
+        session.query(Episode)
+        .filter(Episode.channel_id == channel.id, Episode.day == day, Episode.status != "replaced")
+        .count()
+    )
+
+
 def is_due(session: Session, channel: AutopilotChannel, now: datetime | None = None) -> bool:
-    """The daily episode should start: enabled, past the run hour, and no
-    episode exists for today yet (any status — a skipped day stays skipped;
-    "new topic" is an explicit action). Missed hours still run: if the PC
-    was off at 6am and boots at 3pm, today's video starts at 3pm."""
+    """Another episode should start: enabled, past the run hour, and fewer
+    than episodes_per_day exist for today (any status but "replaced" — a
+    skipped or failed one still used its slot). Missed hours still run: if
+    the PC was off at 6am and boots at 3pm, today's videos start at 3pm.
+    The caller also waits for no episode to be active, so a day's Shorts
+    are made one after another."""
     now = now or datetime.now()
     if not channel.enabled or now.hour < channel.run_hour:
         return False
-    return episode_for_day(session, channel, now.date().isoformat()) is None
+    per_day = max(1, min(channel.episodes_per_day or 1, MAX_EPISODES_PER_DAY))
+    return episodes_counted_today(session, channel, now.date().isoformat()) < per_day
 
 
 def new_episode(session: Session, channel: AutopilotChannel) -> Episode:
@@ -266,17 +273,19 @@ def recent_episodes(session: Session, channel: AutopilotChannel, days: int = 60)
     )
 
 
-def previous_niche(session: Session, channel: AutopilotChannel, before_day: str) -> str | None:
-    """The niche of the last *made* episode before today (skipped/failed
-    ones don't count — the viewer never saw them)."""
+def previous_niche(session: Session, channel: AutopilotChannel, episode: Episode) -> str | None:
+    """The niche of the last *made* episode before this one, same day
+    included (several Shorts a day must not share a niche either).
+    Skipped/failed ones don't count — the viewer never saw them."""
     row = (
         session.query(Episode)
         .filter(
             Episode.channel_id == channel.id,
-            Episode.day < before_day,
+            Episode.id != episode.id,
+            Episode.created_at <= episode.created_at,
             Episode.status.in_(("ready", "uploading", "uploaded")),
         )
-        .order_by(Episode.day.desc(), Episode.created_at.desc())
+        .order_by(Episode.created_at.desc())
         .first()
     )
     return row.niche if row else None
@@ -319,7 +328,7 @@ def build_pick_prompt(
     )
     recent = "\n".join(f"- {t}" for t in recent_topics[:40]) or "- (none yet)"
     blocked = (
-        f"\nDo NOT use the niche \"{blocked_niche}\" today — it was yesterday's.\n"
+        f"\nDo NOT use the niche \"{blocked_niche}\" — the previous video used it.\n"
         if blocked_niche
         else ""
     )
@@ -502,7 +511,7 @@ def plan_episode(
 
     trends = gather_trends(trend_sources, settings.trends_geo)
     recent = [e.topic for e in recent_episodes(session, channel) if e.id != episode.id]
-    blocked = previous_niche(session, channel, episode.day)
+    blocked = previous_niche(session, channel, episode)
     chosen, candidates, pick_cost = pick_topic(
         llm, niches, trends, recent, blocked, episode.day, exclude_topics
     )
@@ -591,6 +600,59 @@ def episode_buttons(episode: Episode) -> list[list[tuple[str, str]]]:
         [("✅ Approve & upload", f"approve:{episode.id}")],
         [("🔁 New topic", f"newtopic:{episode.id}"), ("⏭ Skip today", f"skip:{episode.id}")],
     ]
+
+
+# ---------------------------------------------------------------------------
+# 69labs credit usage
+# ---------------------------------------------------------------------------
+
+CREDIT_LABELS = (("images", "images"), ("videos", "video"), ("motion", "motion"), ("tools", "tool"))
+
+
+def add_credit_delta(used: dict | None, before: dict, after: dict) -> dict:
+    """used + (before - after) per product present in both snapshots. A
+    negative delta (a grant renewed mid-job) counts as 0, not a refund."""
+    total = dict(used or {})
+    for key in before.keys() & after.keys():
+        total[key] = total.get(key, 0) + max(0, before[key] - after[key])
+    return total
+
+
+def tts_characters(paths: ProjectPaths | None) -> int:
+    """Narration characters sent to 69labs TTS (voices it made). Excludes
+    the Shorts closing line, which isn't a scene — hence "~" in the line."""
+    if paths is None or not paths.scenes_json.exists():
+        return 0
+    from renderflow.schema import AssetStatus
+    from renderflow.storage import load_plan
+
+    try:
+        plan = load_plan(paths)
+    except Exception:
+        return 0
+    return sum(
+        len(scene.narration)
+        for scene in plan.scenes
+        if scene.assets.voice.provider == "labs69"
+        and scene.assets.voice.status == AssetStatus.COMPLETED
+    )
+
+
+def usage_lines(episode: Episode, tts_chars: int) -> list[str]:
+    """The Telegram "💳" lines; empty when nothing was measured (e.g. no
+    LABS69_API_KEY, or an episode from before this existed)."""
+    used = episode.credits_used or {}
+    parts = [f"{used[k]:,} {label}" for k, label in CREDIT_LABELS if used.get(k)]
+    if tts_chars:
+        parts.append(f"~{tts_chars:,} TTS chars")
+    lines = []
+    if parts:
+        lines.append("💳 69labs this Short: " + " · ".join(parts))
+    left = episode.credits_left or {}
+    left_parts = [f"{left[k]:,} {label}" for k, label in CREDIT_LABELS if k in left]
+    if left_parts:
+        lines.append("Left this month: " + " · ".join(left_parts))
+    return lines
 
 
 def project_cost(paths: ProjectPaths | None) -> float:
