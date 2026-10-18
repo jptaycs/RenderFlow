@@ -33,3 +33,6 @@ client_secret*.json
 !.env.example
 !.env.*.example
 !*.env.example
+
+# Dashboard API output (deploy/windows/start_api.ps1 appends here)
+logs_api.log
